@@ -41,9 +41,9 @@ cmake --build build/release -j       # compiles
 To verify CUDA + MPI actually work on a compute node:
 
 ```bash
-salloc --partition=gpu --gres=gpu:2 --ntasks=2 --time=00:10:00
+salloc --partition=gpu-turing --gres=gpu:2 --ntasks=2 --time=00:10:00
 source scripts/env/activate.sh
-srun ./build/release/apps/hello_mpi_cuda/hello_mpi_cuda
+mpirun -n 2 ./build/release/apps/hello_mpi_cuda/hello_mpi_cuda
 ```
 
 You should see two lines, one per rank, each reporting a different GPU.
@@ -72,6 +72,6 @@ pre-commit run --all-files
 
 - **CMake can't find MPI or CUDA:** modules aren't loaded. Run `source scripts/env/activate.sh`.
 - **`cudaErrorNoDevice` when running:** you're on the login node (no GPU). Use `salloc` or `sbatch` to get a compute node.
-- **`srun` hangs with multiple ranks:** MPI launcher mismatch. Use `srun`, not `mpirun`, on this cluster.
+- **`srun` fails at `MPI_Init` with `orte_ess_init failed`:** SLURM's PMIx is incompatible with NVHPC 24.1's OpenMPI. Use `mpirun -n N`, not `srun`, inside the allocation.
 
 For more detail, see `docs/design/` (per-milestone design docs) and `CLAUDE.md` (project conventions).

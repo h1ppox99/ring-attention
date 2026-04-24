@@ -9,6 +9,7 @@ dependencies = [
     "numpy>=2.4.4",
     "pandas>=3.0.2",
     "pytest>=9.0.3",
+    "pytest-cov>=6.0.0",
     "ruff>=0.15.11",
     "torch>=2.11.0",
 ]
@@ -25,7 +26,14 @@ select = ["E", "F", "I", "N", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
 testpaths = ["reference/tests"]
-addopts = "-ra --strict-markers"
+addopts = "-ra --strict-markers --cov=ring_attention_ref --cov-report=term-missing --cov-report=xml:coverage.xml"
+
+[tool.coverage.run]
+source = ["ring_attention_ref"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 0
 
 [tool.mypy]
 python_version = "3.11"

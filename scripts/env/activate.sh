@@ -5,8 +5,6 @@
 # It loads the NVHPC module (nvcc, mpirun, NCCL, NVSHMEM) and activates
 # the Python virtual environment managed by uv.
 
-set -euo pipefail
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
@@ -15,6 +13,11 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 if ! module is-loaded course/cme213/nvhpc/24.1 2>/dev/null; then
     module load course/cme213/nvhpc/24.1
 fi
+
+# The NVHPC HPC-X MPI was built with OPAL_PREFIX pointing to /proj/nv/...,
+# which doesn't exist on compute nodes.  Override it to the local install.
+NVHPC_ROOT="/home/cme213/software/nvidia-hpc-sdk/2024_24.1/Linux_x86_64/24.1"
+export OPAL_PREFIX="${NVHPC_ROOT}/comm_libs/12.3/hpcx/hpcx-2.17.1/ompi"
 
 # Make sure uv's bin directory is on PATH.
 export PATH="${HOME}/.local/bin:${PATH}"

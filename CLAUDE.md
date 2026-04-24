@@ -77,7 +77,7 @@ Style: ruff (line length 100, py311 target). Type annotations required (mypy str
 - C++17, CUDA 17. Formatting: Google style, 2-space indent, 100-col limit (`.clang-format`).
 - Host-device split: `.cu` for files containing kernels, `.cpp` for host-only code, `.cuh`/`.hpp` for headers.
 - MPI ranks == GPU IDs (one rank per GPU). `MPI_Init` at entry, `MPI_Finalize` at exit.
-- Use `srun` (not `mpirun`) on this cluster for multi-rank jobs.
+- Use `mpirun -n N` (not `srun`) on this cluster. SLURM's PMIx server is incompatible with NVHPC 24.1's OpenMPI, so `srun` fails at `MPI_Init`. `mpirun` works fine inside a SLURM allocation.
 - Prefer `cudaCheck(...)` macro around CUDA calls; `MPI_CHECK(...)` around MPI calls.
 
 ## Pre-commit hooks
