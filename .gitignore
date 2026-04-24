@@ -1,0 +1,32 @@
+# Build
+build/
+build-*/
+cmake-build-*/
+*.o
+*.so
+*.a
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# Results & profiles (regeneratable, often huge)
+results/
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+*.sqlite
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Claude personal settings
+.claude/settings.local.json

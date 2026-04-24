@@ -1,0 +1,37 @@
+[project]
+name = "ring-attention-ref"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "jupyterlab>=4.5.6",
+    "matplotlib>=3.10.8",
+    "mypy>=1.20.2",
+    "numpy>=2.4.4",
+    "pandas>=3.0.2",
+    "pytest>=9.0.3",
+    "ruff>=0.15.11",
+    "torch>=2.11.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["reference/ring_attention_ref"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["reference/tests"]
+addopts = "-ra --strict-markers"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["reference"]
+
+[build-system]
+requires = ["hatchling>=1.24.0"]
+build-backend = "hatchling.build"
