@@ -80,5 +80,9 @@ def test_golden_fixture(cfg: GoldenConfig) -> None:
 
     saved = torch.load(path, weights_only=False)
     assert saved["config"] == computed["config"]
-    for key in ("q", "k", "v", "out"):
+    # Inputs are seeded deterministically — require bit-exact match.
+    for key in ("q", "k", "v"):
         torch.testing.assert_close(saved[key], computed[key], atol=0.0, rtol=0.0)
+    # Output may differ by ~1e-6 across SDPA backends (e.g. CUDA vs CPU runner);
+    # CLAUDE.md allows atol=1e-3 for fp16 — use tighter fp32 tolerance here.
+    torch.testing.assert_close(saved["out"], computed["out"], atol=1e-5, rtol=1e-5)
