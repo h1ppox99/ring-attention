@@ -10,8 +10,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cd "${REPO_ROOT}"
+cd "${SLURM_SUBMIT_DIR}"
 
 source scripts/env/activate.sh
 
@@ -20,7 +19,6 @@ cmake --preset=release -DCMAKE_CUDA_ARCHITECTURES=75
 cmake --build build/release -j
 
 # ── Node health check ──────────────────────────────────────────────────────────
-# Use mpirun (not srun) — SLURM's PMIx is incompatible with NVHPC 24.1's OpenMPI.
 echo "=== hello_mpi_cuda ==="
 mpirun -n 2 ./build/release/apps/hello_mpi_cuda/hello_mpi_cuda
 echo ""
