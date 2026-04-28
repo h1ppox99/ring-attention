@@ -58,6 +58,14 @@ def test_ring_causal_zigzag_matches_full(cp_size: int) -> None:
     torch.testing.assert_close(ring_out, expected_shards, atol=1e-5, rtol=1e-5)
 
 
+def test_invalid_seq_raises() -> None:
+    q = torch.randn(1, 2, 10, 16)
+    k = torch.randn(1, 2, 10, 16)
+    v = torch.randn(1, 2, 10, 16)
+    with pytest.raises(ValueError):
+        ring_attention(q, k, v, cp_size=4, causal=False, zig_zag=False)
+
+
 def test_cp_size_1_equals_full_attention() -> None:
     q = torch.randn(1, 2, 16, 8)
     k = torch.randn(1, 2, 16, 8)
