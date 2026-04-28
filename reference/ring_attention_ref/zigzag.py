@@ -9,10 +9,25 @@ import torch
 
 
 def zigzag_indices(seq_len: int, cp_size: int) -> torch.Tensor:
-    """Indices of the original tokens owned by each rank.
+    """Token indices owned by each rank under zig-zag assignment.
 
-    Returns a LongTensor of shape (cp_size, seq_len // cp_size) where row i lists
-    the original positions assigned to rank i, in the order the rank stores them.
+    Parameters
+    ----------
+    seq_len : int
+        Total sequence length; must be divisible by ``2 * cp_size``.
+    cp_size : int
+        Number of ranks in the ring.
+
+    Returns
+    -------
+    torch.Tensor
+        ``LongTensor`` of shape ``(cp_size, seq_len // cp_size)`` where row ``i``
+        lists the original token positions assigned to rank ``i``.
+
+    Raises
+    ------
+    ValueError
+        If ``seq_len`` is not divisible by ``2 * cp_size``.
     """
     chunk = 2 * cp_size
     if seq_len % chunk != 0:
@@ -27,11 +42,19 @@ def zigzag_indices(seq_len: int, cp_size: int) -> torch.Tensor:
 
 
 def partition(x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-    """Gather x along the sequence dim (-2) per rank.
+    """Gather tensor slices along the sequence dim per rank.
 
-    x:        (batch, heads, seq, head_dim)
-    indices:  (cp_size, seq // cp_size) from zigzag_indices
-    returns:  (cp_size, batch, heads, seq // cp_size, head_dim)
+    Parameters
+    ----------
+    x : torch.Tensor
+        Shape ``(batch, heads, seq, head_dim)``.
+    indices : torch.Tensor
+        Shape ``(cp_size, seq // cp_size)`` from :func:`zigzag_indices`.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(cp_size, batch, heads, seq // cp_size, head_dim)``.
     """
     cp_size, shard_len = indices.shape
     gathered = x.index_select(-2, indices.flatten())
@@ -40,11 +63,19 @@ def partition(x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
 
 
 def unpartition(shards: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-    """Scatter per-rank shards back to a single sequence-ordered tensor.
+    """Scatter per-rank shards back to a sequence-ordered tensor.
 
-    shards:   (cp_size, batch, heads, seq // cp_size, head_dim)
-    indices:  (cp_size, seq // cp_size)
-    returns:  (batch, heads, seq, head_dim)
+    Parameters
+    ----------
+    shards : torch.Tensor
+        Shape ``(cp_size, batch, heads, seq // cp_size, head_dim)``.
+    indices : torch.Tensor
+        Shape ``(cp_size, seq // cp_size)`` from :func:`zigzag_indices`.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(batch, heads, seq, head_dim)``.
     """
     # Move cp_size back before the seq dim, then flatten → (batch, heads, cp_size*shard_len, ...).
     flat = shards.movedim(0, -3).flatten(-3, -2)

@@ -28,7 +28,7 @@ It sets `CC=nvc` and `CXX=nvc++` — these are used as the CMake CXX compiler.
 
 ## Build system
 
-**Generator**: Unix Makefiles (Ninja not installed on this cluster).
+**Generator**: Unix Makefiles.
 
 ```bash
 cmake --preset=release          # configure (creates build/release/)
@@ -41,7 +41,7 @@ For debug builds replace `release` with `debug`. Override CUDA arch with:
 cmake --preset=release -DCMAKE_CUDA_ARCHITECTURES=75
 ```
 
-**CUDA architecture**: `75` (Turing) — default in CMakeLists.txt. Change to `80` (A100) or `90` (H100) if running on a different cluster.
+**CUDA architecture**: `75` (Turing) — default in CMakeLists.txt.
 
 ## Directory layout
 
@@ -71,6 +71,7 @@ uv run mypy           # type-check
 
 All Python code lives under `reference/`. The package is `ring_attention_ref`.
 Style: ruff (line length 100, py311 target). Type annotations required (mypy strict).
+Docstrings: **Numpy style**.
 
 ## C++/CUDA conventions
 
@@ -79,6 +80,7 @@ Style: ruff (line length 100, py311 target). Type annotations required (mypy str
 - MPI ranks == GPU IDs (one rank per GPU). `MPI_Init` at entry, `MPI_Finalize` at exit.
 - Use `mpirun -n N` (not `srun`) on this cluster. SLURM's PMIx server is incompatible with NVHPC 24.1's OpenMPI, so `srun` fails at `MPI_Init`. `mpirun` works fine inside a SLURM allocation.
 - Prefer `cudaCheck(...)` macro around CUDA calls; `MPI_CHECK(...)` around MPI calls.
+- Docstrings : **Doxygen**.
 
 ## Pre-commit hooks
 

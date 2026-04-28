@@ -26,9 +26,26 @@ def ring_attention(
 ) -> torch.Tensor:
     """Full attention output, partitioned into per-rank shards.
 
-    Returns shape (cp_size, batch, heads, seq // cp_size, head_dim).
-    With zig_zag=True the rank mapping follows `zigzag_indices(seq, cp_size)`;
-    otherwise ranks own contiguous token blocks.
+    Parameters
+    ----------
+    q, k, v : torch.Tensor
+        Shape ``(batch, heads, seq, head_dim)``.
+    cp_size : int
+        Number of ranks in the context-parallel ring.
+    causal : bool
+        Apply causal masking when ``True``.
+    zig_zag : bool
+        Use zig-zag token assignment for load balance; otherwise contiguous blocks.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(cp_size, batch, heads, seq // cp_size, head_dim)``.
+
+    Raises
+    ------
+    ValueError
+        If ``seq`` is not divisible by ``cp_size``.
     """
     seq = q.shape[-2]
     if seq % cp_size != 0:

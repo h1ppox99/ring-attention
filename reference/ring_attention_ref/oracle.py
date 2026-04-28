@@ -11,6 +11,16 @@ def full_attention(
 ) -> torch.Tensor:
     """Scaled dot-product attention over the full sequence.
 
-    q, k, v: (batch, heads, seq, head_dim). Returns a tensor of the same shape.
+    Parameters
+    ----------
+    q, k, v : torch.Tensor
+        Shape ``(batch, heads, seq, head_dim)``.
+    causal : bool
+        Apply causal (lower-triangular) masking when ``True``.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(batch, heads, seq, head_dim)``.
     """
     return scaled_dot_product_attention(q, k, v, is_causal=causal)
