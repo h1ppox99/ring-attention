@@ -5,3 +5,7 @@ add_test(NAME smoke COMMAND test_smoke)
 add_executable(test_cpu_attention test_cpu_attention.cpp)
 target_link_libraries(test_cpu_attention PRIVATE ring_attention)
 add_test(NAME cpu_attention COMMAND test_cpu_attention)
+
+add_executable(test_naive_attention test_naive_attention.cu)
+target_link_libraries(test_naive_attention PRIVATE ring_attention)
+add_test(NAME naive_attention COMMAND test_naive_attention)
