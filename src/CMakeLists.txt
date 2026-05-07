@@ -6,6 +6,7 @@
 
 add_library(ring_attention STATIC
   device_tensor.cu
+  cpu_attention.cpp
 )
 
 target_include_directories(ring_attention PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
