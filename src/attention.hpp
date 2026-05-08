@@ -40,4 +40,13 @@ inline std::size_t tensor_numel(int batch, int heads, int seq, int head_dim) {
 void launch_naive_attention(const float* q, const float* k, const float* v, float* out,
                             const AttentionShape& shape, bool causal, cudaStream_t stream = 0);
 
+/// Tiled FlashAttention-style kernel with online softmax — never materializes
+/// the full score matrix.
+///
+/// Supported `head_dim` values: 32, 64, 128 (other sizes throw via assertion).
+/// Causal masking is end-aligned (key `j` visible to query `i` iff
+/// `j <= i + (seq_k - seq_q)`), matching `cpu_attention`.
+void launch_flash_attention(const float* q, const float* k, const float* v, float* out,
+                            const AttentionShape& shape, bool causal, cudaStream_t stream = 0);
+
 }  // namespace ring_attention

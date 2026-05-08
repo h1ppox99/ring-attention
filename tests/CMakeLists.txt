@@ -9,3 +9,7 @@ add_test(NAME cpu_attention COMMAND test_cpu_attention)
 add_executable(test_naive_attention test_naive_attention.cu)
 target_link_libraries(test_naive_attention PRIVATE ring_attention)
 add_test(NAME naive_attention COMMAND test_naive_attention)
+
+add_executable(test_flash_attention test_flash_attention.cu)
+target_link_libraries(test_flash_attention PRIVATE ring_attention)
+add_test(NAME flash_attention COMMAND test_flash_attention)
