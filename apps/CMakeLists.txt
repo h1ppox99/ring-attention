@@ -1,1 +1,2 @@
 add_subdirectory(hello_mpi_cuda)
+add_subdirectory(bench_attention)

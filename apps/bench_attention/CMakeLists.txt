@@ -1,0 +1,3 @@
+add_executable(bench_attention bench_attention.cu)
+target_link_libraries(bench_attention PRIVATE ring_attention)
+set_target_properties(bench_attention PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
