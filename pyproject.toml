@@ -10,6 +10,7 @@ dependencies = [
     "pandas>=3.0.2",
     "pytest>=9.0.3",
     "pytest-cov>=6.0.0",
+    "ring-attention-pytorch>=0.5",
     "ruff>=0.15.11",
     "torch>=2.11.0",
 ]
@@ -23,6 +24,9 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "B", "SIM"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ring_attention_ref"]
 
 [tool.pytest.ini_options]
 testpaths = ["reference/tests"]
