@@ -1,5 +1,19 @@
-# CTest targets go here.
-# Example:
-#   add_executable(test_ring_attention test_ring_attention.cu)
-#   target_link_libraries(test_ring_attention PRIVATE ring_attention)
-#   add_test(NAME ring_attention COMMAND test_ring_attention)
+add_executable(test_smoke test_smoke.cu)
+target_link_libraries(test_smoke PRIVATE ring_attention)
+add_test(NAME smoke COMMAND test_smoke)
+
+add_executable(test_cpu_attention test_cpu_attention.cpp)
+target_link_libraries(test_cpu_attention PRIVATE ring_attention)
+add_test(NAME cpu_attention COMMAND test_cpu_attention)
+
+add_executable(test_naive_attention test_naive_attention.cu)
+target_link_libraries(test_naive_attention PRIVATE ring_attention)
+add_test(NAME naive_attention COMMAND test_naive_attention)
+
+add_executable(test_flash_attention test_flash_attention.cu)
+target_link_libraries(test_flash_attention PRIVATE ring_attention)
+add_test(NAME flash_attention COMMAND test_flash_attention)
+
+add_executable(test_attention_step test_attention_step.cu)
+target_link_libraries(test_attention_step PRIVATE ring_attention)
+add_test(NAME attention_step COMMAND test_attention_step)
