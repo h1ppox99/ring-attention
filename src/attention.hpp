@@ -73,6 +73,6 @@ void launch_attention_step(const float* q, const float* k, const float* v, float
 /// `l == 0` are zeroed). After this call, `out` contains the final attention
 /// output and `m`, `l` are no longer needed.
 void launch_attention_finalize(float* out, const float* l, const AttentionShape& shape,
-                               std::size_t m_count, cudaStream_t stream = 0);
+                               cudaStream_t stream = 0);
 
 }  // namespace ring_attention

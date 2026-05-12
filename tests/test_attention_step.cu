@@ -123,7 +123,7 @@ int run_ring(const AttentionShape& full, int num_chunks, bool causal, std::uint3
                           dl.data(), chunk_shape, /*q_offset*/ 0, /*k_offset*/ k_off, causal);
   }
 
-  launch_attention_finalize(dout.data(), dl.data(), full, m_count);
+  launch_attention_finalize(dout.data(), dl.data(), full);
   cudaCheck(cudaDeviceSynchronize());
 
   std::vector<float> o_gpu;

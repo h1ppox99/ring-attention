@@ -155,7 +155,7 @@ void launch_flash_attention(const float* q, const float* k, const float* v, floa
   // on sm_75: (BR + 2*BC) * D * 4 bytes.
   switch (shape.head_dim) {
     case 32:
-      launch_typed<64, 64, 32>(q, k, v, out, shape, causal, stream);  // 12 KB smem
+      launch_typed<64, 64, 32>(q, k, v, out, shape, causal, stream);  // 24 KB smem
       break;
     case 64:
       launch_typed<32, 32, 64>(q, k, v, out, shape, causal, stream);  // 24 KB smem

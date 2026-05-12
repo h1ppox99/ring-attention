@@ -208,7 +208,7 @@ void launch_attention_step(const float* q, const float* k, const float* v, float
 }
 
 void launch_attention_finalize(float* out, const float* l, const AttentionShape& shape,
-                               std::size_t /*m_count*/, cudaStream_t stream) {
+                               cudaStream_t stream) {
   const dim3 grid(shape.seq_q, shape.heads, shape.batch);
   const dim3 block(128);
   finalize_kernel<<<grid, block, 0, stream>>>(out, l, shape.heads, shape.seq_q, shape.head_dim);
