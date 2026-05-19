@@ -50,127 +50,153 @@ void fill_host_tensor(std::vector<float>& buf, uint32_t seed, int tensor_id, int
 /// Gather K/V from all ranks, run one attention_step with the full K/V.
 ///
 /// Communication pattern:
-///   D2H local K,V  →  MPI_Allgather  →  rearrange to (B,H,S,D)  →  H2D
+///   MPI_Allgather(K,V)  →  rearrange (P,B,H,Sl,D) → (B,H,S,D)  →  H2D
 ///
-/// Then: init → step(Q, full_K, full_V, q_offset, k_offset=0) → finalize.
+/// Timing:
+///   - comm_ms : MPI_Wtime around Allgather + rearrange + H2D, averaged over iters
+///   - comp_ms : cudaEvent around attention_step, averaged over iters
+///   - total_ms: MPI_Barrier-to-Barrier wall-clock / iters
+///   All three are MPI_Reduce(MAX) across ranks before being stored in RingResult.
 ring_attention::RingResult run_allgather(const ring_attention::RingConfig& cfg) {
   using namespace ring_attention;
 
   const int B = cfg.batch, H = cfg.heads, D = cfg.head_dim;
   const int S = cfg.seq, P = cfg.cp_size, R = cfg.rank;
-  const int Sl = S / P;      // local (per-rank) sequence length
-  const int q_off = R * Sl;  // global query offset for this rank
+  const int Sl = S / P;
+  const int q_off = R * Sl;
 
   const std::size_t local_elem = static_cast<std::size_t>(B) * H * Sl * D;
   const std::size_t full_elem = static_cast<std::size_t>(B) * H * S * D;
   const std::size_t m_count = static_cast<std::size_t>(B) * H * Sl;
 
-  // ---- Fill local Q/K/V on host ----------------------------------------
+  // Fill local Q/K/V on host — constant across iterations.
   std::vector<float> q_h, k_h, v_h;
   fill_host_tensor(q_h, cfg.seed, 0, B, H, Sl, D, q_off);
-  fill_host_tensor(k_h, cfg.seed, 1, B, H, Sl, D, q_off);  // same global range for K
+  fill_host_tensor(k_h, cfg.seed, 1, B, H, Sl, D, q_off);
   fill_host_tensor(v_h, cfg.seed, 2, B, H, Sl, D, q_off);
 
-  // ---- H2D local Q ---------------------------------------------------------
+  // H2D local Q — stays on device for all iterations.
   DeviceTensor<float> q_d(local_elem);
   q_d.copy_from_host(q_h);
 
-  // ---- MPI_Allgather K and V -----------------------------------------------
-  // After allgather: gathered[p * local_elem ... (p+1)*local_elem) = rank p's slice.
-  // Layout of each slice: (B, H, Sl, D) row-major.
+  // Reusable buffers for gather + rearrange + device K/V.
   std::vector<float> k_gathered(full_elem), v_gathered(full_elem);
-
-  double t_comm_start = MPI_Wtime();
-  MPI_Allgather(k_h.data(), static_cast<int>(local_elem), MPI_FLOAT, k_gathered.data(),
-                static_cast<int>(local_elem), MPI_FLOAT, MPI_COMM_WORLD);
-  MPI_Allgather(v_h.data(), static_cast<int>(local_elem), MPI_FLOAT, v_gathered.data(),
-                static_cast<int>(local_elem), MPI_FLOAT, MPI_COMM_WORLD);
-  double t_comm_end = MPI_Wtime();
-
-  // ---- Rearrange from rank-major to (B, H, S, D) ---------------------------
-  // gathered[p * local_elem + ((b*H+h)*Sl + s_local)*D + d]
-  //  → full[((b*H+h)*S + p*Sl + s_local)*D + d]
   std::vector<float> full_k_h(full_elem), full_v_h(full_elem);
-  for (int b = 0; b < B; ++b) {
-    for (int h = 0; h < H; ++h) {
-      for (int p = 0; p < P; ++p) {
-        const std::size_t src =
-            static_cast<std::size_t>(p) * local_elem + static_cast<std::size_t>(b * H + h) * Sl * D;
-        const std::size_t dst = (static_cast<std::size_t>(b * H + h) * S + p * Sl) * D;
-        std::copy(k_gathered.data() + src, k_gathered.data() + src + Sl * D, full_k_h.data() + dst);
-        std::copy(v_gathered.data() + src, v_gathered.data() + src + Sl * D, full_v_h.data() + dst);
-      }
-    }
-  }
-
-  // ---- H2D full K, V -------------------------------------------------------
   DeviceTensor<float> k_d(full_elem), v_d(full_elem);
-  k_d.copy_from_host(full_k_h);
-  v_d.copy_from_host(full_v_h);
-
-  // ---- Attention: init → step → finalize -----------------------------------
   DeviceTensor<float> out_d(local_elem), m_d(m_count), l_d(m_count);
   const AttentionShape shape{B, H, Sl, S, D};
 
-  cudaEvent_t ev_start, ev_stop;
-  cudaEventCreate(&ev_start);
-  cudaEventCreate(&ev_stop);
+  // One complete allgather + attention pass.
+  // Returns {comm_ms, comp_ms} for that single pass.
+  auto one_pass = [&]() -> std::pair<double, double> {
+    // --- Communication: allgather K,V + rearrange + H2D ----------------------
+    const double tc0 = MPI_Wtime();
+    MPI_Allgather(k_h.data(), static_cast<int>(local_elem), MPI_FLOAT, k_gathered.data(),
+                  static_cast<int>(local_elem), MPI_FLOAT, MPI_COMM_WORLD);
+    MPI_Allgather(v_h.data(), static_cast<int>(local_elem), MPI_FLOAT, v_gathered.data(),
+                  static_cast<int>(local_elem), MPI_FLOAT, MPI_COMM_WORLD);
 
-  launch_attention_init(out_d.data(), m_d.data(), l_d.data(), shape, m_count);
+    // Rearrange from rank-major (P,B,H,Sl,D) to (B,H,S,D).
+    for (int b = 0; b < B; ++b)
+      for (int h = 0; h < H; ++h)
+        for (int p = 0; p < P; ++p) {
+          const std::size_t src = static_cast<std::size_t>(p) * local_elem +
+                                  static_cast<std::size_t>(b * H + h) * Sl * D;
+          const std::size_t dst = (static_cast<std::size_t>(b * H + h) * S + p * Sl) * D;
+          std::copy(k_gathered.data() + src, k_gathered.data() + src + Sl * D,
+                    full_k_h.data() + dst);
+          std::copy(v_gathered.data() + src, v_gathered.data() + src + Sl * D,
+                    full_v_h.data() + dst);
+        }
 
-  cudaEventRecord(ev_start);
-  launch_attention_step(q_d.data(), k_d.data(), v_d.data(), out_d.data(), m_d.data(), l_d.data(),
-                        shape, q_off, /*k_offset=*/0, cfg.causal);
-  cudaEventRecord(ev_stop);
-  cudaEventSynchronize(ev_stop);
+    k_d.copy_from_host(full_k_h);
+    v_d.copy_from_host(full_v_h);
+    const double tc1 = MPI_Wtime();
 
-  launch_attention_finalize(out_d.data(), l_d.data(), shape);
-  cudaDeviceSynchronize();
+    // --- Compute: init → step → finalize -------------------------------------
+    cudaEvent_t ev0, ev1;
+    cudaEventCreate(&ev0);
+    cudaEventCreate(&ev1);
+    launch_attention_init(out_d.data(), m_d.data(), l_d.data(), shape, m_count);
+    cudaEventRecord(ev0);
+    launch_attention_step(q_d.data(), k_d.data(), v_d.data(), out_d.data(), m_d.data(), l_d.data(),
+                          shape, q_off, /*k_offset=*/0, cfg.causal);
+    cudaEventRecord(ev1);
+    cudaEventSynchronize(ev1);
+    launch_attention_finalize(out_d.data(), l_d.data(), shape);
+    cudaDeviceSynchronize();
+    float comp_float_ms = 0.f;
+    cudaEventElapsedTime(&comp_float_ms, ev0, ev1);
+    cudaEventDestroy(ev0);
+    cudaEventDestroy(ev1);
 
-  float comp_float_ms = 0.f;
-  cudaEventElapsedTime(&comp_float_ms, ev_start, ev_stop);
-  cudaEventDestroy(ev_start);
-  cudaEventDestroy(ev_stop);
+    return {(tc1 - tc0) * 1e3, static_cast<double>(comp_float_ms)};
+  };
 
-  // ---- Verification -------------------------------------------------------
+  // Warmup: one pass without timing to prime GPU/MPI state.
+  one_pass();
+
+  // Timed loop: iters passes, barrier-wrapped for wall-clock total.
+  double sum_comm = 0.0, sum_comp = 0.0;
+  MPI_Barrier(MPI_COMM_WORLD);
+  const double t_start = MPI_Wtime();
+  for (int i = 0; i < cfg.iters; ++i) {
+    const auto [comm, comp] = one_pass();
+    sum_comm += comm;
+    sum_comp += comp;
+  }
+  MPI_Barrier(MPI_COMM_WORLD);
+  const double t_end = MPI_Wtime();
+
+  RingResult res;
+  res.comm_ms = sum_comm / cfg.iters;
+  res.comp_ms = sum_comp / cfg.iters;
+  res.wait_ms = 0.0;
+  res.total_ms = (t_end - t_start) * 1e3 / cfg.iters;
+
+  // Reduce to rank 0: MAX across ranks = bottleneck rank's time.
+  const double local_t[3] = {res.comm_ms, res.comp_ms, res.total_ms};
+  double global_t[3] = {};
+  MPI_Reduce(local_t, global_t, 3, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+  if (R == 0) {
+    res.comm_ms = global_t[0];
+    res.comp_ms = global_t[1];
+    res.total_ms = global_t[2];
+  }
+
+  // Verification: run once after timing, compare against cpu_attention.
   float max_err = -1.f;
   if (cfg.verify) {
-    // Each rank independently regenerates the full Q/K/V and runs cpu_attention.
-    // No MPI communication needed here — gen_elem is deterministic.
     std::vector<float> full_q_cpu(full_elem), full_k_cpu(full_elem), full_v_cpu(full_elem);
     fill_host_tensor(full_q_cpu, cfg.seed, 0, B, H, S, D, 0);
     fill_host_tensor(full_k_cpu, cfg.seed, 1, B, H, S, D, 0);
     fill_host_tensor(full_v_cpu, cfg.seed, 2, B, H, S, D, 0);
 
     std::vector<float> cpu_out(full_elem);
-    const AttentionShape full_shape{B, H, S, S, D};
     cpu_attention(full_q_cpu.data(), full_k_cpu.data(), full_v_cpu.data(), cpu_out.data(),
-                  full_shape, cfg.causal);
+                  AttentionShape{B, H, S, S, D}, cfg.causal);
+
+    // Re-run one pass so out_d holds a fresh result.
+    one_pass();
 
     std::vector<float> dev_out_h(local_elem);
     out_d.copy_to_host(dev_out_h);
 
     max_err = 0.f;
-    for (int b = 0; b < B; ++b) {
+    for (int b = 0; b < B; ++b)
       for (int h = 0; h < H; ++h) {
-        // cpu_out is (B,H,S,D); this rank's rows start at q_off within seq dim.
         const float* cpu_slice =
             cpu_out.data() + (static_cast<std::size_t>(b * H + h) * S + q_off) * D;
         const float* dev_slice = dev_out_h.data() + static_cast<std::size_t>(b * H + h) * Sl * D;
         for (int e = 0; e < Sl * D; ++e)
           max_err = std::max(max_err, std::abs(cpu_slice[e] - dev_slice[e]));
       }
-    }
+
     float global_max;
     MPI_Reduce(&max_err, &global_max, 1, MPI_FLOAT, MPI_MAX, 0, MPI_COMM_WORLD);
     max_err = (R == 0) ? global_max : -1.f;
   }
 
-  RingResult res;
-  res.comm_ms = (t_comm_end - t_comm_start) * 1e3;
-  res.comp_ms = static_cast<double>(comp_float_ms);
-  res.wait_ms = 0.0;
-  res.total_ms = res.comm_ms + res.comp_ms;
   res.max_err = max_err;
   return res;
 }
