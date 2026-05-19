@@ -45,8 +45,44 @@ __global__ void finalize_kernel(float* O, const float* L, int H, int Sq, int D) 
   }
 }
 
-/// Same online-softmax recurrence as flash_attention_kernel, but persists
-/// (O, m, l) across calls instead of finalizing inside the kernel.
+/// One ring-step of the online-softmax (flash-attention) recurrence.
+///
+/// Same recurrence as `flash_attention_kernel`, but instead of finalizing
+/// `O <- O / l` inside the kernel, the running state `(O, m, l)` is persisted
+/// to global memory so a subsequent call can resume with the next K/V chunk.
+/// After all chunks have been consumed, `launch_attention_finalize` performs
+/// the single division.
+///
+/// Grid / block layout:
+///   - grid = (ceil(Sq / BR), H, B), block = (BR)
+///   - Each thread owns one query row of the BR-row tile; threads in a block
+///     cooperatively load BC keys / values into shared memory per K-tile.
+///
+/// Template parameters:
+///   - BR : query rows per block (one thread per row).
+///   - BC : K/V columns loaded per shared-memory tile.
+///   - D  : head dimension (compile-time so per-thread `O_i[D]` lives in regs).
+///
+/// @param Q         Queries, shape [B, H, Sq, D], row-major, device pointer.
+/// @param K         Keys for *this* chunk, shape [B, H, Sk, D].
+/// @param V         Values for *this* chunk, shape [B, H, Sk, D].
+/// @param O         In/out running output accumulator, shape [B, H, Sq, D].
+///                  Read at entry, updated, written back. Must be zero-init
+///                  before the first ring step (see `init_kernel`).
+/// @param M         In/out per-row running max, shape [B, H, Sq]. Init to -inf.
+/// @param L         In/out per-row running sum-of-exp, shape [B, H, Sq]. Init to 0.
+/// @param H         Number of heads.
+/// @param Sq        Local query sequence length (this rank's slice).
+/// @param Sk        Chunk key/value length (this step's K/V tile, not the full Sk).
+/// @param scale     Softmax scale, typically 1 / sqrt(D).
+/// @param causal    If true, mask entries where `j_global > i_global`.
+/// @param q_offset  Global position of the first local query row. Used only
+///                  for causal masking; identifies where this Q slice sits
+///                  in the full (pre-zigzag) sequence.
+/// @param k_offset  Global position of the first key in this chunk. Combined
+///                  with the local `j` index to recover `j_global` for the
+///                  causal predicate. Lets the ring pass non-contiguous chunks
+///                  (e.g. zig-zag) without changing the kernel.
 template <int BR, int BC, int D>
 __global__ void attention_step_kernel(const float* __restrict__ Q, const float* __restrict__ K,
                                       const float* __restrict__ V, float* __restrict__ O,
