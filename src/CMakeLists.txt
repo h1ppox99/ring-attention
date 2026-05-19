@@ -11,6 +11,7 @@ add_library(ring_attention STATIC
   flash_attention.cu
   attention_step.cu
   ring_partition.cpp
+  ring_loop.cu
 )
 
 target_include_directories(ring_attention PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

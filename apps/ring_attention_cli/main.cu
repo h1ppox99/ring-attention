@@ -1,8 +1,5 @@
 /// @file
 /// Ring-attention distributed driver. One MPI rank per GPU.
-///
-/// In P1 (scaffolding) the binary parses arguments, binds each rank to a GPU,
-/// and prints per-rank diagnostic info. Later phases fill in the attention modes.
 
 #include <cuda_runtime.h>
 #include <mpi.h>
@@ -12,6 +9,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+
+#include "ring_loop.hpp"
 
 // ---------------------------------------------------------------------------
 // Error macros — MPI-aware so any failure tears down all ranks, not just one.
@@ -85,22 +84,6 @@ Config parse_args(int argc, char** argv) {
   return cfg;
 }
 
-/// Reproducible float in [-1, 1) for global position (tensor_id, b, h, s, d).
-/// Hash-based so each rank can generate any position in O(1) without skipping
-/// over elements it doesn't own (unlike a sequential RNG). tensor_id: 0=Q 1=K 2=V.
-[[maybe_unused]] float gen_elem(uint32_t seed, int tensor_id, int b, int h, int s, int d) {
-  uint32_t v = seed;
-  v ^= static_cast<uint32_t>(tensor_id) * 2654435761u;
-  v ^= static_cast<uint32_t>(b) * 2246822519u;
-  v ^= static_cast<uint32_t>(h) * 3266489917u;
-  v ^= static_cast<uint32_t>(s) * 668265263u;
-  v ^= static_cast<uint32_t>(d) * 374761393u;
-  v ^= v << 13;
-  v ^= v >> 17;
-  v ^= v << 5;
-  return static_cast<float>(static_cast<int32_t>(v)) * (1.0f / 2147483648.0f);
-}
-
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -148,7 +131,43 @@ int main(int argc, char** argv) {
       cfg.mode.c_str(), static_cast<int>(cfg.causal), static_cast<int>(cfg.zigzag));
   fflush(stdout);
 
+  // Run the attention (all modes dispatch through run_ring_attention).
+  ring_attention::RingConfig rcfg;
+  rcfg.rank = rank;
+  rcfg.cp_size = cp_size;
+  rcfg.batch = cfg.batch;
+  rcfg.heads = cfg.heads;
+  rcfg.seq = cfg.seq;
+  rcfg.head_dim = cfg.head_dim;
+  rcfg.causal = cfg.causal;
+  rcfg.zigzag = cfg.zigzag;
+  rcfg.verify = cfg.verify;
+  rcfg.csv = cfg.csv;
+  rcfg.mode = ring_attention::mode_from_string(cfg.mode);
+  rcfg.iters = cfg.iters;
+  rcfg.seed = 42u;
+
+  const ring_attention::RingResult res = ring_attention::run_ring_attention(rcfg);
+
   MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+  if (rank == 0) {
+    if (cfg.verify) {
+      const bool pass = (res.max_err >= 0.f && res.max_err < 1e-3f);
+      printf("verify  max_err=%.2e  %s\n", res.max_err, pass ? "PASS" : "FAIL");
+    }
+    if (cfg.csv) {
+      // Header (printed once; downstream tools can deduplicate).
+      printf(
+          "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag,"
+          "iters,comm_ms,comp_ms,wait_ms,total_ms,max_err\n");
+      printf("%s,%d,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.2e\n", cfg.mode.c_str(), cp_size,
+             cfg.batch, cfg.heads, cfg.seq, cfg.head_dim, static_cast<int>(cfg.causal),
+             static_cast<int>(cfg.zigzag), cfg.iters, res.comm_ms, res.comp_ms, res.wait_ms,
+             res.total_ms, res.max_err);
+    }
+  }
+
   MPI_CHECK(MPI_Finalize());
   return 0;
 }
