@@ -118,6 +118,31 @@ void test_ring_topology() {
   printf("test_ring_topology OK\n");
 }
 
+/// local_chunk_len == seq / cp_size for all ranks and sizes.
+void test_local_chunk_len() {
+  for (int cp_size : {1, 2, 4}) {
+    const int seq = cp_size * 32;
+    for (int r = 0; r < cp_size; ++r) {
+      RingPartition p(cp_size, r, seq);
+      check(p.local_chunk_len() == seq / cp_size, "local_chunk_len == seq/cp_size");
+    }
+  }
+  printf("test_local_chunk_len OK\n");
+}
+
+/// Getters return the values passed to the constructor.
+void test_getters() {
+  RingPartition c(4, 2, 128, RingPartition::Mode::Contiguous);
+  check(c.cp_size() == 4, "getter cp_size");
+  check(c.rank() == 2, "getter rank");
+  check(c.seq() == 128, "getter seq");
+  check(c.mode() == RingPartition::Mode::Contiguous, "getter mode contiguous");
+
+  RingPartition z(4, 0, 128, RingPartition::Mode::Zigzag);
+  check(z.mode() == RingPartition::Mode::Zigzag, "getter mode zigzag");
+  printf("test_getters OK\n");
+}
+
 }  // namespace
 
 int main() {
@@ -127,6 +152,8 @@ int main() {
   test_step0_is_own_kv();
   test_num_sub_groups();
   test_ring_topology();
+  test_local_chunk_len();
+  test_getters();
   printf("All ring_partition tests passed.\n");
   return 0;
 }

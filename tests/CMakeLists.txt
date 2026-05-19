@@ -21,3 +21,7 @@ add_test(NAME attention_step COMMAND test_attention_step)
 add_executable(test_ring_partition test_ring_partition.cpp)
 target_link_libraries(test_ring_partition PRIVATE ring_attention)
 add_test(NAME ring_partition COMMAND test_ring_partition)
+
+add_executable(test_gen_elem test_gen_elem.cpp)
+target_link_libraries(test_gen_elem PRIVATE ring_attention)
+add_test(NAME gen_elem COMMAND test_gen_elem)

@@ -1,6 +1,6 @@
 /// @file
-/// Host-side ring-attention orchestrator — allgather baseline (P3).
-/// Ring-blocking (P5) and ring-overlap (P6) are added in later phases.
+/// Host-side ring-attention orchestrator.
+/// Implements allgather baseline; ring-blocking and ring-overlap are stubbed.
 
 #include <mpi.h>
 
@@ -198,9 +198,9 @@ RingResult run_ring_attention(const RingConfig& cfg) {
     case RingMode::AllGather:
       return run_allgather(cfg);
     case RingMode::RingBlocking:
-      mpi_die("ring-blocking not yet implemented (P5)");
+      mpi_die("ring-blocking not yet implemented");
     case RingMode::RingOverlap:
-      mpi_die("ring-overlap not yet implemented (P6)");
+      mpi_die("ring-overlap not yet implemented");
   }
   mpi_die("unreachable");
 }

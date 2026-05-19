@@ -1,5 +1,5 @@
 /// @file
-/// RingPartition implementation. Contiguous mode only; Zigzag wired in P7.
+/// RingPartition implementation. Contiguous mode only; Zigzag offsets stubbed.
 
 #include "ring_partition.hpp"
 
@@ -17,7 +17,7 @@ RingPartition::RingPartition(int cp_size, int rank, int seq, Mode mode)
 
 int RingPartition::q_offset(int /*sg*/) const {
   // Contiguous: rank r owns tokens [r*chunk, (r+1)*chunk).
-  // Zigzag sub-groups added in P7.
+  // Zigzag sub-group offsets not yet implemented.
   return rank_ * (seq_ / cp_size_);
 }
 
