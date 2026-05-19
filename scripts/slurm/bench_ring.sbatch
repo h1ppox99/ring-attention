@@ -28,7 +28,7 @@ echo "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag,iters,comm_ms,comp_ms,
 
 ITERS=20
 
-for mode in allgather; do
+for mode in allgather ring-blocking ring-overlap; do
   for cp_size in 1 2 4; do
     for seq in 1024 4096 16384; do
       for head_dim in 64 128; do
