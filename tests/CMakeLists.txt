@@ -17,3 +17,7 @@ add_test(NAME flash_attention COMMAND test_flash_attention)
 add_executable(test_attention_step test_attention_step.cu)
 target_link_libraries(test_attention_step PRIVATE ring_attention)
 add_test(NAME attention_step COMMAND test_attention_step)
+
+add_executable(test_ring_partition test_ring_partition.cpp)
+target_link_libraries(test_ring_partition PRIVATE ring_attention)
+add_test(NAME ring_partition COMMAND test_ring_partition)
