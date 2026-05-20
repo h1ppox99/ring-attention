@@ -28,22 +28,43 @@ echo "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag,iters,comm_ms,comp_ms,
 
 ITERS=20
 
+bench_one() {
+  local cp_size=$1 mode=$2 seq=$3 head_dim=$4 causal=$5
+  shift 5
+  local extra="$*"
+  echo "mode=${mode}  cp_size=${cp_size}  seq=${seq}  head_dim=${head_dim}  causal=${causal}${extra:+  ${extra}}"
+  mpirun -n "${cp_size}" "${CLI}" \
+    --batch 1 --heads 4 \
+    --seq "${seq}" \
+    --head_dim "${head_dim}" \
+    --causal "${causal}" \
+    --mode "${mode}" \
+    --iters "${ITERS}" \
+    --csv ${extra} 2>/dev/null \
+    | grep -v "^mode," \
+    >> "${CSV}"
+}
+
+# Contiguous sweep (allgather / ring-blocking / ring-overlap)
 for mode in allgather ring-blocking ring-overlap; do
   for cp_size in 1 2 4; do
     for seq in 1024 4096 16384; do
       for head_dim in 64 128; do
         for causal in 0 1; do
-          echo "mode=${mode}  cp_size=${cp_size}  seq=${seq}  head_dim=${head_dim}  causal=${causal}"
-          mpirun -n "${cp_size}" "${CLI}" \
-            --batch 1 --heads 4 \
-            --seq "${seq}" \
-            --head_dim "${head_dim}" \
-            --causal "${causal}" \
-            --mode "${mode}" \
-            --iters "${ITERS}" \
-            --csv 2>/dev/null \
-            | grep -v "^mode," \
-            >> "${CSV}"
+          bench_one "${cp_size}" "${mode}" "${seq}" "${head_dim}" "${causal}"
+        done
+      done
+    done
+  done
+done
+
+# Zigzag sweep (ring-blocking / ring-overlap only; seq divisible by 2*cp_size for all sizes)
+for mode in ring-blocking ring-overlap; do
+  for cp_size in 1 2 4; do
+    for seq in 1024 4096 16384; do
+      for head_dim in 64 128; do
+        for causal in 0 1; do
+          bench_one "${cp_size}" "${mode}" "${seq}" "${head_dim}" "${causal}" --zigzag
         done
       done
     done

@@ -214,39 +214,55 @@ ring_attention::RingResult run_allgather(const ring_attention::RingConfig& cfg) 
 ///   D2H K_cur,V_cur  →  Isend/Irecv to next/prev ranks  →  attention_step on
 ///   K_cur,V_cur  →  cudaDeviceSync + MPI_Waitall  →  H2D recv buffers  →  swap.
 ///
-/// Both the GPU step and the host-side MPI exchange run on the default stream
-/// and on the host respectively, so they happen to overlap incidentally, but
-/// the trailing `cudaDeviceSync` + `MPI_Waitall` block until both are complete
-/// before the next step — that's the "blocking" part. Real overlap (separate
-/// streams + events) comes in P6.
+/// Supports both Contiguous and Zigzag token assignment. In Zigzag mode the
+/// buffer layout is [lo_tensor | hi_tensor]: two contiguous [B,H,chunk,D] blocks
+/// of size sg_elem each. K_cur + sg*sg_elem is a valid kernel pointer for sub-group sg.
+/// Per step, up to 4 launch_attention_step calls (sg_q × sg_k); causal pairs
+/// where k_offset > q_offset + chunk - 1 are pruned.
 ///
 /// Timing:
 ///   - comm_ms : D2H + H2D + Isend/Irecv post (the unavoidable staging cost)
 ///   - wait_ms : MPI_Waitall time = unhidden communication latency
-///   - comp_ms : sum of cudaEvent intervals around each attention_step call
+///   - comp_ms : sum of cudaEvent intervals around each step's kernel calls
 ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& cfg) {
   using namespace ring_attention;
 
   const int B = cfg.batch, H = cfg.heads, D = cfg.head_dim;
   const int S = cfg.seq, P = cfg.cp_size, R = cfg.rank;
-  const int Sl = S / P;
-  const int q_off = R * Sl;
 
-  const std::size_t local_elem = static_cast<std::size_t>(B) * H * Sl * D;
-  const std::size_t m_count = static_cast<std::size_t>(B) * H * Sl;
+  const RingPartition::Mode mode =
+      cfg.zigzag ? RingPartition::Mode::Zigzag : RingPartition::Mode::Contiguous;
+  RingPartition part(P, R, S, mode);
+  const int nsg = part.num_sub_groups();  // 1 (contiguous) or 2 (zigzag)
+  const int Sl = part.local_chunk_len();  // per-sub-group rows: S/P or S/(2P)
+  const int Sl_local = Sl * nsg;          // total local rows per rank = S/P
+  const std::size_t sg_elem = static_cast<std::size_t>(B) * H * Sl * D;
+  const std::size_t local_elem = static_cast<std::size_t>(nsg) * sg_elem;
+  const std::size_t m_sg = static_cast<std::size_t>(B) * H * Sl;
+  const std::size_t m_count = static_cast<std::size_t>(nsg) * m_sg;
   const std::size_t bytes = local_elem * sizeof(float);
 
-  // Partition supplies next/prev ranks and k_offset for each ring step.
-  RingPartition part(P, R, S, RingPartition::Mode::Contiguous);
   const int next_rank = part.next_rank();
   const int prev_rank = part.prev_rank();
 
-  // Local Q/K/V — generated once on the host, re-uploaded each iteration so
-  // the ring loop always starts from a clean K/V state.
-  std::vector<float> q_h, k_h_init, v_h_init;
-  fill_host_tensor(q_h, cfg.seed, 0, B, H, Sl, D, q_off);
-  fill_host_tensor(k_h_init, cfg.seed, 1, B, H, Sl, D, q_off);
-  fill_host_tensor(v_h_init, cfg.seed, 2, B, H, Sl, D, q_off);
+  // Fill into the [lo|hi] layout: sub-group sg occupies [sg*sg_elem, (sg+1)*sg_elem).
+  // The stride within each (b,h) head is Sl (not Sl_local), so the kernel sees a
+  // valid [B,H,Sl,D] tensor at K_buf + sg*sg_elem.
+  auto fill_into = [&](std::vector<float>& buf, int tid, std::size_t off, int global_seq_start) {
+    for (int b = 0; b < B; ++b)
+      for (int h = 0; h < H; ++h)
+        for (int s = 0; s < Sl; ++s)
+          for (int d = 0; d < D; ++d)
+            buf[off + (static_cast<std::size_t>(b * H + h) * Sl + s) * D + d] =
+                gen_elem(cfg.seed, tid, b, h, global_seq_start + s, d);
+  };
+
+  std::vector<float> q_h(local_elem), k_h_init(local_elem), v_h_init(local_elem);
+  for (int sg = 0; sg < nsg; ++sg) {
+    fill_into(q_h, 0, sg * sg_elem, part.q_offset(sg));
+    fill_into(k_h_init, 1, sg * sg_elem, part.k_offset_for_step(0, sg));
+    fill_into(v_h_init, 2, sg * sg_elem, part.k_offset_for_step(0, sg));
+  }
 
   // Device buffers: Q stays put; K/V double-buffered (K_a/K_b, V_a/V_b).
   DeviceTensor<float> q_d(local_elem);
@@ -255,8 +271,10 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
   DeviceTensor<float> V_a(local_elem), V_b(local_elem);
   DeviceTensor<float> out_d(local_elem), m_d(m_count), l_d(m_count);
 
-  const AttentionShape full_shape{B, H, Sl, S, D};    // for init / finalize (uses seq_q)
-  const AttentionShape chunk_shape{B, H, Sl, Sl, D};  // each ring step processes one chunk
+  // init_shape seq_q = Sl_local initialises all sub-groups in one call;
+  // sg_shape seq_q = Sl is used per (sg_q, sg_k) kernel call.
+  const AttentionShape init_shape{B, H, Sl_local, S, D};
+  const AttentionShape sg_shape{B, H, Sl, Sl, D};
 
   // Pinned host staging — page-locked so D2H/H2D can be async without copies.
   float *K_send_h = nullptr, *V_send_h = nullptr, *K_recv_h = nullptr, *V_recv_h = nullptr;
@@ -275,7 +293,7 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
     float* K_recv = K_b.data();
     float* V_recv = V_b.data();
 
-    launch_attention_init(out_d.data(), m_d.data(), l_d.data(), full_shape, m_count);
+    launch_attention_init(out_d.data(), m_d.data(), l_d.data(), init_shape, m_count);
 
     double comm_acc = 0.0, comp_acc = 0.0, wait_acc = 0.0;
     cudaEvent_t ev0, ev1;
@@ -301,12 +319,23 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
       const double t_post1 = MPI_Wtime();
       comm_acc += (t_post1 - t_post0) * 1e3;
 
-      // (3) Compute the step on the current K/V chunk.
-      //     k_offset for step s is the global token offset of the source rank.
-      const int k_off = part.k_offset_for_step(step);
+      // (3) Compute: one kernel call per surviving (sg_q, sg_k) pair.
+      //     Bracket all calls in the step with a single event pair so that
+      //     comp_ms accumulates total GPU time across all sub-groups.
       cudaEventRecord(ev0);
-      launch_attention_step(q_d.data(), K_cur, V_cur, out_d.data(), m_d.data(), l_d.data(),
-                            chunk_shape, q_off, k_off, cfg.causal);
+      for (int sg_q = 0; sg_q < nsg; ++sg_q) {
+        for (int sg_k = 0; sg_k < nsg; ++sg_k) {
+          const int q_off_sg = part.q_offset(sg_q);
+          const int k_off_sg = part.k_offset_for_step(step, sg_k);
+          // Causal prune: skip if every key position is strictly after every
+          // query position in this block (the entire block contributes zero).
+          if (cfg.causal && k_off_sg > q_off_sg + Sl - 1) continue;
+          launch_attention_step(q_d.data() + sg_q * sg_elem, K_cur + sg_k * sg_elem,
+                                V_cur + sg_k * sg_elem, out_d.data() + sg_q * sg_elem,
+                                m_d.data() + sg_q * m_sg, l_d.data() + sg_q * m_sg, sg_shape,
+                                q_off_sg, k_off_sg, cfg.causal);
+        }
+      }
       cudaEventRecord(ev1);
       cudaEventSynchronize(ev1);
       float comp_float_ms = 0.f;
@@ -335,7 +364,8 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
       }
     }
 
-    launch_attention_finalize(out_d.data(), l_d.data(), full_shape);
+    for (int sg = 0; sg < nsg; ++sg)
+      launch_attention_finalize(out_d.data() + sg * sg_elem, l_d.data() + sg * m_sg, sg_shape);
     cudaDeviceSynchronize();
     cudaEventDestroy(ev0);
     cudaEventDestroy(ev1);
@@ -375,7 +405,7 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
     res.total_ms = global_t[3];
   }
 
-  // Verification: regenerate full Q/K/V, run cpu_attention, compare this rank's slice.
+  // Verification: regenerate full Q/K/V, run cpu_attention, compare each sub-group.
   float max_err = -1.f;
   if (cfg.verify) {
     const std::size_t full_elem = static_cast<std::size_t>(B) * H * S * D;
@@ -394,14 +424,18 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
     out_d.copy_to_host(dev_out_h);
 
     max_err = 0.f;
-    for (int b = 0; b < B; ++b)
-      for (int h = 0; h < H; ++h) {
-        const float* cpu_slice =
-            cpu_out.data() + (static_cast<std::size_t>(b * H + h) * S + q_off) * D;
-        const float* dev_slice = dev_out_h.data() + static_cast<std::size_t>(b * H + h) * Sl * D;
-        for (int e = 0; e < Sl * D; ++e)
-          max_err = std::max(max_err, std::abs(cpu_slice[e] - dev_slice[e]));
-      }
+    for (int sg = 0; sg < nsg; ++sg) {
+      const int q_off_sg = part.q_offset(sg);
+      for (int b = 0; b < B; ++b)
+        for (int h = 0; h < H; ++h) {
+          const float* cpu_slice =
+              cpu_out.data() + (static_cast<std::size_t>(b * H + h) * S + q_off_sg) * D;
+          const float* dev_slice =
+              dev_out_h.data() + sg * sg_elem + static_cast<std::size_t>(b * H + h) * Sl * D;
+          for (int e = 0; e < Sl * D; ++e)
+            max_err = std::max(max_err, std::abs(cpu_slice[e] - dev_slice[e]));
+        }
+    }
 
     float global_max;
     MPI_Reduce(&max_err, &global_max, 1, MPI_FLOAT, MPI_MAX, 0, MPI_COMM_WORLD);
@@ -449,22 +483,37 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
 
   const int B = cfg.batch, H = cfg.heads, D = cfg.head_dim;
   const int S = cfg.seq, P = cfg.cp_size, R = cfg.rank;
-  const int Sl = S / P;
-  const int q_off = R * Sl;
 
-  const std::size_t local_elem = static_cast<std::size_t>(B) * H * Sl * D;
-  const std::size_t m_count = static_cast<std::size_t>(B) * H * Sl;
+  const RingPartition::Mode mode =
+      cfg.zigzag ? RingPartition::Mode::Zigzag : RingPartition::Mode::Contiguous;
+  RingPartition part(P, R, S, mode);
+  const int nsg = part.num_sub_groups();
+  const int Sl = part.local_chunk_len();
+  const int Sl_local = Sl * nsg;
+  const std::size_t sg_elem = static_cast<std::size_t>(B) * H * Sl * D;
+  const std::size_t local_elem = static_cast<std::size_t>(nsg) * sg_elem;
+  const std::size_t m_sg = static_cast<std::size_t>(B) * H * Sl;
+  const std::size_t m_count = static_cast<std::size_t>(nsg) * m_sg;
   const std::size_t bytes = local_elem * sizeof(float);
 
-  RingPartition part(P, R, S, RingPartition::Mode::Contiguous);
   const int next_rank = part.next_rank();
   const int prev_rank = part.prev_rank();
 
-  // Local Q/K/V — generated once on the host.
-  std::vector<float> q_h, k_h_init, v_h_init;
-  fill_host_tensor(q_h, cfg.seed, 0, B, H, Sl, D, q_off);
-  fill_host_tensor(k_h_init, cfg.seed, 1, B, H, Sl, D, q_off);
-  fill_host_tensor(v_h_init, cfg.seed, 2, B, H, Sl, D, q_off);
+  auto fill_into = [&](std::vector<float>& buf, int tid, std::size_t off, int global_seq_start) {
+    for (int b = 0; b < B; ++b)
+      for (int h = 0; h < H; ++h)
+        for (int s = 0; s < Sl; ++s)
+          for (int d = 0; d < D; ++d)
+            buf[off + (static_cast<std::size_t>(b * H + h) * Sl + s) * D + d] =
+                gen_elem(cfg.seed, tid, b, h, global_seq_start + s, d);
+  };
+
+  std::vector<float> q_h(local_elem), k_h_init(local_elem), v_h_init(local_elem);
+  for (int sg = 0; sg < nsg; ++sg) {
+    fill_into(q_h, 0, sg * sg_elem, part.q_offset(sg));
+    fill_into(k_h_init, 1, sg * sg_elem, part.k_offset_for_step(0, sg));
+    fill_into(v_h_init, 2, sg * sg_elem, part.k_offset_for_step(0, sg));
+  }
 
   // Device buffers — Q stays put; K/V double-buffered with pointer swap.
   DeviceTensor<float> q_d(local_elem);
@@ -473,8 +522,8 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
   DeviceTensor<float> V_a(local_elem), V_b(local_elem);
   DeviceTensor<float> out_d(local_elem), m_d(m_count), l_d(m_count);
 
-  const AttentionShape full_shape{B, H, Sl, S, D};
-  const AttentionShape chunk_shape{B, H, Sl, Sl, D};
+  const AttentionShape init_shape{B, H, Sl_local, S, D};
+  const AttentionShape sg_shape{B, H, Sl, Sl, D};
 
   // Pinned host staging.
   float *K_send_h = nullptr, *V_send_h = nullptr, *K_recv_h = nullptr, *V_recv_h = nullptr;
@@ -510,7 +559,7 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
     float* K_recv = K_b.data();
     float* V_recv = V_b.data();
 
-    launch_attention_init(out_d.data(), m_d.data(), l_d.data(), full_shape, m_count,
+    launch_attention_init(out_d.data(), m_d.data(), l_d.data(), init_shape, m_count,
                           stream_compute);
 
     double comm_acc = 0.0, wait_acc = 0.0;
@@ -519,11 +568,22 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
       // (1) Compute stream waits for the H2D into K_cur to complete.
       cudaStreamWaitEvent(stream_compute, comm_done, 0);
 
-      // (2) Queue the kernel — returns immediately; GPU runs it asynchronously.
-      const int k_off = part.k_offset_for_step(step);
+      // (2) Queue kernels for all surviving (sg_q, sg_k) pairs — returns immediately;
+      //     GPU runs them asynchronously. Both events bracket the full set so that
+      //     ev_ends[step] fires only after all sub-group calls for this step complete,
+      //     which is the correct WAR fence point for the next step's H2D.
       cudaEventRecord(ev_starts[step], stream_compute);
-      launch_attention_step(q_d.data(), K_cur, V_cur, out_d.data(), m_d.data(), l_d.data(),
-                            chunk_shape, q_off, k_off, cfg.causal, stream_compute);
+      for (int sg_q = 0; sg_q < nsg; ++sg_q) {
+        for (int sg_k = 0; sg_k < nsg; ++sg_k) {
+          const int q_off_sg = part.q_offset(sg_q);
+          const int k_off_sg = part.k_offset_for_step(step, sg_k);
+          if (cfg.causal && k_off_sg > q_off_sg + Sl - 1) continue;
+          launch_attention_step(q_d.data() + sg_q * sg_elem, K_cur + sg_k * sg_elem,
+                                V_cur + sg_k * sg_elem, out_d.data() + sg_q * sg_elem,
+                                m_d.data() + sg_q * m_sg, l_d.data() + sg_q * m_sg, sg_shape,
+                                q_off_sg, k_off_sg, cfg.causal, stream_compute);
+        }
+      }
       cudaEventRecord(ev_ends[step], stream_compute);
 
       // (3) Overlap window: ship K_cur out and pull next chunk in while the
@@ -580,7 +640,9 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
 
     // Drain stream_compute before finalize, then sync once more.
     cudaStreamSynchronize(stream_compute);
-    launch_attention_finalize(out_d.data(), l_d.data(), full_shape, stream_compute);
+    for (int sg = 0; sg < nsg; ++sg)
+      launch_attention_finalize(out_d.data() + sg * sg_elem, l_d.data() + sg * m_sg, sg_shape,
+                                stream_compute);
     cudaStreamSynchronize(stream_compute);
 
     // Now all kernel events have fired — safe to query elapsed times.
@@ -640,14 +702,18 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
     out_d.copy_to_host(dev_out_h);
 
     max_err = 0.f;
-    for (int b = 0; b < B; ++b)
-      for (int h = 0; h < H; ++h) {
-        const float* cpu_slice =
-            cpu_out.data() + (static_cast<std::size_t>(b * H + h) * S + q_off) * D;
-        const float* dev_slice = dev_out_h.data() + static_cast<std::size_t>(b * H + h) * Sl * D;
-        for (int e = 0; e < Sl * D; ++e)
-          max_err = std::max(max_err, std::abs(cpu_slice[e] - dev_slice[e]));
-      }
+    for (int sg = 0; sg < nsg; ++sg) {
+      const int q_off_sg = part.q_offset(sg);
+      for (int b = 0; b < B; ++b)
+        for (int h = 0; h < H; ++h) {
+          const float* cpu_slice =
+              cpu_out.data() + (static_cast<std::size_t>(b * H + h) * S + q_off_sg) * D;
+          const float* dev_slice =
+              dev_out_h.data() + sg * sg_elem + static_cast<std::size_t>(b * H + h) * Sl * D;
+          for (int e = 0; e < Sl * D; ++e)
+            max_err = std::max(max_err, std::abs(cpu_slice[e] - dev_slice[e]));
+        }
+    }
 
     float global_max;
     MPI_Reduce(&max_err, &global_max, 1, MPI_FLOAT, MPI_MAX, 0, MPI_COMM_WORLD);
@@ -689,6 +755,8 @@ RingMode mode_from_string(const std::string& s) {
 }
 
 RingResult run_ring_attention(const RingConfig& cfg) {
+  if (cfg.zigzag && cfg.mode == RingMode::AllGather)
+    mpi_die("--zigzag is not supported with --mode=allgather (use ring-blocking or ring-overlap)");
   switch (cfg.mode) {
     case RingMode::AllGather:
       return run_allgather(cfg);

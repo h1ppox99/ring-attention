@@ -143,6 +143,62 @@ void test_getters() {
   printf("test_getters OK\n");
 }
 
+/// Zigzag mode: each rank's two sub-groups live in distinct contiguous chunks
+/// of size seq/(2*cp_size). Exhaustive check for cp_size=4, seq=16 (chunk=2).
+void test_zigzag_offsets_4ranks() {
+  const int cp_size = 4, seq = 16, chunk = 2;  // 2*cp_size = 8 chunks of size 2
+  for (int r = 0; r < cp_size; ++r) {
+    RingPartition p(cp_size, r, seq, RingPartition::Mode::Zigzag);
+    check(p.num_sub_groups() == 2, "zigzag: 2 sub-groups");
+    check(p.local_chunk_len() == chunk, "zigzag: chunk = seq/(2*cp_size)");
+    // sub-group 0 ("low") is at rank's natural chunk slot.
+    check(p.q_offset(0) == r * chunk, "zigzag q_offset(low)");
+    // sub-group 1 ("high") is at the mirror slot in the late half.
+    check(p.q_offset(1) == (2 * cp_size - 1 - r) * chunk, "zigzag q_offset(high)");
+    for (int step = 0; step < cp_size; ++step) {
+      const int src = (r - step + cp_size) % cp_size;
+      char m0[80], m1[80];
+      std::snprintf(m0, sizeof(m0), "zigzag r=%d step=%d k_off(low)", r, step);
+      std::snprintf(m1, sizeof(m1), "zigzag r=%d step=%d k_off(high)", r, step);
+      check(p.k_offset_for_step(step, 0) == src * chunk, m0);
+      check(p.k_offset_for_step(step, 1) == (2 * cp_size - 1 - src) * chunk, m1);
+    }
+  }
+  printf("test_zigzag_offsets_4ranks OK\n");
+}
+
+/// Zigzag: at step 0 each sub-group's K must match the rank's own Q sub-group.
+void test_zigzag_step0_own() {
+  for (int cp_size : {1, 2, 4}) {
+    const int seq = cp_size * 32;
+    for (int r = 0; r < cp_size; ++r) {
+      RingPartition p(cp_size, r, seq, RingPartition::Mode::Zigzag);
+      check(p.k_offset_for_step(0, 0) == p.q_offset(0), "zigzag step 0 sg=0");
+      check(p.k_offset_for_step(0, 1) == p.q_offset(1), "zigzag step 0 sg=1");
+    }
+  }
+  printf("test_zigzag_step0_own OK\n");
+}
+
+/// Zigzag: the union of sub-groups across all ranks covers every chunk exactly
+/// once — no overlaps, no gaps. This is the partition correctness property.
+void test_zigzag_partition_cover() {
+  const int cp_size = 4, seq = 32, chunk = 4;  // 8 chunks of size 4
+  std::set<int> seen;
+  for (int r = 0; r < cp_size; ++r) {
+    RingPartition p(cp_size, r, seq, RingPartition::Mode::Zigzag);
+    for (int sg = 0; sg < 2; ++sg) {
+      const int off = p.q_offset(sg);
+      check(seen.count(off) == 0, "zigzag: no duplicate chunk in partition");
+      seen.insert(off);
+    }
+  }
+  check(static_cast<int>(seen.size()) == 2 * cp_size, "zigzag: all chunks covered");
+  for (int c = 0; c < 2 * cp_size; ++c)
+    check(seen.count(c * chunk) == 1, "zigzag: every chunk position present");
+  printf("test_zigzag_partition_cover OK\n");
+}
+
 }  // namespace
 
 int main() {
@@ -154,6 +210,9 @@ int main() {
   test_ring_topology();
   test_local_chunk_len();
   test_getters();
+  test_zigzag_offsets_4ranks();
+  test_zigzag_step0_own();
+  test_zigzag_partition_cover();
   printf("All ring_partition tests passed.\n");
   return 0;
 }
