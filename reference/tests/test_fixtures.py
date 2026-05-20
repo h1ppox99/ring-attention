@@ -48,9 +48,9 @@ def test_fixture_shapes() -> None:
             cp = data["cp_size"]
             seq = data["seq"]
             expected_shape = (cp, batch, heads, seq // cp, head_dim)
-            assert (
-                tuple(data["out"].shape) == expected_shape
-            ), f"{path.name}: expected {expected_shape}, got {tuple(data['out'].shape)}"
+            assert tuple(data["out"].shape) == expected_shape, (
+                f"{path.name}: expected {expected_shape}, got {tuple(data['out'].shape)}"
+            )
 
 
 def test_fixture_values_match_oracle() -> None:
