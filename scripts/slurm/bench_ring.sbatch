@@ -64,7 +64,7 @@ for mode in ring-blocking ring-overlap; do
     for seq in 1024 4096 16384; do
       for head_dim in 64 128; do
         for causal in 0 1; do
-          bench_one "${cp_size}" "${mode}" "${seq}" "${head_dim}" "${causal}" --zigzag
+          bench_one "${cp_size}" "${mode}" "${seq}" "${head_dim}" "${causal}" --zigzag 1
         done
       done
     done
