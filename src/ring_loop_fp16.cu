@@ -17,6 +17,7 @@
 #include <mpi.h>
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -36,6 +37,22 @@ namespace {
   fprintf(stderr, "%s\n", msg);
   MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
   std::exit(EXIT_FAILURE);
+}
+
+/// Validate that `bytes` fits in the `int` count used by MPI-3 point-to-point
+/// and collective calls. NVHPC 24.1 ships OpenMPI 4.1.7 (MPI-3.1) so we cannot
+/// use `MPI_Count` / the `_c` variants here. On overflow we abort with a clear
+/// message rather than silently truncating the count.
+int mpi_int_count(std::size_t bytes, const char* where) {
+  if (bytes > static_cast<std::size_t>(INT_MAX)) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "MPI count overflow in %s: %zu bytes exceeds INT_MAX=%d — "
+                  "reduce per-rank tensor size or chunk the transfer.",
+                  where, bytes, INT_MAX);
+    mpi_die(buf);
+  }
+  return static_cast<int>(bytes);
 }
 
 /// Fill a host vector of shape (B, H, seq_len, D) using gen_elem (returns fp32).
@@ -102,12 +119,14 @@ ring_attention::RingResult run_allgather_fp16(const ring_attention::RingConfig& 
   DeviceTensor<float> out_d(local_elem), m_d(m_count), l_d(m_count);
   const AttentionShape shape{B, H, Sl, S, D};
 
+  const int local_bytes_int = mpi_int_count(local_bytes, "run_allgather_fp16/MPI_Allgather");
+
   auto one_pass = [&]() -> std::pair<double, double> {
     const double tc0 = MPI_Wtime();
-    MPI_Allgather(k_h16.data(), static_cast<int>(local_bytes), MPI_BYTE, k_gathered.data(),
-                  static_cast<int>(local_bytes), MPI_BYTE, MPI_COMM_WORLD);
-    MPI_Allgather(v_h16.data(), static_cast<int>(local_bytes), MPI_BYTE, v_gathered.data(),
-                  static_cast<int>(local_bytes), MPI_BYTE, MPI_COMM_WORLD);
+    MPI_Allgather(k_h16.data(), local_bytes_int, MPI_BYTE, k_gathered.data(), local_bytes_int,
+                  MPI_BYTE, MPI_COMM_WORLD);
+    MPI_Allgather(v_h16.data(), local_bytes_int, MPI_BYTE, v_gathered.data(), local_bytes_int,
+                  MPI_BYTE, MPI_COMM_WORLD);
 
     // Rearrange (P,B,H,Sl,D) → (B,H,S,D).
     for (int b = 0; b < B; ++b)
@@ -290,7 +309,7 @@ ring_attention::RingResult run_ring_blocking_fp16(const ring_attention::RingConf
       if (step < P - 1) {
         cudaMemcpy(K_send_h, K_cur, bytes, cudaMemcpyDeviceToHost);
         cudaMemcpy(V_send_h, V_cur, bytes, cudaMemcpyDeviceToHost);
-        const int n = static_cast<int>(bytes);
+        const int n = mpi_int_count(bytes, "run_ring_blocking_fp16/MPI_Isend|Irecv");
         MPI_Isend(K_send_h, n, MPI_BYTE, next_rank, /*tag=*/0, MPI_COMM_WORLD, &reqs[n_req++]);
         MPI_Irecv(K_recv_h, n, MPI_BYTE, prev_rank, /*tag=*/0, MPI_COMM_WORLD, &reqs[n_req++]);
         MPI_Isend(V_send_h, n, MPI_BYTE, next_rank, /*tag=*/1, MPI_COMM_WORLD, &reqs[n_req++]);
@@ -488,19 +507,21 @@ ring_attention::RingResult run_ring_overlap_fp16(const ring_attention::RingConfi
     cudaEventCreate(&ev_h2d_ends[s]);
   }
 
-  // Pinned float scratch for the initial fp32→fp16 staging of K/V.  We can't
-  // reuse `scratch_f` here because that one feeds q_d above; the per-iteration
-  // initial state needs its own fp32 scratch on the host pinned for async H2D.
-  // Simpler: stage host fp32 → host fp16 once outside the timed loop.
-  std::vector<__half> k_init_h16(local_elem), v_init_h16(local_elem);
+  // Pinned host fp16 buffers for the initial K/V state. They must be page-locked:
+  // `cudaMemcpyAsync` from pageable memory silently serializes (internal staging)
+  // and would defeat the overlap with `stream_compute`. We stage fp32→fp16 once
+  // here, outside the timed loop.
+  __half *k_init_h16 = nullptr, *v_init_h16 = nullptr;
+  cudaHostAlloc(&k_init_h16, bytes, cudaHostAllocDefault);
+  cudaHostAlloc(&v_init_h16, bytes, cudaHostAllocDefault);
   for (std::size_t i = 0; i < local_elem; ++i) {
     k_init_h16[i] = __float2half(k_h_init[i]);
     v_init_h16[i] = __float2half(v_h_init[i]);
   }
 
   auto one_pass = [&]() -> std::tuple<double, double, double> {
-    cudaMemcpyAsync(K_a.data(), k_init_h16.data(), bytes, cudaMemcpyHostToDevice, stream_copy);
-    cudaMemcpyAsync(V_a.data(), v_init_h16.data(), bytes, cudaMemcpyHostToDevice, stream_copy);
+    cudaMemcpyAsync(K_a.data(), k_init_h16, bytes, cudaMemcpyHostToDevice, stream_copy);
+    cudaMemcpyAsync(V_a.data(), v_init_h16, bytes, cudaMemcpyHostToDevice, stream_copy);
     cudaEventRecord(comm_done, stream_copy);
 
     __half* K_cur = K_a.data();
@@ -536,7 +557,7 @@ ring_attention::RingResult run_ring_overlap_fp16(const ring_attention::RingConfi
         cudaMemcpyAsync(V_send_h, V_cur, bytes, cudaMemcpyDeviceToHost, stream_copy);
         cudaStreamSynchronize(stream_copy);
         MPI_Request reqs[4];
-        const int n = static_cast<int>(bytes);
+        const int n = mpi_int_count(bytes, "run_ring_overlap_fp16/MPI_Isend|Irecv");
         MPI_Isend(K_send_h, n, MPI_BYTE, next_rank, /*tag=*/0, MPI_COMM_WORLD, &reqs[0]);
         MPI_Irecv(K_recv_h, n, MPI_BYTE, prev_rank, /*tag=*/0, MPI_COMM_WORLD, &reqs[1]);
         MPI_Isend(V_send_h, n, MPI_BYTE, next_rank, /*tag=*/1, MPI_COMM_WORLD, &reqs[2]);
@@ -661,6 +682,8 @@ ring_attention::RingResult run_ring_overlap_fp16(const ring_attention::RingConfi
   cudaFreeHost(V_send_h);
   cudaFreeHost(K_recv_h);
   cudaFreeHost(V_recv_h);
+  cudaFreeHost(k_init_h16);
+  cudaFreeHost(v_init_h16);
   return res;
 }
 
