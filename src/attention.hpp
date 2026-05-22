@@ -8,6 +8,7 @@
 /// launch (no implicit synchronization). Callers must synchronize before
 /// reading device results.
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -49,6 +50,19 @@ void launch_naive_attention(const float* q, const float* k, const float* v, floa
 void launch_flash_attention(const float* q, const float* k, const float* v, float* out,
                             const AttentionShape& shape, bool causal, cudaStream_t stream = 0);
 
+/// FP16 / Tensor-Core variant of `launch_flash_attention`.
+///
+/// Same row-major `(batch, heads, seq, head_dim)` layout and same `float*`
+/// API as the FP32 kernel — Q/K/V/O are stored in FP32 and converted to
+/// `__half` inside the kernel. Both matmuls (Q·Kᵀ and P·V) run on Tensor
+/// Cores (sm_75 `wmma 16x16x16`) with FP32 accumulation; softmax stays in
+/// FP32. Numerical tolerance vs. the CPU reference is ~1e-2 (vs. 1e-4 for
+/// the FP32 path).
+///
+/// Supported `head_dim` values: 32, 64, 128. Requires sm_70+.
+void launch_flash_attention_fp16(const float* q, const float* k, const float* v, float* out,
+                                 const AttentionShape& shape, bool causal, cudaStream_t stream = 0);
+
 /// Reset the persistent online-softmax state used by `launch_attention_step`.
 ///
 /// `out` is the per-row output accumulator with the same layout as the full
@@ -74,5 +88,21 @@ void launch_attention_step(const float* q, const float* k, const float* v, float
 /// output and `m`, `l` are no longer needed.
 void launch_attention_finalize(float* out, const float* l, const AttentionShape& shape,
                                cudaStream_t stream = 0);
+
+/// FP16 / Tensor-Core ring step. Same semantics as `launch_attention_step` but
+/// Q/K/V live in `__half` (so MPI traffic between ranks can be FP16) and the
+/// two matmuls run on Tensor Cores. The persistent state `(out, m, l)` stays
+/// FP32 — these accumulators benefit from the extra precision and are written
+/// back at every step. `launch_attention_init` / `launch_attention_finalize`
+/// are reused unchanged.
+///
+/// Supported `head_dim`: 32, 64, 128. Requires sm_70+.
+void launch_attention_step_fp16(const __half* q, const __half* k, const __half* v, float* out,
+                                float* m, float* l, const AttentionShape& shape, int q_offset,
+                                int k_offset, bool causal, cudaStream_t stream = 0);
+
+/// Element-wise FP32 → FP16 cast on the device. Used to stage Q (and K/V in
+/// tests) into the FP16 path without a CPU round-trip.
+void launch_float_to_half(const float* src, __half* dst, std::size_t n, cudaStream_t stream = 0);
 
 }  // namespace ring_attention

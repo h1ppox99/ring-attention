@@ -9,9 +9,12 @@ add_library(ring_attention STATIC
   cpu_attention.cpp
   naive_attention.cu
   flash_attention.cu
+  flash_attention_fp16.cu
   attention_step.cu
+  attention_step_fp16.cu
   ring_partition.cpp
   ring_loop.cu
+  ring_loop_fp16.cu
 )
 
 target_include_directories(ring_attention PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

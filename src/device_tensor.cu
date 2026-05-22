@@ -1,6 +1,8 @@
 /// @file
 /// DeviceTensor template instantiations.
 
+#include <cuda_fp16.h>
+
 #include <cassert>
 #include <utility>
 
@@ -67,5 +69,6 @@ void DeviceTensor<T>::copy_to_host(std::vector<T>& host) const {
 template class DeviceTensor<float>;
 template class DeviceTensor<int>;
 template class DeviceTensor<unsigned int>;
+template class DeviceTensor<__half>;
 
 }  // namespace ring_attention

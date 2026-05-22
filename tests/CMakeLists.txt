@@ -18,9 +18,17 @@ add_executable(test_flash_attention test_flash_attention.cu)
 target_link_libraries(test_flash_attention PRIVATE ring_attention)
 add_test(NAME flash_attention COMMAND test_flash_attention)
 
+add_executable(test_flash_attention_fp16 test_flash_attention_fp16.cu)
+target_link_libraries(test_flash_attention_fp16 PRIVATE ring_attention)
+add_test(NAME flash_attention_fp16 COMMAND test_flash_attention_fp16)
+
 add_executable(test_attention_step test_attention_step.cu)
 target_link_libraries(test_attention_step PRIVATE ring_attention)
 add_test(NAME attention_step COMMAND test_attention_step)
+
+add_executable(test_attention_step_fp16 test_attention_step_fp16.cu)
+target_link_libraries(test_attention_step_fp16 PRIVATE ring_attention)
+add_test(NAME attention_step_fp16 COMMAND test_attention_step_fp16)
 
 add_executable(test_ring_partition test_ring_partition.cpp)
 target_link_libraries(test_ring_partition PRIVATE ring_attention)
@@ -52,6 +60,18 @@ if(MPIRUN_EXECUTABLE)
               --seq 128 --heads 2 --head_dim 32 --iters 1
               --causal 1 ${_zigzag_flag} --mode ${_mode} --verify)
     set_tests_properties(ring_smoke_${_mode} PROPERTIES
+      PASS_REGULAR_EXPRESSION "verify[^\n]*PASS"
+      LABELS "mpi;gpu")
+
+    # FP16 / Tensor-Core path. Same smoke matrix, --dtype fp16. Tolerance
+    # for the --verify check is the CLI's job; we just confirm the run
+    # reaches "verify ... PASS" with the relaxed FP16 threshold.
+    add_test(
+      NAME ring_smoke_${_mode}_fp16
+      COMMAND ${MPIRUN_EXECUTABLE} -n 2 $<TARGET_FILE:ring_attention_cli>
+              --seq 128 --heads 2 --head_dim 32 --iters 1
+              --causal 1 ${_zigzag_flag} --mode ${_mode} --dtype fp16 --verify)
+    set_tests_properties(ring_smoke_${_mode}_fp16 PROPERTIES
       PASS_REGULAR_EXPRESSION "verify[^\n]*PASS"
       LABELS "mpi;gpu")
   endforeach()
