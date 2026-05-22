@@ -52,3 +52,76 @@ jobs:
         with:
           files: coverage.xml
           fail_ci_if_error: false
+
+  cpp-format:
+    name: clang-format (C++/CUDA)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang-format-18
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format-18
+          sudo update-alternatives --install /usr/bin/clang-format clang-format \
+            /usr/bin/clang-format-18 100
+
+      - name: Check formatting
+        run: |
+          shopt -s globstar nullglob
+          files=(src/**/*.{cu,cuh,cpp,hpp} apps/**/*.{cu,cuh,cpp,hpp} tests/**/*.{cu,cuh,cpp,hpp})
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No C++/CUDA files found"; exit 0
+          fi
+          clang-format --dry-run --Werror "${files[@]}"
+
+  pre-commit:
+    name: pre-commit hooks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run pre-commit
+        # Skip clang-format here (covered by the cpp-format job with a pinned binary).
+        env:
+          SKIP: clang-format
+        uses: pre-commit/action@v3.0.1
+
+  cuda-build:
+    name: CUDA configure + build (no GPU)
+    # Pinned to 22.04: NVIDIA's apt repo doesn't ship cuda-12-3 packages for
+    # noble (24.04). Keeping nvcc 12.3 matches the cluster's NVHPC 24.1.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: "12.3.2"
+          method: network
+          sub-packages: '["nvcc", "cudart", "cudart-dev"]'
+
+      - name: Install MPI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopenmpi-dev openmpi-bin
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: cuda-build-${{ runner.os }}
+          max-size: 500M
+
+      - name: Configure
+        run: |
+          export PATH="/usr/lib/ccache:$PATH"
+          cmake --preset=release -DCMAKE_CUDA_ARCHITECTURES=75
+
+      - name: Build (compile-only, no GPU)
+        # Builds src/, apps/, and tests/. No ctest run — runner has no GPU.
+        run: cmake --build build/release -j$(nproc)
