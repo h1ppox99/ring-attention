@@ -10,7 +10,7 @@
 ///   --bh B H              override batch and heads (default 1 8)
 ///   --only seq d causal   run only this single (seq, head_dim, causal) config
 ///                         (useful for Nsight Compute)
-///   --kernels list        comma-separated subset of {cpu,naive,flash}
+///   --kernels list        comma-separated subset of {cpu,naive,flash,flash_fp16}
 ///                         (default: all)
 
 #include <algorithm>
@@ -31,6 +31,7 @@ using ring_attention::AttentionShape;
 using ring_attention::cpu_attention;
 using ring_attention::DeviceTensor;
 using ring_attention::launch_flash_attention;
+using ring_attention::launch_flash_attention_fp16;
 using ring_attention::launch_naive_attention;
 using ring_attention::XorShift32;
 
@@ -196,6 +197,12 @@ int main(int argc, char** argv) {
           BenchResult r = bench_gpu(launch_flash_attention, s, causal, warmup_gpu, iters_gpu);
           printf("flash,%d,%d,%d,%d,%d,%d,%.4f,%.2f,%.2f\n", B, H, n, d, causal_flag, iters_gpu,
                  r.ms, r.gflops, r.gbps);
+          fflush(stdout);
+        }
+        if (kernel_enabled(kernels, "flash_fp16")) {
+          BenchResult r = bench_gpu(launch_flash_attention_fp16, s, causal, warmup_gpu, iters_gpu);
+          printf("flash_fp16,%d,%d,%d,%d,%d,%d,%.4f,%.2f,%.2f\n", B, H, n, d, causal_flag,
+                 iters_gpu, r.ms, r.gflops, r.gbps);
           fflush(stdout);
         }
       }

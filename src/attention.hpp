@@ -49,6 +49,19 @@ void launch_naive_attention(const float* q, const float* k, const float* v, floa
 void launch_flash_attention(const float* q, const float* k, const float* v, float* out,
                             const AttentionShape& shape, bool causal, cudaStream_t stream = 0);
 
+/// FP16 / Tensor-Core variant of `launch_flash_attention`.
+///
+/// Same row-major `(batch, heads, seq, head_dim)` layout and same `float*`
+/// API as the FP32 kernel — Q/K/V/O are stored in FP32 and converted to
+/// `__half` inside the kernel. Both matmuls (Q·Kᵀ and P·V) run on Tensor
+/// Cores (sm_75 `wmma 16x16x16`) with FP32 accumulation; softmax stays in
+/// FP32. Numerical tolerance vs. the CPU reference is ~1e-2 (vs. 1e-4 for
+/// the FP32 path).
+///
+/// Supported `head_dim` values: 32, 64, 128. Requires sm_70+.
+void launch_flash_attention_fp16(const float* q, const float* k, const float* v, float* out,
+                                 const AttentionShape& shape, bool causal, cudaStream_t stream = 0);
+
 /// Reset the persistent online-softmax state used by `launch_attention_step`.
 ///
 /// `out` is the per-row output accumulator with the same layout as the full

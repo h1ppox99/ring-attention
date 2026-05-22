@@ -18,6 +18,10 @@ add_executable(test_flash_attention test_flash_attention.cu)
 target_link_libraries(test_flash_attention PRIVATE ring_attention)
 add_test(NAME flash_attention COMMAND test_flash_attention)
 
+add_executable(test_flash_attention_fp16 test_flash_attention_fp16.cu)
+target_link_libraries(test_flash_attention_fp16 PRIVATE ring_attention)
+add_test(NAME flash_attention_fp16 COMMAND test_flash_attention_fp16)
+
 add_executable(test_attention_step test_attention_step.cu)
 target_link_libraries(test_attention_step PRIVATE ring_attention)
 add_test(NAME attention_step COMMAND test_attention_step)
