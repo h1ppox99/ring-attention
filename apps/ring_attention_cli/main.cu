@@ -52,6 +52,7 @@ struct Config {
   int iters = 10;
   bool verify = false;
   bool csv = false;
+  bool csv_header = false;  // emit header row only (paired with --csv or alone)
 };
 
 namespace {
@@ -80,6 +81,8 @@ Config parse_args(int argc, char** argv) {
       cfg.verify = true;
     else if (!std::strcmp(argv[i], "--csv"))
       cfg.csv = true;
+    else if (!std::strcmp(argv[i], "--csv-header"))
+      cfg.csv_header = true;
   }
   return cfg;
 }
@@ -98,11 +101,20 @@ int main(int argc, char** argv) {
 
   const Config cfg = parse_args(argc, argv);
 
-  // Bind rank to GPU: with 4 GPUs per node ranks {0,1,2,3} → GPUs {0,1,2,3},
-  // ranks {4,5,6,7} on the next node again use {0,1,2,3}.
+  // Bind rank to GPU using a node-local rank. MPI_COMM_TYPE_SHARED splits
+  // MPI_COMM_WORLD by shared-memory domain (== same node), which is robust to
+  // launcher rank-distribution policy (block vs. cyclic vs. round-robin). A
+  // plain `rank % num_devices` would oversubscribe under cyclic distribution.
+  MPI_Comm node_comm;
+  MPI_CHECK(
+      MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, rank, MPI_INFO_NULL, &node_comm));
+  int local_rank;
+  MPI_CHECK(MPI_Comm_rank(node_comm, &local_rank));
+  MPI_CHECK(MPI_Comm_free(&node_comm));
+
   int num_devices;
   CUDA_CHECK(cudaGetDeviceCount(&num_devices));
-  const int device = rank % num_devices;
+  const int device = local_rank % num_devices;
   CUDA_CHECK(cudaSetDevice(device));
 
   cudaDeviceProp prop;
@@ -125,9 +137,9 @@ int main(int argc, char** argv) {
   // Barrier before printing so output from all ranks arrives in one burst.
   MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
   printf(
-      "rank %d/%d  gpu %d  %-24s  local_shape=(B=%d H=%d Sq=%d D=%d)  "
+      "rank %d/%d  local_rank %d  gpu %d  %-24s  local_shape=(B=%d H=%d Sq=%d D=%d)  "
       "mode=%-14s  causal=%d  zigzag=%d\n",
-      rank, cp_size, device, prop.name, cfg.batch, cfg.heads, local_seq, cfg.head_dim,
+      rank, cp_size, local_rank, device, prop.name, cfg.batch, cfg.heads, local_seq, cfg.head_dim,
       cfg.mode.c_str(), static_cast<int>(cfg.causal), static_cast<int>(cfg.zigzag));
   fflush(stdout);
 
@@ -156,11 +168,15 @@ int main(int argc, char** argv) {
       const bool pass = (res.max_err >= 0.f && res.max_err < 1e-3f);
       printf("verify  max_err=%.2e  %s\n", res.max_err, pass ? "PASS" : "FAIL");
     }
-    if (cfg.csv) {
-      // Header (printed once; downstream tools can deduplicate).
+    // Header is opt-in so that appending many --csv runs to one file produces
+    // a single header at the top. First run: `--csv-header --csv`; subsequent
+    // runs: `--csv` only.
+    if (cfg.csv_header) {
       printf(
           "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag,"
           "iters,comm_ms,comp_ms,wait_ms,total_ms,max_err\n");
+    }
+    if (cfg.csv) {
       printf("%s,%d,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.2e\n", cfg.mode.c_str(), cp_size,
              cfg.batch, cfg.heads, cfg.seq, cfg.head_dim, static_cast<int>(cfg.causal),
              static_cast<int>(cfg.zigzag), cfg.iters, res.comm_ms, res.comp_ms, res.wait_ms,

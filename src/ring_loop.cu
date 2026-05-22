@@ -542,9 +542,18 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
   // Per-step kernel timing — queried only after the loop terminates so that
   // cudaEventElapsedTime never blocks inside the iteration body.
   std::vector<cudaEvent_t> ev_starts(P), ev_ends(P);
+  // Per-step H2D timing on stream_copy. We can't sample H2D with MPI_Wtime
+  // because cudaMemcpyAsync only enqueues; the actual transfer runs async on
+  // the copy engine and we deliberately do NOT sync (that would kill the
+  // overlap). Events let us measure the transfer time after the fact without
+  // serializing the hot path. Only P-1 H2Ds actually fire (skipped on last
+  // step); the trailing event stays unrecorded and is ignored when summing.
+  std::vector<cudaEvent_t> ev_h2d_starts(P), ev_h2d_ends(P);
   for (int s = 0; s < P; ++s) {
     cudaEventCreate(&ev_starts[s]);
     cudaEventCreate(&ev_ends[s]);
+    cudaEventCreate(&ev_h2d_starts[s]);
+    cudaEventCreate(&ev_h2d_ends[s]);
   }
 
   auto one_pass = [&]() -> std::tuple<double, double, double> {
@@ -624,12 +633,14 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
         }
 
         // H2D into K_recv on stream_copy; record event for the next iter.
-        const double t_h2d0 = MPI_Wtime();
+        // Time the actual transfer with cudaEvents (see note at allocation),
+        // not MPI_Wtime — the wall-clock here would only see enqueue cost
+        // and underreport comm_ms vs. ring-blocking.
+        cudaEventRecord(ev_h2d_starts[step], stream_copy);
         cudaMemcpyAsync(K_recv, K_recv_h, bytes, cudaMemcpyHostToDevice, stream_copy);
         cudaMemcpyAsync(V_recv, V_recv_h, bytes, cudaMemcpyHostToDevice, stream_copy);
+        cudaEventRecord(ev_h2d_ends[step], stream_copy);
         cudaEventRecord(comm_done, stream_copy);
-        const double t_h2d1 = MPI_Wtime();
-        comm_acc += (t_h2d1 - t_h2d0) * 1e3;
 
         // (4) Promote received buffers. Pointer-only swap — the actual write
         //     is still in flight on stream_copy and is gated by comm_done.
@@ -645,12 +656,18 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
                                 stream_compute);
     cudaStreamSynchronize(stream_compute);
 
-    // Now all kernel events have fired — safe to query elapsed times.
+    // Now all kernel + H2D events have fired — safe to query elapsed times.
     double comp_acc = 0.0;
     for (int s = 0; s < P; ++s) {
       float t = 0.f;
       cudaEventElapsedTime(&t, ev_starts[s], ev_ends[s]);
       comp_acc += t;
+    }
+    // Only P-1 H2D events were recorded (last step has no next chunk).
+    for (int s = 0; s < P - 1; ++s) {
+      float t = 0.f;
+      cudaEventElapsedTime(&t, ev_h2d_starts[s], ev_h2d_ends[s]);
+      comm_acc += t;
     }
     return {comm_acc, comp_acc, wait_acc};
   };
@@ -724,6 +741,8 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
   for (int s = 0; s < P; ++s) {
     cudaEventDestroy(ev_starts[s]);
     cudaEventDestroy(ev_ends[s]);
+    cudaEventDestroy(ev_h2d_starts[s]);
+    cudaEventDestroy(ev_h2d_ends[s]);
   }
   cudaEventDestroy(comm_done);
   cudaStreamDestroy(stream_compute);
