@@ -93,7 +93,9 @@ jobs:
 
   cuda-build:
     name: CUDA configure + build (no GPU)
-    runs-on: ubuntu-latest
+    # Pinned to 22.04: NVIDIA's apt repo doesn't ship cuda-12-3 packages for
+    # noble (24.04). Keeping nvcc 12.3 matches the cluster's NVHPC 24.1.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
