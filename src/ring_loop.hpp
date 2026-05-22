@@ -15,8 +15,15 @@ namespace ring_attention {
 
 enum class RingMode { AllGather, RingBlocking, RingOverlap };
 
+/// Compute / transport dtype. FP16 routes through the wmma-based kernel and
+/// sends K/V over MPI as half-precision; FP32 is the original path.
+enum class RingDtype { Float, Half };
+
 /// Parse "--mode=<string>" into a RingMode. Aborts (MPI_Abort) on unknown input.
 RingMode mode_from_string(const std::string& s);
+
+/// Parse "--dtype=<string>" into a RingDtype (`fp32`/`float` or `fp16`/`half`).
+RingDtype dtype_from_string(const std::string& s);
 
 /// Per-iteration timing and correctness results (all ranks report their own
 /// values; caller does MPI_Reduce(MPI_MAX) to get global summary).
@@ -43,6 +50,7 @@ struct RingConfig {
   RingMode mode;
   int iters;
   uint32_t seed = 42u;
+  RingDtype dtype = RingDtype::Float;
 };
 
 /// Run one complete ring-attention forward pass (all modes, all phases).

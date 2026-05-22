@@ -8,6 +8,7 @@
 /// launch (no implicit synchronization). Callers must synchronize before
 /// reading device results.
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -87,5 +88,21 @@ void launch_attention_step(const float* q, const float* k, const float* v, float
 /// output and `m`, `l` are no longer needed.
 void launch_attention_finalize(float* out, const float* l, const AttentionShape& shape,
                                cudaStream_t stream = 0);
+
+/// FP16 / Tensor-Core ring step. Same semantics as `launch_attention_step` but
+/// Q/K/V live in `__half` (so MPI traffic between ranks can be FP16) and the
+/// two matmuls run on Tensor Cores. The persistent state `(out, m, l)` stays
+/// FP32 — these accumulators benefit from the extra precision and are written
+/// back at every step. `launch_attention_init` / `launch_attention_finalize`
+/// are reused unchanged.
+///
+/// Supported `head_dim`: 32, 64, 128. Requires sm_70+.
+void launch_attention_step_fp16(const __half* q, const __half* k, const __half* v, float* out,
+                                float* m, float* l, const AttentionShape& shape, int q_offset,
+                                int k_offset, bool causal, cudaStream_t stream = 0);
+
+/// Element-wise FP32 → FP16 cast on the device. Used to stage Q (and K/V in
+/// tests) into the FP16 path without a CPU round-trip.
+void launch_float_to_half(const float* src, __half* dst, std::size_t n, cudaStream_t stream = 0);
 
 }  // namespace ring_attention

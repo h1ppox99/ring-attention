@@ -49,6 +49,7 @@ struct Config {
   bool causal = false;
   bool zigzag = false;
   std::string mode = "allgather";  // allgather | ring-blocking | ring-overlap
+  std::string dtype = "fp32";      // fp32 | fp16
   int iters = 10;
   bool verify = false;
   bool csv = false;
@@ -75,6 +76,8 @@ Config parse_args(int argc, char** argv) {
       cfg.zigzag = std::atoi(argv[++i]) != 0;
     else if (!std::strcmp(argv[i], "--mode") && nxt)
       cfg.mode = argv[++i];
+    else if (!std::strcmp(argv[i], "--dtype") && nxt)
+      cfg.dtype = argv[++i];
     else if (!std::strcmp(argv[i], "--iters") && nxt)
       cfg.iters = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--verify"))
@@ -138,9 +141,10 @@ int main(int argc, char** argv) {
   MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
   printf(
       "rank %d/%d  local_rank %d  gpu %d  %-24s  local_shape=(B=%d H=%d Sq=%d D=%d)  "
-      "mode=%-14s  causal=%d  zigzag=%d\n",
+      "mode=%-14s  dtype=%-4s  causal=%d  zigzag=%d\n",
       rank, cp_size, local_rank, device, prop.name, cfg.batch, cfg.heads, local_seq, cfg.head_dim,
-      cfg.mode.c_str(), static_cast<int>(cfg.causal), static_cast<int>(cfg.zigzag));
+      cfg.mode.c_str(), cfg.dtype.c_str(), static_cast<int>(cfg.causal),
+      static_cast<int>(cfg.zigzag));
   fflush(stdout);
 
   // Run the attention (all modes dispatch through run_ring_attention).
@@ -156,6 +160,7 @@ int main(int argc, char** argv) {
   rcfg.verify = cfg.verify;
   rcfg.csv = cfg.csv;
   rcfg.mode = ring_attention::mode_from_string(cfg.mode);
+  rcfg.dtype = ring_attention::dtype_from_string(cfg.dtype);
   rcfg.iters = cfg.iters;
   rcfg.seed = 42u;
 
@@ -165,8 +170,11 @@ int main(int argc, char** argv) {
 
   if (rank == 0) {
     if (cfg.verify) {
-      const bool pass = (res.max_err >= 0.f && res.max_err < 1e-3f);
-      printf("verify  max_err=%.2e  %s\n", res.max_err, pass ? "PASS" : "FAIL");
+      // FP16 paths accumulate ~1e-2 round-off vs. the FP32 CPU oracle; the
+      // FP32 path stays well under 1e-3.
+      const float tol = (rcfg.dtype == ring_attention::RingDtype::Half) ? 5e-2f : 1e-3f;
+      const bool pass = (res.max_err >= 0.f && res.max_err < tol);
+      printf("verify  max_err=%.2e  tol=%.0e  %s\n", res.max_err, tol, pass ? "PASS" : "FAIL");
     }
     // Header is opt-in so that appending many --csv runs to one file produces
     // a single header at the top. First run: `--csv-header --csv`; subsequent

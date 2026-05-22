@@ -48,6 +48,32 @@ mpirun -n 2 ./build/release/apps/hello_mpi_cuda/hello_mpi_cuda
 
 You should see two lines, one per rank, each reporting a different GPU.
 
+### Running ring attention
+
+The distributed driver is `apps/ring_attention_cli`. One MPI rank per GPU.
+
+```bash
+salloc --partition=gpu-turing --gres=gpu:2 --ntasks=2 --time=00:15:00
+source scripts/env/activate.sh
+cmake --build build/release -j
+
+mpirun -n 2 ./build/release/apps/ring_attention_cli/ring_attention_cli \
+    --seq 4096 --heads 8 --head_dim 64 \
+    --causal 1 --zigzag 1 \
+    --mode ring-overlap --iters 10 --verify
+```
+
+**Modes** (`--mode`):
+- `allgather` — baseline: `MPI_Allgather` the full K/V, one local attention pass.
+- `ring-blocking` — ring rotation with blocking `MPI_Waitall` between steps (no overlap).
+- `ring-overlap` — ring rotation with two CUDA streams hiding MPI behind the kernel.
+
+**Flags**:
+- `--causal 1` — apply lower-triangular mask.
+- `--zigzag 1` — interleave token assignment so each rank gets balanced work under a causal mask (requires `seq` divisible by `2 * cp_size`).
+- `--verify` — re-run a CPU reference pass and report max absolute error.
+- `--csv` — emit one CSV result line; pair with `--csv-header` on the first invocation when appending many runs to a file.
+
 ### Daily workflow
 
 Every new shell session, before working:
