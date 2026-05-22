@@ -1,0 +1,3 @@
+add_executable(ring_attention_cli main.cu)
+target_link_libraries(ring_attention_cli PRIVATE ring_attention MPI::MPI_CXX)
+set_target_properties(ring_attention_cli PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
