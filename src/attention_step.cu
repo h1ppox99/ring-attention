@@ -236,8 +236,11 @@ void launch_attention_step(const float* q, const float* k, const float* v, float
     case 128:
       launch_step_typed<32, 16, 128>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
       break;
+    case 256:
+      launch_step_typed<16, 8, 256>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
+      break;
     default:
-      fprintf(stderr, "attention_step: unsupported head_dim=%d (supported: 32, 64, 128)\n",
+      fprintf(stderr, "attention_step: unsupported head_dim=%d (supported: 32, 64, 128, 256)\n",
               shape.head_dim);
       std::abort();
   }

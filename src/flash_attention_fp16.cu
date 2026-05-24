@@ -258,8 +258,12 @@ void launch_flash_attention_fp16(const float* q, const float* k, const float* v,
     case 128:
       launch_typed<128>(q, k, v, out, shape, causal, stream);
       break;
+    case 256:
+      launch_typed<256>(q, k, v, out, shape, causal, stream);
+      break;
     default:
-      fprintf(stderr, "flash_attention_fp16: unsupported head_dim=%d (supported: 32, 64, 128)\n",
+      fprintf(stderr,
+              "flash_attention_fp16: unsupported head_dim=%d (supported: 32, 64, 128, 256)\n",
               shape.head_dim);
       std::abort();
   }

@@ -37,7 +37,7 @@ constexpr int kMmaK = 16;
 /// (K, V) chunk, write the updated state back. After the final chunk
 /// `launch_attention_finalize` divides O by l (unchanged, FP32 path).
 ///
-/// @tparam D Head dimension; multiple of 16. Supported: 32, 64, 128.
+/// @tparam D Head dimension; multiple of 16. Supported: 32, 64, 128, 256.
 template <int D>
 __global__ void attention_step_fp16_kernel(const __half* __restrict__ Q,
                                            const __half* __restrict__ K,
@@ -249,8 +249,12 @@ void launch_attention_step_fp16(const __half* q, const __half* k, const __half* 
     case 128:
       launch_step_fp16_typed<128>(q, k, v, o, m, l, shape, q_offset, k_offset, causal, stream);
       break;
+    case 256:
+      launch_step_fp16_typed<256>(q, k, v, o, m, l, shape, q_offset, k_offset, causal, stream);
+      break;
     default:
-      fprintf(stderr, "attention_step_fp16: unsupported head_dim=%d (supported: 32, 64, 128)\n",
+      fprintf(stderr,
+              "attention_step_fp16: unsupported head_dim=%d (supported: 32, 64, 128, 256)\n",
               shape.head_dim);
       std::abort();
   }
