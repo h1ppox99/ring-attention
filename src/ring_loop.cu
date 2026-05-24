@@ -15,6 +15,7 @@
 #include "attention.hpp"
 #include "cpu_attention.hpp"
 #include "device_tensor.hpp"
+#include "nccl_utils.hpp"
 #include "ring_gen.hpp"
 #include "ring_loop.hpp"
 #include "ring_partition.hpp"
@@ -313,12 +314,17 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
   AttentionShape sg_shape{B, H, Sl, Sl, D};
   sg_shape.kv_heads = kv_H;
 
+#ifdef RING_USE_NCCL
+  // NCCL communicator: GPU-to-GPU direct, no host staging needed.
+  ncclComm_t nccl_comm = ring_attention::nccl_init(R, P);
+#else
   // Pinned host staging — page-locked so D2H/H2D can be async without copies.
   float *K_send_h = nullptr, *V_send_h = nullptr, *K_recv_h = nullptr, *V_recv_h = nullptr;
   cudaHostAlloc(&K_send_h, kv_bytes, cudaHostAllocDefault);
   cudaHostAlloc(&V_send_h, kv_bytes, cudaHostAllocDefault);
   cudaHostAlloc(&K_recv_h, kv_bytes, cudaHostAllocDefault);
   cudaHostAlloc(&V_recv_h, kv_bytes, cudaHostAllocDefault);
+#endif
 
   // One full ring pass — returns (comm_ms, comp_ms, wait_ms) for that pass.
   auto one_pass = [&]() -> std::tuple<double, double, double> {
@@ -338,13 +344,26 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
     cudaEventCreate(&ev1);
 
     for (int step = 0; step < P; ++step) {
+#ifndef RING_USE_NCCL
       MPI_Request reqs[4];
       int n_req = 0;
+#endif
 
-      // (1) D2H stage current K/V → host pinned buffer + (2) post MPI exchange.
-      //     Skipped on the last step (no further chunk needed).
+      // (1) Post ring transfer for next step's K/V chunk. Skipped on the last step.
       const double t_post0 = MPI_Wtime();
       if (step < P - 1) {
+#ifdef RING_USE_NCCL
+        // Direct GPU-to-GPU via NCCL — no host staging, no D2H/H2D.
+        // ncclGroupEnd enqueues all ops to the default stream; the transfer
+        // runs asynchronously until cudaStreamSynchronize below.
+        ncclGroupStart();
+        NCCL_CHECK(ncclSend(K_cur, kv_local_elem, ncclFloat, next_rank, nccl_comm, 0));
+        NCCL_CHECK(ncclRecv(K_recv, kv_local_elem, ncclFloat, prev_rank, nccl_comm, 0));
+        NCCL_CHECK(ncclSend(V_cur, kv_local_elem, ncclFloat, next_rank, nccl_comm, 0));
+        NCCL_CHECK(ncclRecv(V_recv, kv_local_elem, ncclFloat, prev_rank, nccl_comm, 0));
+        NCCL_CHECK(ncclGroupEnd());
+#else
+        // (1) D2H stage current K/V → host pinned buffer + (2) post MPI exchange.
         cudaMemcpy(K_send_h, K_cur, kv_bytes, cudaMemcpyDeviceToHost);
         cudaMemcpy(V_send_h, V_cur, kv_bytes, cudaMemcpyDeviceToHost);
         const int n = mpi_int_count(kv_local_elem, "run_ring_blocking/MPI_Isend|Irecv");
@@ -352,6 +371,7 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
         MPI_Irecv(K_recv_h, n, MPI_FLOAT, prev_rank, /*tag=*/0, MPI_COMM_WORLD, &reqs[n_req++]);
         MPI_Isend(V_send_h, n, MPI_FLOAT, next_rank, /*tag=*/1, MPI_COMM_WORLD, &reqs[n_req++]);
         MPI_Irecv(V_recv_h, n, MPI_FLOAT, prev_rank, /*tag=*/1, MPI_COMM_WORLD, &reqs[n_req++]);
+#endif
       }
       const double t_post1 = MPI_Wtime();
       comm_acc += (t_post1 - t_post0) * 1e3;
@@ -379,10 +399,20 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
       cudaEventElapsedTime(&comp_float_ms, ev0, ev1);
       comp_acc += comp_float_ms;
 
-      // (4) Wait for the comm we posted, then H2D the received chunk.
-      //     wait_ms = MPI_Waitall only (the headline "unhidden comm" metric);
-      //     H2D is folded into comm_ms.
+      // (4) Wait for the transfer posted in (1) to complete, then promote buffers.
       if (step < P - 1) {
+#ifdef RING_USE_NCCL
+        // Synchronise the default stream: NCCL ops from (1) must finish before
+        // the next step's kernel reads K_recv (now aliased as K_cur).
+        // wait_ms = the unhidden part of the NCCL transfer (after the kernel).
+        const double t_wait0 = MPI_Wtime();
+        cudaStreamSynchronize(0);
+        const double t_wait1 = MPI_Wtime();
+        wait_acc += (t_wait1 - t_wait0) * 1e3;
+        // K_recv already holds the received data on the device — no H2D needed.
+#else
+        // wait_ms = MPI_Waitall only (the headline "unhidden comm" metric);
+        // H2D is folded into comm_ms.
         const double t_wait0 = MPI_Wtime();
         MPI_Waitall(n_req, reqs, MPI_STATUSES_IGNORE);
         const double t_wait1 = MPI_Wtime();
@@ -393,7 +423,7 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
         cudaMemcpy(V_recv, V_recv_h, kv_bytes, cudaMemcpyHostToDevice);
         const double t_h2d1 = MPI_Wtime();
         comm_acc += (t_h2d1 - t_h2d0) * 1e3;
-
+#endif
         // (5) Promote received buffers to "current"; the old current slot will
         //     be reused as the next recv target.
         std::swap(K_cur, K_recv);
@@ -483,10 +513,14 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
   }
   res.max_err = max_err;
 
+#ifdef RING_USE_NCCL
+  ncclCommDestroy(nccl_comm);
+#else
   cudaFreeHost(K_send_h);
   cudaFreeHost(V_send_h);
   cudaFreeHost(K_recv_h);
   cudaFreeHost(V_recv_h);
+#endif
 
   return res;
 }
@@ -578,12 +612,17 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
   AttentionShape sg_shape{B, H, Sl, Sl, D};
   sg_shape.kv_heads = kv_H;
 
+#ifdef RING_USE_NCCL
+  // NCCL communicator: GPU-to-GPU direct, no host staging needed.
+  ncclComm_t nccl_comm = ring_attention::nccl_init(R, P);
+#else
   // Pinned host staging.
   float *K_send_h = nullptr, *V_send_h = nullptr, *K_recv_h = nullptr, *V_recv_h = nullptr;
   cudaHostAlloc(&K_send_h, kv_bytes, cudaHostAllocDefault);
   cudaHostAlloc(&V_send_h, kv_bytes, cudaHostAllocDefault);
   cudaHostAlloc(&K_recv_h, kv_bytes, cudaHostAllocDefault);
   cudaHostAlloc(&V_recv_h, kv_bytes, cudaHostAllocDefault);
+#endif
 
   // Two CUDA streams + one reusable event for the producer/consumer handshake.
   cudaStream_t stream_compute = nullptr, stream_copy = nullptr;
@@ -652,6 +691,26 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
       //     kernel from (2) runs on stream_compute. Skipped on the last step
       //     because there is no next chunk to ingest.
       if (step < P - 1) {
+#ifdef RING_USE_NCCL
+        // WAR fence: K_recv is aliased from the previous step's K_cur.
+        // The previous step's kernel (on stream_compute) was still reading it;
+        // stream_copy must not write until stream_compute has passed ev_ends[step-1].
+        if (step >= 1) cudaStreamWaitEvent(stream_copy, ev_ends[step - 1], 0);
+
+        // NCCL send/recv on stream_copy — fully async, no host involvement.
+        // The kernel on stream_compute continues in parallel (true GPU overlap).
+        // comm_ms is captured via ev_h2d_starts/ends after the loop.
+        cudaEventRecord(ev_h2d_starts[step], stream_copy);
+        ncclGroupStart();
+        NCCL_CHECK(ncclSend(K_cur, kv_local_elem, ncclFloat, next_rank, nccl_comm, stream_copy));
+        NCCL_CHECK(ncclRecv(K_recv, kv_local_elem, ncclFloat, prev_rank, nccl_comm, stream_copy));
+        NCCL_CHECK(ncclSend(V_cur, kv_local_elem, ncclFloat, next_rank, nccl_comm, stream_copy));
+        NCCL_CHECK(ncclRecv(V_recv, kv_local_elem, ncclFloat, prev_rank, nccl_comm, stream_copy));
+        NCCL_CHECK(ncclGroupEnd());
+        cudaEventRecord(ev_h2d_ends[step], stream_copy);
+        cudaEventRecord(comm_done, stream_copy);
+        // wait_acc remains 0: no blocking host wait exists in the NCCL path.
+#else
         const double t_post0 = MPI_Wtime();
         // D2H reads K_cur — concurrent with the kernel reading K_cur (both
         // are reads, so there is no race; the copy engine and the SMs run
@@ -694,6 +753,7 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
         cudaMemcpyAsync(V_recv, V_recv_h, kv_bytes, cudaMemcpyHostToDevice, stream_copy);
         cudaEventRecord(ev_h2d_ends[step], stream_copy);
         cudaEventRecord(comm_done, stream_copy);
+#endif
 
         // (4) Promote received buffers. Pointer-only swap — the actual write
         //     is still in flight on stream_copy and is gated by comm_done.
@@ -803,10 +863,14 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
   cudaEventDestroy(comm_done);
   cudaStreamDestroy(stream_compute);
   cudaStreamDestroy(stream_copy);
+#ifdef RING_USE_NCCL
+  ncclCommDestroy(nccl_comm);
+#else
   cudaFreeHost(K_send_h);
   cudaFreeHost(V_send_h);
   cudaFreeHost(K_recv_h);
   cudaFreeHost(V_recv_h);
+#endif
 
   return res;
 }

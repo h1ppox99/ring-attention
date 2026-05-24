@@ -19,6 +19,15 @@ add_library(ring_attention STATIC
 
 target_include_directories(ring_attention PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(ring_attention PUBLIC CUDA::cudart MPI::MPI_CXX)
+
+if(USE_NCCL)
+  target_include_directories(ring_attention PRIVATE ${NCCL_INCLUDE_DIR})
+  target_link_libraries(ring_attention PUBLIC ${NCCL_LIBRARY})
+  target_compile_definitions(ring_attention PUBLIC RING_USE_NCCL)
+  message(STATUS "ring_attention: NCCL back-end ENABLED")
+else()
+  message(STATUS "ring_attention: NCCL back-end DISABLED (MPI host-staging path)")
+endif()
 set_target_properties(ring_attention PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON
   POSITION_INDEPENDENT_CODE ON
