@@ -70,11 +70,17 @@ Config parse_args(int argc, char** argv) {
       cfg.seq = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--head_dim") && nxt)
       cfg.head_dim = std::atoi(argv[++i]);
-    else if (!std::strcmp(argv[i], "--causal") && nxt)
-      cfg.causal = std::atoi(argv[++i]) != 0;
-    else if (!std::strcmp(argv[i], "--zigzag") && nxt)
-      cfg.zigzag = std::atoi(argv[++i]) != 0;
-    else if (!std::strcmp(argv[i], "--mode") && nxt)
+    else if (!std::strcmp(argv[i], "--causal")) {
+      if (nxt && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9' && argv[i + 1][1] == '\0')
+        cfg.causal = std::atoi(argv[++i]) != 0;
+      else
+        cfg.causal = true;
+    } else if (!std::strcmp(argv[i], "--zigzag")) {
+      if (nxt && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9' && argv[i + 1][1] == '\0')
+        cfg.zigzag = std::atoi(argv[++i]) != 0;
+      else
+        cfg.zigzag = true;
+    } else if (!std::strcmp(argv[i], "--mode") && nxt)
       cfg.mode = argv[++i];
     else if (!std::strcmp(argv[i], "--dtype") && nxt)
       cfg.dtype = argv[++i];
