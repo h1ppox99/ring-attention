@@ -140,6 +140,8 @@ int main() {
 
   rc |= run_ring({1, 1, 64, 64, 32}, 4, true, 7u, "fp16 d=32 Sq=Sk=64 P=4 causal");
   rc |= run_ring({1, 1, 64, 64, 128}, 2, true, 8u, "fp16 d=128 Sq=Sk=64 P=2 causal");
+  rc |= run_ring({1, 1, 64, 64, 256}, 2, false, 11u, "fp16 d=256 Sq=Sk=64 P=2 non-causal");
+  rc |= run_ring({1, 2, 64, 64, 256}, 2, true, 12u, "fp16 d=256 Sq=Sk=64 P=2 causal");
 
   rc |= run_ring({1, 2, 32, 64, 64}, 1, false, 9u, "fp16 P=1 sanity non-causal");
   rc |= run_ring({1, 2, 64, 64, 64}, 1, true, 10u, "fp16 P=1 sanity causal");

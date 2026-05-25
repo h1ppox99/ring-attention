@@ -98,6 +98,10 @@ int main() {
   rc |= run_case({1, 1, 32, 64, 128}, false, 9u, "fp16 d=128 32x64 non-causal");
   rc |= run_case({1, 1, 64, 64, 128}, true, 10u, "fp16 d=128 64x64 causal");
 
+  // head_dim = 256.
+  rc |= run_case({1, 1, 32, 64, 256}, false, 11u, "fp16 d=256 32x64 non-causal");
+  rc |= run_case({1, 1, 64, 64, 256}, true, 12u, "fp16 d=256 64x64 causal");
+
   if (rc == 0) printf("flash_attention_fp16 OK\n");
   return rc;
 }
