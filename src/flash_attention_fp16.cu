@@ -12,7 +12,7 @@
 ///   - One block computes BR=16 consecutive query rows for one (batch, head).
 ///   - K/V is consumed in BC=16-key tiles.
 ///   - The head-dim D is processed in 16-wide inner slices (D must be a
-///     multiple of 16). Supported: 32 / 64 / 128.
+///     multiple of 16). Supported: 32 / 64 / 128 / 256.
 ///
 /// Per-block shared memory:
 ///   - Q_h[BR][D]   fp16   (one-time load)
@@ -52,7 +52,7 @@ __device__ __forceinline__ __half f2h(float x) { return __float2half_rn(x); }
 
 /// FlashAttention with wmma 16×16×16 Tensor Core matmuls.
 ///
-/// @tparam D Head dimension; must be a multiple of 16 and one of {32, 64, 128}.
+/// @tparam D Head dimension; must be a multiple of 16 and one of {32, 64, 128, 256}.
 template <int D>
 __global__ void flash_attention_fp16_kernel(const float* __restrict__ Q,
                                             const float* __restrict__ K,
