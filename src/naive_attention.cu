@@ -18,7 +18,7 @@ namespace {
 /// parallelize the V projection across head_dim.
 __global__ void naive_attention_kernel(const float* __restrict__ Q, const float* __restrict__ K,
                                        const float* __restrict__ V, float* __restrict__ O, int H,
-                                       int Sq, int Sk, int D, float scale, bool causal,
+                                       int kv_H, int Sq, int Sk, int D, float scale, bool causal,
                                        int causal_shift) {
   const int i = blockIdx.x;
   const int h = blockIdx.y;
@@ -27,7 +27,7 @@ __global__ void naive_attention_kernel(const float* __restrict__ Q, const float*
   const int nthreads = blockDim.x;
 
   const long head_q = ((long)b * H + h) * Sq * D;
-  const long head_k = ((long)b * H + h) * Sk * D;
+  const long head_k = ((long)b * kv_H + (h % kv_H)) * Sk * D;
 
   const float* q_row = Q + head_q + (long)i * D;
   const float* k_h = K + head_k;
@@ -89,6 +89,7 @@ void launch_naive_attention(const float* q, const float* k, const float* v, floa
                             const AttentionShape& shape, bool causal, cudaStream_t stream) {
   const int B = shape.batch;
   const int H = shape.heads;
+  const int kv_H = (shape.kv_heads > 0) ? shape.kv_heads : shape.heads;
   const int Sq = shape.seq_q;
   const int Sk = shape.seq_k;
   const int D = shape.head_dim;
@@ -101,8 +102,8 @@ void launch_naive_attention(const float* q, const float* k, const float* v, floa
   const dim3 grid(Sq, H, B);
   const std::size_t smem_bytes = (static_cast<std::size_t>(Sk) + 2) * sizeof(float);
 
-  naive_attention_kernel<<<grid, block, smem_bytes, stream>>>(q, k, v, out, H, Sq, Sk, D, scale,
-                                                              causal, causal_shift);
+  naive_attention_kernel<<<grid, block, smem_bytes, stream>>>(q, k, v, out, H, kv_H, Sq, Sk, D,
+                                                              scale, causal, causal_shift);
   cudaCheck(cudaGetLastError());
 }
 
