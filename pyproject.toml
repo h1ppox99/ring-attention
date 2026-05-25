@@ -10,6 +10,7 @@ dependencies = [
     "pandas>=3.0.2",
     "pytest>=9.0.3",
     "pytest-cov>=6.0.0",
+    "gcovr>=8.2",
     "ring-attention-pytorch>=0.5",
     "ruff>=0.15.11",
     "torch>=2.11.0",

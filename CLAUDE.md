@@ -41,6 +41,15 @@ For debug builds replace `release` with `debug`. Override CUDA arch with:
 cmake --preset=release -DCMAKE_CUDA_ARCHITECTURES=75
 ```
 
+**C++ coverage** (inside a GPU allocation):
+```bash
+bash scripts/coverage.sh           # build → ctest → results/coverage/cov.txt
+bash scripts/coverage.sh -L gpu    # extra args forwarded to ctest
+```
+Uses the `coverage` CMake preset (forces g++ + `--coverage`) and `gcovr` from
+the venv. Only host-side C++ is instrumented — CUDA device kernels are not
+measured by gcov.
+
 **CUDA architecture**: `75` (Turing) — default in CMakeLists.txt.
 
 ## Directory layout
