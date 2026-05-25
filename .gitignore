@@ -6,6 +6,11 @@ cmake-build-*/
 *.so
 *.a
 
+# C++ coverage (gcov / gcovr)
+*.gcno
+*.gcda
+*.gcov
+
 # Python
 __pycache__/
 *.py[cod]
