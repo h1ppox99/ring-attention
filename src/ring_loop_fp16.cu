@@ -282,8 +282,10 @@ ring_attention::RingResult run_ring_blocking_fp16(const ring_attention::RingConf
     fill_kv_into(v_h_init, 2, sg * kv_sg_elem, part.k_offset_for_step(0, sg));
   }
 
-  // Q (fp16 on device) — uploaded once.
-  DeviceTensor<float> scratch_f(q_local_elem);
+  // Q (fp16 on device) — uploaded once. Scratch is reused below to stage K/V,
+  // so size it to fit the largest payload (kv_local_elem can exceed q_local_elem
+  // if kv_heads > heads).
+  DeviceTensor<float> scratch_f(std::max(q_local_elem, kv_local_elem));
   DeviceTensor<__half> q_d(q_local_elem);
   upload_as_half(q_h, scratch_f, q_d.data(), q_local_elem);
 
@@ -304,8 +306,8 @@ ring_attention::RingResult run_ring_blocking_fp16(const ring_attention::RingConf
   cudaHostAlloc(&V_recv_h, kv_bytes, cudaHostAllocDefault);
 
   auto one_pass = [&]() -> std::tuple<double, double, double> {
-    // Reset K/V to local chunk. scratch_f (q_local_elem ≥ kv_local_elem since kv_H ≤ H)
-    // is large enough to serve as the fp32 staging buffer.
+    // Reset K/V to local chunk. scratch_f was sized to max(q_local_elem, kv_local_elem)
+    // so it is large enough to serve as the fp32 staging buffer for any valid kv_H.
     upload_as_half(k_h_init, scratch_f, K_a.data(), kv_local_elem);
     upload_as_half(v_h_init, scratch_f, V_a.data(), kv_local_elem);
     __half* K_cur = K_a.data();
