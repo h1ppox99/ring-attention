@@ -86,8 +86,8 @@ __global__ void finalize_kernel(float* O, const float* L, int H, int Sq, int D) 
 template <int BR, int BC, int D>
 __global__ void attention_step_kernel(const float* __restrict__ Q, const float* __restrict__ K,
                                       const float* __restrict__ V, float* __restrict__ O,
-                                      float* __restrict__ M, float* __restrict__ L, int H, int Sq,
-                                      int Sk, float scale, bool causal, int q_offset,
+                                      float* __restrict__ M, float* __restrict__ L, int H, int kv_H,
+                                      int Sq, int Sk, float scale, bool causal, int q_offset,
                                       int k_offset) {
   const int tid = threadIdx.x;
   const int q_tile = blockIdx.x;
@@ -98,7 +98,7 @@ __global__ void attention_step_kernel(const float* __restrict__ Q, const float* 
   const bool active = (i_local < Sq);
 
   const long head_q = ((long)b * H + h) * Sq * D;
-  const long head_k = ((long)b * H + h) * Sk * D;
+  const long head_k = ((long)b * kv_H + (h % kv_H)) * Sk * D;
   const long row_idx = ((long)b * H + h) * Sq + i_local;
 
   __shared__ float Q_tile[BR * D];
@@ -205,9 +205,11 @@ void launch_step_typed(const float* q, const float* k, const float* v, float* ou
                        bool causal, cudaStream_t stream) {
   const dim3 grid(ceil_div(shape.seq_q, BR), shape.heads, shape.batch);
   const dim3 block(BR);
+  const int kv_H = (shape.kv_heads > 0) ? shape.kv_heads : shape.heads;
   const float scale = 1.0f / std::sqrt(static_cast<float>(D));
-  attention_step_kernel<BR, BC, D><<<grid, block, 0, stream>>>(
-      q, k, v, out, m, l, shape.heads, shape.seq_q, shape.seq_k, scale, causal, q_offset, k_offset);
+  attention_step_kernel<BR, BC, D><<<grid, block, 0, stream>>>(q, k, v, out, m, l, shape.heads,
+                                                               kv_H, shape.seq_q, shape.seq_k,
+                                                               scale, causal, q_offset, k_offset);
   cudaCheck(cudaGetLastError());
 }
 

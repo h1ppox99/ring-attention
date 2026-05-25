@@ -46,6 +46,7 @@ struct Config {
   int heads = 4;
   int seq = 512;  // total sequence length; must be divisible by cp_size
   int head_dim = 64;
+  int kv_heads = 0;  // 0 = MHA; set for GQA/MQA
   bool causal = false;
   bool zigzag = false;
   std::string mode = "allgather";  // allgather | ring-blocking | ring-overlap
@@ -70,6 +71,8 @@ Config parse_args(int argc, char** argv) {
       cfg.seq = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--head_dim") && nxt)
       cfg.head_dim = std::atoi(argv[++i]);
+    else if (!std::strcmp(argv[i], "--kv_heads") && nxt)
+      cfg.kv_heads = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--causal") && nxt)
       cfg.causal = std::atoi(argv[++i]) != 0;
     else if (!std::strcmp(argv[i], "--zigzag") && nxt)
@@ -155,6 +158,7 @@ int main(int argc, char** argv) {
   rcfg.heads = cfg.heads;
   rcfg.seq = cfg.seq;
   rcfg.head_dim = cfg.head_dim;
+  rcfg.kv_heads = cfg.kv_heads;
   rcfg.causal = cfg.causal;
   rcfg.zigzag = cfg.zigzag;
   rcfg.verify = cfg.verify;

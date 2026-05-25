@@ -19,9 +19,10 @@ namespace ring_attention {
 struct AttentionShape {
   int batch;
   int heads;
-  int seq_q;     ///< Number of query rows.
-  int seq_k;     ///< Number of key/value rows.
-  int head_dim;  ///< Per-head feature dimension.
+  int seq_q;        ///< Number of query rows.
+  int seq_k;        ///< Number of key/value rows.
+  int head_dim;     ///< Per-head feature dimension.
+  int kv_heads{0};  ///< KV head count for GQA/MQA; 0 means same as heads (MHA).
 };
 
 /// Total element count for a (batch, heads, seq, head_dim) tensor.

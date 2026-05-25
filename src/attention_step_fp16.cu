@@ -43,8 +43,8 @@ __global__ void attention_step_fp16_kernel(const __half* __restrict__ Q,
                                            const __half* __restrict__ K,
                                            const __half* __restrict__ V, float* __restrict__ O,
                                            float* __restrict__ M, float* __restrict__ L, int H,
-                                           int Sq, int Sk, float scale, bool causal, int q_offset,
-                                           int k_offset) {
+                                           int kv_H, int Sq, int Sk, float scale, bool causal,
+                                           int q_offset, int k_offset) {
   static_assert(D % kMmaK == 0, "D must be a multiple of 16 for wmma path");
   constexpr int kDSlices = D / kMmaK;
 
@@ -54,7 +54,7 @@ __global__ void attention_step_fp16_kernel(const __half* __restrict__ Q,
   const int b = blockIdx.z;
 
   const long head_q = ((long)b * H + h) * Sq * D;
-  const long head_k = ((long)b * H + h) * Sk * D;
+  const long head_k = ((long)b * kv_H + (h % kv_H)) * Sk * D;
   const long base_row = ((long)b * H + h) * Sq;
 
   __shared__ __half Q_h[kBR * D];
@@ -228,9 +228,11 @@ void launch_step_fp16_typed(const __half* q, const __half* k, const __half* v, f
                             bool causal, cudaStream_t stream) {
   const dim3 grid(ceil_div(shape.seq_q, kBR), shape.heads, shape.batch);
   const dim3 block(32);
+  const int kv_H = (shape.kv_heads > 0) ? shape.kv_heads : shape.heads;
   const float scale = 1.0f / std::sqrt(static_cast<float>(D));
-  attention_step_fp16_kernel<D><<<grid, block, 0, stream>>>(
-      q, k, v, o, m, l, shape.heads, shape.seq_q, shape.seq_k, scale, causal, q_offset, k_offset);
+  attention_step_fp16_kernel<D><<<grid, block, 0, stream>>>(q, k, v, o, m, l, shape.heads, kv_H,
+                                                            shape.seq_q, shape.seq_k, scale, causal,
+                                                            q_offset, k_offset);
   cudaCheck(cudaGetLastError());
 }
 

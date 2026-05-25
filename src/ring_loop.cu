@@ -63,48 +63,52 @@ ring_attention::RingResult run_allgather(const ring_attention::RingConfig& cfg) 
   using namespace ring_attention;
 
   const int B = cfg.batch, H = cfg.heads, D = cfg.head_dim;
+  const int kv_H = (cfg.kv_heads > 0) ? cfg.kv_heads : cfg.heads;
   const int S = cfg.seq, P = cfg.cp_size, R = cfg.rank;
   const int Sl = S / P;
   const int q_off = R * Sl;
 
-  const std::size_t local_elem = static_cast<std::size_t>(B) * H * Sl * D;
-  const std::size_t full_elem = static_cast<std::size_t>(B) * H * S * D;
+  const std::size_t q_local_elem = static_cast<std::size_t>(B) * H * Sl * D;
+  const std::size_t kv_local_elem = static_cast<std::size_t>(B) * kv_H * Sl * D;
+  const std::size_t q_full_elem = static_cast<std::size_t>(B) * H * S * D;
+  const std::size_t kv_full_elem = static_cast<std::size_t>(B) * kv_H * S * D;
   const std::size_t m_count = static_cast<std::size_t>(B) * H * Sl;
 
   // Fill local Q/K/V on host — constant across iterations.
   std::vector<float> q_h, k_h, v_h;
   fill_host_tensor(q_h, cfg.seed, 0, B, H, Sl, D, q_off);
-  fill_host_tensor(k_h, cfg.seed, 1, B, H, Sl, D, q_off);
-  fill_host_tensor(v_h, cfg.seed, 2, B, H, Sl, D, q_off);
+  fill_host_tensor(k_h, cfg.seed, 1, B, kv_H, Sl, D, q_off);
+  fill_host_tensor(v_h, cfg.seed, 2, B, kv_H, Sl, D, q_off);
 
   // H2D local Q — stays on device for all iterations.
-  DeviceTensor<float> q_d(local_elem);
+  DeviceTensor<float> q_d(q_local_elem);
   q_d.copy_from_host(q_h);
 
   // Reusable buffers for gather + rearrange + device K/V.
-  std::vector<float> k_gathered(full_elem), v_gathered(full_elem);
-  std::vector<float> full_k_h(full_elem), full_v_h(full_elem);
-  DeviceTensor<float> k_d(full_elem), v_d(full_elem);
-  DeviceTensor<float> out_d(local_elem), m_d(m_count), l_d(m_count);
-  const AttentionShape shape{B, H, Sl, S, D};
+  std::vector<float> k_gathered(kv_full_elem), v_gathered(kv_full_elem);
+  std::vector<float> full_k_h(kv_full_elem), full_v_h(kv_full_elem);
+  DeviceTensor<float> k_d(kv_full_elem), v_d(kv_full_elem);
+  DeviceTensor<float> out_d(q_local_elem), m_d(m_count), l_d(m_count);
+  AttentionShape shape{B, H, Sl, S, D};
+  shape.kv_heads = kv_H;
 
   // One complete allgather + attention pass.
   // Returns {comm_ms, comp_ms} for that single pass.
   auto one_pass = [&]() -> std::pair<double, double> {
     // --- Communication: allgather K,V + rearrange + H2D ----------------------
     const double tc0 = MPI_Wtime();
-    MPI_Allgather(k_h.data(), static_cast<int>(local_elem), MPI_FLOAT, k_gathered.data(),
-                  static_cast<int>(local_elem), MPI_FLOAT, MPI_COMM_WORLD);
-    MPI_Allgather(v_h.data(), static_cast<int>(local_elem), MPI_FLOAT, v_gathered.data(),
-                  static_cast<int>(local_elem), MPI_FLOAT, MPI_COMM_WORLD);
+    MPI_Allgather(k_h.data(), static_cast<int>(kv_local_elem), MPI_FLOAT, k_gathered.data(),
+                  static_cast<int>(kv_local_elem), MPI_FLOAT, MPI_COMM_WORLD);
+    MPI_Allgather(v_h.data(), static_cast<int>(kv_local_elem), MPI_FLOAT, v_gathered.data(),
+                  static_cast<int>(kv_local_elem), MPI_FLOAT, MPI_COMM_WORLD);
 
-    // Rearrange from rank-major (P,B,H,Sl,D) to (B,H,S,D).
+    // Rearrange from rank-major (P,B,kv_H,Sl,D) to (B,kv_H,S,D).
     for (int b = 0; b < B; ++b)
-      for (int h = 0; h < H; ++h)
+      for (int h = 0; h < kv_H; ++h)
         for (int p = 0; p < P; ++p) {
-          const std::size_t src = static_cast<std::size_t>(p) * local_elem +
-                                  static_cast<std::size_t>(b * H + h) * Sl * D;
-          const std::size_t dst = (static_cast<std::size_t>(b * H + h) * S + p * Sl) * D;
+          const std::size_t src = static_cast<std::size_t>(p) * kv_local_elem +
+                                  static_cast<std::size_t>(b * kv_H + h) * Sl * D;
+          const std::size_t dst = (static_cast<std::size_t>(b * kv_H + h) * S + p * Sl) * D;
           std::copy(k_gathered.data() + src, k_gathered.data() + src + Sl * D,
                     full_k_h.data() + dst);
           std::copy(v_gathered.data() + src, v_gathered.data() + src + Sl * D,
@@ -169,19 +173,21 @@ ring_attention::RingResult run_allgather(const ring_attention::RingConfig& cfg) 
   // Verification: run once after timing, compare against cpu_attention.
   float max_err = -1.f;
   if (cfg.verify) {
-    std::vector<float> full_q_cpu(full_elem), full_k_cpu(full_elem), full_v_cpu(full_elem);
+    std::vector<float> full_q_cpu(q_full_elem), full_k_cpu(kv_full_elem), full_v_cpu(kv_full_elem);
     fill_host_tensor(full_q_cpu, cfg.seed, 0, B, H, S, D, 0);
-    fill_host_tensor(full_k_cpu, cfg.seed, 1, B, H, S, D, 0);
-    fill_host_tensor(full_v_cpu, cfg.seed, 2, B, H, S, D, 0);
+    fill_host_tensor(full_k_cpu, cfg.seed, 1, B, kv_H, S, D, 0);
+    fill_host_tensor(full_v_cpu, cfg.seed, 2, B, kv_H, S, D, 0);
 
-    std::vector<float> cpu_out(full_elem);
+    AttentionShape ref_shape{B, H, S, S, D};
+    ref_shape.kv_heads = kv_H;
+    std::vector<float> cpu_out(q_full_elem);
     cpu_attention(full_q_cpu.data(), full_k_cpu.data(), full_v_cpu.data(), cpu_out.data(),
-                  AttentionShape{B, H, S, S, D}, cfg.causal);
+                  ref_shape, cfg.causal);
 
     // Re-run one pass so out_d holds a fresh result.
     one_pass();
 
-    std::vector<float> dev_out_h(local_elem);
+    std::vector<float> dev_out_h(q_local_elem);
     out_d.copy_to_host(dev_out_h);
 
     max_err = 0.f;
@@ -228,6 +234,7 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
   using namespace ring_attention;
 
   const int B = cfg.batch, H = cfg.heads, D = cfg.head_dim;
+  const int kv_H = (cfg.kv_heads > 0) ? cfg.kv_heads : cfg.heads;
   const int S = cfg.seq, P = cfg.cp_size, R = cfg.rank;
 
   const RingPartition::Mode mode =
@@ -236,58 +243,70 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
   const int nsg = part.num_sub_groups();  // 1 (contiguous) or 2 (zigzag)
   const int Sl = part.local_chunk_len();  // per-sub-group rows: S/P or S/(2P)
   const int Sl_local = Sl * nsg;          // total local rows per rank = S/P
-  const std::size_t sg_elem = static_cast<std::size_t>(B) * H * Sl * D;
-  const std::size_t local_elem = static_cast<std::size_t>(nsg) * sg_elem;
+  const std::size_t q_sg_elem = static_cast<std::size_t>(B) * H * Sl * D;
+  const std::size_t q_local_elem = static_cast<std::size_t>(nsg) * q_sg_elem;
+  const std::size_t kv_sg_elem = static_cast<std::size_t>(B) * kv_H * Sl * D;
+  const std::size_t kv_local_elem = static_cast<std::size_t>(nsg) * kv_sg_elem;
   const std::size_t m_sg = static_cast<std::size_t>(B) * H * Sl;
   const std::size_t m_count = static_cast<std::size_t>(nsg) * m_sg;
-  const std::size_t bytes = local_elem * sizeof(float);
+  const std::size_t kv_bytes = kv_local_elem * sizeof(float);
 
   const int next_rank = part.next_rank();
   const int prev_rank = part.prev_rank();
 
   // Fill into the [lo|hi] layout: sub-group sg occupies [sg*sg_elem, (sg+1)*sg_elem).
   // The stride within each (b,h) head is Sl (not Sl_local), so the kernel sees a
-  // valid [B,H,Sl,D] tensor at K_buf + sg*sg_elem.
-  auto fill_into = [&](std::vector<float>& buf, int tid, std::size_t off, int global_seq_start) {
+  // valid [B,H,Sl,D] tensor at buf + sg*q_sg_elem (Q) or buf + sg*kv_sg_elem (K/V).
+  auto fill_q_into = [&](std::vector<float>& buf, int tid, std::size_t off, int gss) {
     for (int b = 0; b < B; ++b)
       for (int h = 0; h < H; ++h)
         for (int s = 0; s < Sl; ++s)
           for (int d = 0; d < D; ++d)
             buf[off + (static_cast<std::size_t>(b * H + h) * Sl + s) * D + d] =
-                gen_elem(cfg.seed, tid, b, h, global_seq_start + s, d);
+                gen_elem(cfg.seed, tid, b, h, gss + s, d);
   };
 
-  std::vector<float> q_h(local_elem), k_h_init(local_elem), v_h_init(local_elem);
+  auto fill_kv_into = [&](std::vector<float>& buf, int tid, std::size_t off, int gss) {
+    for (int b = 0; b < B; ++b)
+      for (int h = 0; h < kv_H; ++h)
+        for (int s = 0; s < Sl; ++s)
+          for (int d = 0; d < D; ++d)
+            buf[off + (static_cast<std::size_t>(b * kv_H + h) * Sl + s) * D + d] =
+                gen_elem(cfg.seed, tid, b, h, gss + s, d);
+  };
+
+  std::vector<float> q_h(q_local_elem), k_h_init(kv_local_elem), v_h_init(kv_local_elem);
   for (int sg = 0; sg < nsg; ++sg) {
-    fill_into(q_h, 0, sg * sg_elem, part.q_offset(sg));
-    fill_into(k_h_init, 1, sg * sg_elem, part.k_offset_for_step(0, sg));
-    fill_into(v_h_init, 2, sg * sg_elem, part.k_offset_for_step(0, sg));
+    fill_q_into(q_h, 0, sg * q_sg_elem, part.q_offset(sg));
+    fill_kv_into(k_h_init, 1, sg * kv_sg_elem, part.k_offset_for_step(0, sg));
+    fill_kv_into(v_h_init, 2, sg * kv_sg_elem, part.k_offset_for_step(0, sg));
   }
 
   // Device buffers: Q stays put; K/V double-buffered (K_a/K_b, V_a/V_b).
-  DeviceTensor<float> q_d(local_elem);
+  DeviceTensor<float> q_d(q_local_elem);
   q_d.copy_from_host(q_h);
-  DeviceTensor<float> K_a(local_elem), K_b(local_elem);
-  DeviceTensor<float> V_a(local_elem), V_b(local_elem);
-  DeviceTensor<float> out_d(local_elem), m_d(m_count), l_d(m_count);
+  DeviceTensor<float> K_a(kv_local_elem), K_b(kv_local_elem);
+  DeviceTensor<float> V_a(kv_local_elem), V_b(kv_local_elem);
+  DeviceTensor<float> out_d(q_local_elem), m_d(m_count), l_d(m_count);
 
   // init_shape seq_q = Sl_local initialises all sub-groups in one call;
   // sg_shape seq_q = Sl is used per (sg_q, sg_k) kernel call.
   const AttentionShape init_shape{B, H, Sl_local, S, D};
-  const AttentionShape sg_shape{B, H, Sl, Sl, D};
+  AttentionShape sg_shape{B, H, Sl, Sl, D};
+  sg_shape.kv_heads = kv_H;
 
   // Pinned host staging — page-locked so D2H/H2D can be async without copies.
   float *K_send_h = nullptr, *V_send_h = nullptr, *K_recv_h = nullptr, *V_recv_h = nullptr;
-  cudaHostAlloc(&K_send_h, bytes, cudaHostAllocDefault);
-  cudaHostAlloc(&V_send_h, bytes, cudaHostAllocDefault);
-  cudaHostAlloc(&K_recv_h, bytes, cudaHostAllocDefault);
-  cudaHostAlloc(&V_recv_h, bytes, cudaHostAllocDefault);
+  cudaHostAlloc(&K_send_h, kv_bytes, cudaHostAllocDefault);
+  cudaHostAlloc(&V_send_h, kv_bytes, cudaHostAllocDefault);
+  cudaHostAlloc(&K_recv_h, kv_bytes, cudaHostAllocDefault);
+  cudaHostAlloc(&V_recv_h, kv_bytes, cudaHostAllocDefault);
 
   // One full ring pass — returns (comm_ms, comp_ms, wait_ms) for that pass.
   auto one_pass = [&]() -> std::tuple<double, double, double> {
     // Reset K/V to local chunk (timed iterations need a clean starting state).
-    cudaMemcpy(K_a.data(), k_h_init.data(), bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(V_a.data(), v_h_init.data(), bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(K_a.data(), k_h_init.data(), kv_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(V_a.data(), v_h_init.data(), kv_bytes, cudaMemcpyHostToDevice);
     float* K_cur = K_a.data();
     float* V_cur = V_a.data();
     float* K_recv = K_b.data();
@@ -308,9 +327,9 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
       //     Skipped on the last step (no further chunk needed).
       const double t_post0 = MPI_Wtime();
       if (step < P - 1) {
-        cudaMemcpy(K_send_h, K_cur, bytes, cudaMemcpyDeviceToHost);
-        cudaMemcpy(V_send_h, V_cur, bytes, cudaMemcpyDeviceToHost);
-        const int n = static_cast<int>(local_elem);
+        cudaMemcpy(K_send_h, K_cur, kv_bytes, cudaMemcpyDeviceToHost);
+        cudaMemcpy(V_send_h, V_cur, kv_bytes, cudaMemcpyDeviceToHost);
+        const int n = static_cast<int>(kv_local_elem);
         MPI_Isend(K_send_h, n, MPI_FLOAT, next_rank, /*tag=*/0, MPI_COMM_WORLD, &reqs[n_req++]);
         MPI_Irecv(K_recv_h, n, MPI_FLOAT, prev_rank, /*tag=*/0, MPI_COMM_WORLD, &reqs[n_req++]);
         MPI_Isend(V_send_h, n, MPI_FLOAT, next_rank, /*tag=*/1, MPI_COMM_WORLD, &reqs[n_req++]);
@@ -330,8 +349,8 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
           // Causal prune: skip if every key position is strictly after every
           // query position in this block (the entire block contributes zero).
           if (cfg.causal && k_off_sg > q_off_sg + Sl - 1) continue;
-          launch_attention_step(q_d.data() + sg_q * sg_elem, K_cur + sg_k * sg_elem,
-                                V_cur + sg_k * sg_elem, out_d.data() + sg_q * sg_elem,
+          launch_attention_step(q_d.data() + sg_q * q_sg_elem, K_cur + sg_k * kv_sg_elem,
+                                V_cur + sg_k * kv_sg_elem, out_d.data() + sg_q * q_sg_elem,
                                 m_d.data() + sg_q * m_sg, l_d.data() + sg_q * m_sg, sg_shape,
                                 q_off_sg, k_off_sg, cfg.causal);
         }
@@ -352,8 +371,8 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
         wait_acc += (t_wait1 - t_wait0) * 1e3;
 
         const double t_h2d0 = MPI_Wtime();
-        cudaMemcpy(K_recv, K_recv_h, bytes, cudaMemcpyHostToDevice);
-        cudaMemcpy(V_recv, V_recv_h, bytes, cudaMemcpyHostToDevice);
+        cudaMemcpy(K_recv, K_recv_h, kv_bytes, cudaMemcpyHostToDevice);
+        cudaMemcpy(V_recv, V_recv_h, kv_bytes, cudaMemcpyHostToDevice);
         const double t_h2d1 = MPI_Wtime();
         comm_acc += (t_h2d1 - t_h2d0) * 1e3;
 
@@ -365,7 +384,7 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
     }
 
     for (int sg = 0; sg < nsg; ++sg)
-      launch_attention_finalize(out_d.data() + sg * sg_elem, l_d.data() + sg * m_sg, sg_shape);
+      launch_attention_finalize(out_d.data() + sg * q_sg_elem, l_d.data() + sg * m_sg, sg_shape);
     cudaDeviceSynchronize();
     cudaEventDestroy(ev0);
     cudaEventDestroy(ev1);
@@ -408,19 +427,22 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
   // Verification: regenerate full Q/K/V, run cpu_attention, compare each sub-group.
   float max_err = -1.f;
   if (cfg.verify) {
-    const std::size_t full_elem = static_cast<std::size_t>(B) * H * S * D;
-    std::vector<float> full_q(full_elem), full_k(full_elem), full_v(full_elem);
+    const std::size_t q_full_elem = static_cast<std::size_t>(B) * H * S * D;
+    const std::size_t kv_full_elem = static_cast<std::size_t>(B) * kv_H * S * D;
+    std::vector<float> full_q(q_full_elem), full_k(kv_full_elem), full_v(kv_full_elem);
     fill_host_tensor(full_q, cfg.seed, 0, B, H, S, D, 0);
-    fill_host_tensor(full_k, cfg.seed, 1, B, H, S, D, 0);
-    fill_host_tensor(full_v, cfg.seed, 2, B, H, S, D, 0);
+    fill_host_tensor(full_k, cfg.seed, 1, B, kv_H, S, D, 0);
+    fill_host_tensor(full_v, cfg.seed, 2, B, kv_H, S, D, 0);
 
-    std::vector<float> cpu_out(full_elem);
-    cpu_attention(full_q.data(), full_k.data(), full_v.data(), cpu_out.data(),
-                  AttentionShape{B, H, S, S, D}, cfg.causal);
+    AttentionShape ref_shape{B, H, S, S, D};
+    ref_shape.kv_heads = kv_H;
+    std::vector<float> cpu_out(q_full_elem);
+    cpu_attention(full_q.data(), full_k.data(), full_v.data(), cpu_out.data(), ref_shape,
+                  cfg.causal);
 
     // Re-run one pass so out_d reflects a complete forward.
     one_pass();
-    std::vector<float> dev_out_h(local_elem);
+    std::vector<float> dev_out_h(q_local_elem);
     out_d.copy_to_host(dev_out_h);
 
     max_err = 0.f;
@@ -431,7 +453,7 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
           const float* cpu_slice =
               cpu_out.data() + (static_cast<std::size_t>(b * H + h) * S + q_off_sg) * D;
           const float* dev_slice =
-              dev_out_h.data() + sg * sg_elem + static_cast<std::size_t>(b * H + h) * Sl * D;
+              dev_out_h.data() + sg * q_sg_elem + static_cast<std::size_t>(b * H + h) * Sl * D;
           for (int e = 0; e < Sl * D; ++e)
             max_err = std::max(max_err, std::abs(cpu_slice[e] - dev_slice[e]));
         }
@@ -482,6 +504,7 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
   using namespace ring_attention;
 
   const int B = cfg.batch, H = cfg.heads, D = cfg.head_dim;
+  const int kv_H = (cfg.kv_heads > 0) ? cfg.kv_heads : cfg.heads;
   const int S = cfg.seq, P = cfg.cp_size, R = cfg.rank;
 
   const RingPartition::Mode mode =
@@ -490,47 +513,59 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
   const int nsg = part.num_sub_groups();
   const int Sl = part.local_chunk_len();
   const int Sl_local = Sl * nsg;
-  const std::size_t sg_elem = static_cast<std::size_t>(B) * H * Sl * D;
-  const std::size_t local_elem = static_cast<std::size_t>(nsg) * sg_elem;
+  const std::size_t q_sg_elem = static_cast<std::size_t>(B) * H * Sl * D;
+  const std::size_t q_local_elem = static_cast<std::size_t>(nsg) * q_sg_elem;
+  const std::size_t kv_sg_elem = static_cast<std::size_t>(B) * kv_H * Sl * D;
+  const std::size_t kv_local_elem = static_cast<std::size_t>(nsg) * kv_sg_elem;
   const std::size_t m_sg = static_cast<std::size_t>(B) * H * Sl;
   const std::size_t m_count = static_cast<std::size_t>(nsg) * m_sg;
-  const std::size_t bytes = local_elem * sizeof(float);
+  const std::size_t kv_bytes = kv_local_elem * sizeof(float);
 
   const int next_rank = part.next_rank();
   const int prev_rank = part.prev_rank();
 
-  auto fill_into = [&](std::vector<float>& buf, int tid, std::size_t off, int global_seq_start) {
+  auto fill_q_into = [&](std::vector<float>& buf, int tid, std::size_t off, int gss) {
     for (int b = 0; b < B; ++b)
       for (int h = 0; h < H; ++h)
         for (int s = 0; s < Sl; ++s)
           for (int d = 0; d < D; ++d)
             buf[off + (static_cast<std::size_t>(b * H + h) * Sl + s) * D + d] =
-                gen_elem(cfg.seed, tid, b, h, global_seq_start + s, d);
+                gen_elem(cfg.seed, tid, b, h, gss + s, d);
   };
 
-  std::vector<float> q_h(local_elem), k_h_init(local_elem), v_h_init(local_elem);
+  auto fill_kv_into = [&](std::vector<float>& buf, int tid, std::size_t off, int gss) {
+    for (int b = 0; b < B; ++b)
+      for (int h = 0; h < kv_H; ++h)
+        for (int s = 0; s < Sl; ++s)
+          for (int d = 0; d < D; ++d)
+            buf[off + (static_cast<std::size_t>(b * kv_H + h) * Sl + s) * D + d] =
+                gen_elem(cfg.seed, tid, b, h, gss + s, d);
+  };
+
+  std::vector<float> q_h(q_local_elem), k_h_init(kv_local_elem), v_h_init(kv_local_elem);
   for (int sg = 0; sg < nsg; ++sg) {
-    fill_into(q_h, 0, sg * sg_elem, part.q_offset(sg));
-    fill_into(k_h_init, 1, sg * sg_elem, part.k_offset_for_step(0, sg));
-    fill_into(v_h_init, 2, sg * sg_elem, part.k_offset_for_step(0, sg));
+    fill_q_into(q_h, 0, sg * q_sg_elem, part.q_offset(sg));
+    fill_kv_into(k_h_init, 1, sg * kv_sg_elem, part.k_offset_for_step(0, sg));
+    fill_kv_into(v_h_init, 2, sg * kv_sg_elem, part.k_offset_for_step(0, sg));
   }
 
   // Device buffers — Q stays put; K/V double-buffered with pointer swap.
-  DeviceTensor<float> q_d(local_elem);
+  DeviceTensor<float> q_d(q_local_elem);
   q_d.copy_from_host(q_h);
-  DeviceTensor<float> K_a(local_elem), K_b(local_elem);
-  DeviceTensor<float> V_a(local_elem), V_b(local_elem);
-  DeviceTensor<float> out_d(local_elem), m_d(m_count), l_d(m_count);
+  DeviceTensor<float> K_a(kv_local_elem), K_b(kv_local_elem);
+  DeviceTensor<float> V_a(kv_local_elem), V_b(kv_local_elem);
+  DeviceTensor<float> out_d(q_local_elem), m_d(m_count), l_d(m_count);
 
   const AttentionShape init_shape{B, H, Sl_local, S, D};
-  const AttentionShape sg_shape{B, H, Sl, Sl, D};
+  AttentionShape sg_shape{B, H, Sl, Sl, D};
+  sg_shape.kv_heads = kv_H;
 
   // Pinned host staging.
   float *K_send_h = nullptr, *V_send_h = nullptr, *K_recv_h = nullptr, *V_recv_h = nullptr;
-  cudaHostAlloc(&K_send_h, bytes, cudaHostAllocDefault);
-  cudaHostAlloc(&V_send_h, bytes, cudaHostAllocDefault);
-  cudaHostAlloc(&K_recv_h, bytes, cudaHostAllocDefault);
-  cudaHostAlloc(&V_recv_h, bytes, cudaHostAllocDefault);
+  cudaHostAlloc(&K_send_h, kv_bytes, cudaHostAllocDefault);
+  cudaHostAlloc(&V_send_h, kv_bytes, cudaHostAllocDefault);
+  cudaHostAlloc(&K_recv_h, kv_bytes, cudaHostAllocDefault);
+  cudaHostAlloc(&V_recv_h, kv_bytes, cudaHostAllocDefault);
 
   // Two CUDA streams + one reusable event for the producer/consumer handshake.
   cudaStream_t stream_compute = nullptr, stream_copy = nullptr;
@@ -559,8 +594,8 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
   auto one_pass = [&]() -> std::tuple<double, double, double> {
     // Initial H2D for step 0's K/V on stream_copy; record event so step 0's
     // kernel waits on it (uniform treatment of step 0 vs. step s>0).
-    cudaMemcpyAsync(K_a.data(), k_h_init.data(), bytes, cudaMemcpyHostToDevice, stream_copy);
-    cudaMemcpyAsync(V_a.data(), v_h_init.data(), bytes, cudaMemcpyHostToDevice, stream_copy);
+    cudaMemcpyAsync(K_a.data(), k_h_init.data(), kv_bytes, cudaMemcpyHostToDevice, stream_copy);
+    cudaMemcpyAsync(V_a.data(), v_h_init.data(), kv_bytes, cudaMemcpyHostToDevice, stream_copy);
     cudaEventRecord(comm_done, stream_copy);
 
     float* K_cur = K_a.data();
@@ -587,8 +622,8 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
           const int q_off_sg = part.q_offset(sg_q);
           const int k_off_sg = part.k_offset_for_step(step, sg_k);
           if (cfg.causal && k_off_sg > q_off_sg + Sl - 1) continue;
-          launch_attention_step(q_d.data() + sg_q * sg_elem, K_cur + sg_k * sg_elem,
-                                V_cur + sg_k * sg_elem, out_d.data() + sg_q * sg_elem,
+          launch_attention_step(q_d.data() + sg_q * q_sg_elem, K_cur + sg_k * kv_sg_elem,
+                                V_cur + sg_k * kv_sg_elem, out_d.data() + sg_q * q_sg_elem,
                                 m_d.data() + sg_q * m_sg, l_d.data() + sg_q * m_sg, sg_shape,
                                 q_off_sg, k_off_sg, cfg.causal, stream_compute);
         }
@@ -603,13 +638,13 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
         // D2H reads K_cur — concurrent with the kernel reading K_cur (both
         // are reads, so there is no race; the copy engine and the SMs run
         // on independent hardware paths).
-        cudaMemcpyAsync(K_send_h, K_cur, bytes, cudaMemcpyDeviceToHost, stream_copy);
-        cudaMemcpyAsync(V_send_h, V_cur, bytes, cudaMemcpyDeviceToHost, stream_copy);
+        cudaMemcpyAsync(K_send_h, K_cur, kv_bytes, cudaMemcpyDeviceToHost, stream_copy);
+        cudaMemcpyAsync(V_send_h, V_cur, kv_bytes, cudaMemcpyDeviceToHost, stream_copy);
         // MPI must see the data on the host — block briefly on stream_copy.
         // stream_compute is untouched, so the kernel keeps running.
         cudaStreamSynchronize(stream_copy);
         MPI_Request reqs[4];
-        const int n = static_cast<int>(local_elem);
+        const int n = static_cast<int>(kv_local_elem);
         MPI_Isend(K_send_h, n, MPI_FLOAT, next_rank, /*tag=*/0, MPI_COMM_WORLD, &reqs[0]);
         MPI_Irecv(K_recv_h, n, MPI_FLOAT, prev_rank, /*tag=*/0, MPI_COMM_WORLD, &reqs[1]);
         MPI_Isend(V_send_h, n, MPI_FLOAT, next_rank, /*tag=*/1, MPI_COMM_WORLD, &reqs[2]);
@@ -637,8 +672,8 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
         // not MPI_Wtime — the wall-clock here would only see enqueue cost
         // and underreport comm_ms vs. ring-blocking.
         cudaEventRecord(ev_h2d_starts[step], stream_copy);
-        cudaMemcpyAsync(K_recv, K_recv_h, bytes, cudaMemcpyHostToDevice, stream_copy);
-        cudaMemcpyAsync(V_recv, V_recv_h, bytes, cudaMemcpyHostToDevice, stream_copy);
+        cudaMemcpyAsync(K_recv, K_recv_h, kv_bytes, cudaMemcpyHostToDevice, stream_copy);
+        cudaMemcpyAsync(V_recv, V_recv_h, kv_bytes, cudaMemcpyHostToDevice, stream_copy);
         cudaEventRecord(ev_h2d_ends[step], stream_copy);
         cudaEventRecord(comm_done, stream_copy);
 
@@ -652,7 +687,7 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
     // Drain stream_compute before finalize, then sync once more.
     cudaStreamSynchronize(stream_compute);
     for (int sg = 0; sg < nsg; ++sg)
-      launch_attention_finalize(out_d.data() + sg * sg_elem, l_d.data() + sg * m_sg, sg_shape,
+      launch_attention_finalize(out_d.data() + sg * q_sg_elem, l_d.data() + sg * m_sg, sg_shape,
                                 stream_compute);
     cudaStreamSynchronize(stream_compute);
 
@@ -704,18 +739,21 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
 
   float max_err = -1.f;
   if (cfg.verify) {
-    const std::size_t full_elem = static_cast<std::size_t>(B) * H * S * D;
-    std::vector<float> full_q(full_elem), full_k(full_elem), full_v(full_elem);
+    const std::size_t q_full_elem = static_cast<std::size_t>(B) * H * S * D;
+    const std::size_t kv_full_elem = static_cast<std::size_t>(B) * kv_H * S * D;
+    std::vector<float> full_q(q_full_elem), full_k(kv_full_elem), full_v(kv_full_elem);
     fill_host_tensor(full_q, cfg.seed, 0, B, H, S, D, 0);
-    fill_host_tensor(full_k, cfg.seed, 1, B, H, S, D, 0);
-    fill_host_tensor(full_v, cfg.seed, 2, B, H, S, D, 0);
+    fill_host_tensor(full_k, cfg.seed, 1, B, kv_H, S, D, 0);
+    fill_host_tensor(full_v, cfg.seed, 2, B, kv_H, S, D, 0);
 
-    std::vector<float> cpu_out(full_elem);
-    cpu_attention(full_q.data(), full_k.data(), full_v.data(), cpu_out.data(),
-                  AttentionShape{B, H, S, S, D}, cfg.causal);
+    AttentionShape ref_shape{B, H, S, S, D};
+    ref_shape.kv_heads = kv_H;
+    std::vector<float> cpu_out(q_full_elem);
+    cpu_attention(full_q.data(), full_k.data(), full_v.data(), cpu_out.data(), ref_shape,
+                  cfg.causal);
 
     one_pass();
-    std::vector<float> dev_out_h(local_elem);
+    std::vector<float> dev_out_h(q_local_elem);
     out_d.copy_to_host(dev_out_h);
 
     max_err = 0.f;
@@ -726,7 +764,7 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
           const float* cpu_slice =
               cpu_out.data() + (static_cast<std::size_t>(b * H + h) * S + q_off_sg) * D;
           const float* dev_slice =
-              dev_out_h.data() + sg * sg_elem + static_cast<std::size_t>(b * H + h) * Sl * D;
+              dev_out_h.data() + sg * q_sg_elem + static_cast<std::size_t>(b * H + h) * Sl * D;
           for (int e = 0; e < Sl * D; ++e)
             max_err = std::max(max_err, std::abs(cpu_slice[e] - dev_slice[e]));
         }
