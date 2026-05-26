@@ -112,8 +112,10 @@ int test_hand_computed_2x2() {
 }
 
 /// GQA: verify each Q head attends to the correct KV head (h % kv_H).
-/// Build a GQA case where each KV head has a distinctive V pattern; check
-/// that Q heads sharing the same KV head produce identical output.
+/// For each KV head, compare the GQA output for the mapped Q heads against a
+/// 1-head MHA call using that KV head's K/V slice (the Q tensors differ across
+/// heads, so outputs differ — the check is that the K/V slice used matches the
+/// h % kv_H mapping).
 int test_gqa_head_sharing() {
   // H=4 Q heads, kv_H=2 KV heads: Q heads {0,2} → KV head 0; {1,3} → KV head 1.
   AttentionShape s{1, 4, 8, 8, 4};

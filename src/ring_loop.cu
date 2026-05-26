@@ -5,6 +5,7 @@
 #include <mpi.h>
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +30,22 @@ namespace {
   fprintf(stderr, "%s\n", msg);
   MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
   std::exit(EXIT_FAILURE);  // satisfy [[noreturn]]; MPI_Abort does not return
+}
+
+/// Validate that `count` fits in the `int` count used by MPI-3 point-to-point
+/// and collective calls. NVHPC 24.1 ships OpenMPI 4.1.7 (MPI-3.1) so we cannot
+/// use `MPI_Count` / the `_c` variants here. On overflow we abort with a clear
+/// message rather than silently truncating the transfer size.
+int mpi_int_count(std::size_t count, const char* where) {
+  if (count > static_cast<std::size_t>(INT_MAX)) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "MPI count overflow in %s: %zu elements exceeds INT_MAX=%d — "
+                  "reduce per-rank tensor size or chunk the transfer.",
+                  where, count, INT_MAX);
+    mpi_die(buf);
+  }
+  return static_cast<int>(count);
 }
 
 /// Fill a host vector of shape (B, H, seq_len, D) using gen_elem.
@@ -97,10 +114,11 @@ ring_attention::RingResult run_allgather(const ring_attention::RingConfig& cfg) 
   auto one_pass = [&]() -> std::pair<double, double> {
     // --- Communication: allgather K,V + rearrange + H2D ----------------------
     const double tc0 = MPI_Wtime();
-    MPI_Allgather(k_h.data(), static_cast<int>(kv_local_elem), MPI_FLOAT, k_gathered.data(),
-                  static_cast<int>(kv_local_elem), MPI_FLOAT, MPI_COMM_WORLD);
-    MPI_Allgather(v_h.data(), static_cast<int>(kv_local_elem), MPI_FLOAT, v_gathered.data(),
-                  static_cast<int>(kv_local_elem), MPI_FLOAT, MPI_COMM_WORLD);
+    const int kv_local_elem_int = mpi_int_count(kv_local_elem, "run_allgather/MPI_Allgather");
+    MPI_Allgather(k_h.data(), kv_local_elem_int, MPI_FLOAT, k_gathered.data(), kv_local_elem_int,
+                  MPI_FLOAT, MPI_COMM_WORLD);
+    MPI_Allgather(v_h.data(), kv_local_elem_int, MPI_FLOAT, v_gathered.data(), kv_local_elem_int,
+                  MPI_FLOAT, MPI_COMM_WORLD);
 
     // Rearrange from rank-major (P,B,kv_H,Sl,D) to (B,kv_H,S,D).
     for (int b = 0; b < B; ++b)
@@ -329,7 +347,7 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
       if (step < P - 1) {
         cudaMemcpy(K_send_h, K_cur, kv_bytes, cudaMemcpyDeviceToHost);
         cudaMemcpy(V_send_h, V_cur, kv_bytes, cudaMemcpyDeviceToHost);
-        const int n = static_cast<int>(kv_local_elem);
+        const int n = mpi_int_count(kv_local_elem, "run_ring_blocking/MPI_Isend|Irecv");
         MPI_Isend(K_send_h, n, MPI_FLOAT, next_rank, /*tag=*/0, MPI_COMM_WORLD, &reqs[n_req++]);
         MPI_Irecv(K_recv_h, n, MPI_FLOAT, prev_rank, /*tag=*/0, MPI_COMM_WORLD, &reqs[n_req++]);
         MPI_Isend(V_send_h, n, MPI_FLOAT, next_rank, /*tag=*/1, MPI_COMM_WORLD, &reqs[n_req++]);
@@ -644,7 +662,7 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
         // stream_compute is untouched, so the kernel keeps running.
         cudaStreamSynchronize(stream_copy);
         MPI_Request reqs[4];
-        const int n = static_cast<int>(kv_local_elem);
+        const int n = mpi_int_count(kv_local_elem, "run_ring_overlap/MPI_Isend|Irecv");
         MPI_Isend(K_send_h, n, MPI_FLOAT, next_rank, /*tag=*/0, MPI_COMM_WORLD, &reqs[0]);
         MPI_Irecv(K_recv_h, n, MPI_FLOAT, prev_rank, /*tag=*/0, MPI_COMM_WORLD, &reqs[1]);
         MPI_Isend(V_send_h, n, MPI_FLOAT, next_rank, /*tag=*/1, MPI_COMM_WORLD, &reqs[2]);
