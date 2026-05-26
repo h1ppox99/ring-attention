@@ -328,6 +328,13 @@ ring_attention::RingResult run_ring_blocking_fp16(const ring_attention::RingConf
     cudaEvent_t ev0, ev1;
     cudaEventCreate(&ev0);
     cudaEventCreate(&ev1);
+#ifdef RING_USE_NCCL
+    // Bracket NCCL with its own events; otherwise the on-device transfer time
+    // is invisible in every sub-metric (see run_ring_blocking for details).
+    cudaEvent_t ev_nccl0, ev_nccl1;
+    cudaEventCreate(&ev_nccl0);
+    cudaEventCreate(&ev_nccl1);
+#endif
 
     for (int step = 0; step < P; ++step) {
 #ifndef RING_USE_NCCL
@@ -338,12 +345,14 @@ ring_attention::RingResult run_ring_blocking_fp16(const ring_attention::RingConf
       const double t_post0 = MPI_Wtime();
       if (step < P - 1) {
 #ifdef RING_USE_NCCL
+        cudaEventRecord(ev_nccl0, 0);
         ncclGroupStart();
         NCCL_CHECK(ncclSend(K_cur, kv_local_elem, ncclHalf, next_rank, nccl_comm, 0));
         NCCL_CHECK(ncclRecv(K_recv, kv_local_elem, ncclHalf, prev_rank, nccl_comm, 0));
         NCCL_CHECK(ncclSend(V_cur, kv_local_elem, ncclHalf, next_rank, nccl_comm, 0));
         NCCL_CHECK(ncclRecv(V_recv, kv_local_elem, ncclHalf, prev_rank, nccl_comm, 0));
         NCCL_CHECK(ncclGroupEnd());
+        cudaEventRecord(ev_nccl1, 0);
 #else
         cudaMemcpy(K_send_h, K_cur, kv_bytes, cudaMemcpyDeviceToHost);
         cudaMemcpy(V_send_h, V_cur, kv_bytes, cudaMemcpyDeviceToHost);
@@ -377,10 +386,15 @@ ring_attention::RingResult run_ring_blocking_fp16(const ring_attention::RingConf
 
       if (step < P - 1) {
 #ifdef RING_USE_NCCL
+        // Stream 0 already drained by cudaEventSynchronize(ev1); wait ≈ 0 by
+        // construction. The NCCL transfer cost is attributed to comm_ms below.
         const double t_wait0 = MPI_Wtime();
         cudaStreamSynchronize(0);
         const double t_wait1 = MPI_Wtime();
         wait_acc += (t_wait1 - t_wait0) * 1e3;
+        float nccl_ms = 0.f;
+        cudaEventElapsedTime(&nccl_ms, ev_nccl0, ev_nccl1);
+        comm_acc += nccl_ms;
 #else
         const double t_wait0 = MPI_Wtime();
         MPI_Waitall(n_req, reqs, MPI_STATUSES_IGNORE);
@@ -403,6 +417,10 @@ ring_attention::RingResult run_ring_blocking_fp16(const ring_attention::RingConf
     cudaDeviceSynchronize();
     cudaEventDestroy(ev0);
     cudaEventDestroy(ev1);
+#ifdef RING_USE_NCCL
+    cudaEventDestroy(ev_nccl0);
+    cudaEventDestroy(ev_nccl1);
+#endif
     return {comm_acc, comp_acc, wait_acc};
   };
 
