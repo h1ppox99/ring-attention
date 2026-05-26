@@ -1,0 +1,777 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{siunitx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{titlesec}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  urlcolor=blue!50!black,
+  citecolor=blue!50!black
+}
+
+\newcommand{\flops}{\mathrm{FLOP}}
+\newcommand{\bw}{\mathrm{BW}}
+\newcommand{\peak}{\mathrm{peak}}
+\newcommand{\eff}{\mathrm{eff}}
+\newcommand{\comp}{\mathrm{comp}}
+\newcommand{\comm}{\mathrm{comm}}
+\newcommand{\wait}{\mathrm{wait}}
+\newcommand{\tot}{\mathrm{total}}
+\newcommand{\step}{\mathrm{step}}
+\newcommand{\zz}{\mathrm{zz}}
+\newcommand{\dtype}{\mathrm{dtype}}
+\newcommand{\Bd}{\sigma}        % bytes per element of the chosen dtype
+\newcommand{\indicator}[1]{\mathbb{1}\!\left[#1\right]}
+
+\title{A First-Order Performance Model for Zig-Zag Ring Attention}
+\author{Ring Attention project --- v1 baseline}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We develop a closed-form, alpha--beta--gamma style analytical model
+$\mathcal{P}(S, D, H, B, P, \dtype, \text{mode}, \text{causal}) \to (t_\comp, t_\comm, t_\wait, t_\tot)$
+that predicts the per-iteration wall-clock time of our context-parallel
+ring-attention forward pass. The model is intentionally first-order:
+its purpose is not to be exact, but to be \emph{diagnostically informative}.
+Calibrated against the v1 baseline and re-fit per version, the residuals
+between model and measurement are read as a map of the bottlenecks
+that drive each kernel re-write.
+\end{abstract}
+
+\tableofcontents
+
+\bigskip
+
+\section{Scope and modelling assumptions}
+\label{sec:scope}
+
+The model covers a \emph{single forward pass} of multi-head attention,
+distributed across $P$ ring ranks via Zig-Zag Ring
+Attention~\cite{liu2023ring,brandon2023ringflash}. The following are
+fixed within one prediction call:
+
+\begin{itemize}
+  \item One MPI rank per GPU; all ranks share an identical workload shape.
+  \item No backward pass, no decode mode, no attention bias.
+  \item All-to-all causal masking is either fully on (lower-triangular)
+        or fully off.
+  \item Streams: at most one compute stream and one copy stream per rank.
+  \item Communication primitive: NCCL \texttt{Send}/\texttt{Recv}
+        in a ring topology, or one \texttt{Allgather} (modelled separately).
+\end{itemize}
+
+The model does \emph{not} attempt to predict numerical precision,
+TLB/page-table effects, dynamic clock throttling, or contention with
+unrelated processes on the node. Its measurement contract is the same
+as the benchmark binary: barrier-to-barrier wall-clock, with
+\texttt{comp\_ms}, \texttt{comm\_ms}, \texttt{wait\_ms} recorded
+per rank and reduced with \texttt{MPI\_Reduce(MAX)}.
+
+\section{Notation: symbols and units}
+\label{sec:symbols}
+
+All times are in milliseconds and all bandwidths in
+$\si{\giga\byte\per\second}$ unless stated otherwise. The compute /
+storage dtype $\dtype \in \{\text{fp32}, \text{fp16}\}$ has
+$\Bd_{\text{fp32}} = 4$ and $\Bd_{\text{fp16}} = 2$ bytes per element.
+
+\paragraph{Problem shape (user-controlled).}
+\begin{longtable}{@{}lll@{}}
+  \toprule
+  Symbol & Meaning & Typical range \\
+  \midrule
+  $B$        & Batch size                               & $1$ \\
+  $H$        & Number of attention heads                & $32$ (Llama-3 8B anchor) \\
+  $S$        & Global sequence length                   & $\{4\mathrm{k},\dots,64\mathrm{k}\}$ \\
+  $D$        & Per-head feature dimension               & $\{32,64,128,256\}$ \\
+  $P$        & Ring size (= total number of GPUs)       & $\{1,2,4,8,16,20\}$ \\
+  $g$        & GPUs per node on the partition           & $4$ (gpu-turing) \\
+  $N$        & Number of nodes used: $N = \lceil P / g\rceil$ & $\{1,\dots,5\}$ \\
+  $\dtype$   & Compute / transport dtype                & fp32 or fp16 \\
+  $\Bd$      & Bytes per element of $\dtype$            & $\Bd_{\text{fp16}}=2$, $\Bd_{\text{fp32}}=4$ \\
+  causal     & Boolean: lower-triangular mask on/off    & on / off \\
+  mode       & \{allgather, ring-blocking, ring-overlap\} & \\
+  \bottomrule
+\end{longtable}
+
+\paragraph{Cluster topology fixed in v1.}
+The Stanford HPCC \texttt{gpu-turing} partition exposes
+$N_\text{max} = 5$ nodes with $g = 4$ GPUs each, for a hard ceiling of
+$P_\text{max} = N_\text{max}\cdot g = 20$. Intra-node links are PCIe~3.0
+$\times 16$; inter-node links go over the cluster fabric. No NVLink,
+no NVSwitch anywhere. The ring is laid out with contiguous ranks
+clustered per node (rank $r$ lives on node $\lfloor r/g \rfloor$), so
+ranks $r$ and $r+1$ share a node unless $(r+1) \bmod g = 0$.
+
+\paragraph{Derived shape.}
+\begin{align}
+  S_\ell &= S / P                        & &\text{(rows of $Q$ owned by each rank).} \\
+  C       &= S / P                        & &\text{(K/V chunk length transported per ring step).} \\
+  G       &= 2P                           & &\text{(number of zig-zag chunks of size $S/(2P)$).}
+\end{align}
+
+\paragraph{Hardware constants (per node, calibrated once).}
+\begin{longtable}{@{}p{3.0cm}p{6.5cm}p{4.5cm}@{}}
+  \toprule
+  Symbol & Meaning & v1 target hardware \\
+  \midrule
+  $F_{\peak}^{\dtype}$ &
+    Peak achievable FLOP throughput per GPU, dtype-specific.
+    For fp32 this is the FMA throughput; for fp16 the WMMA tensor-core peak.
+    & RTX 6000 (Turing, sm\_75): \newline
+      $F_{\peak}^{\text{fp32}} \approx \SI{16.3}{TFLOP\per\second}$, \newline
+      $F_{\peak}^{\text{fp16}} \approx \SI{130.5}{TFLOP\per\second}$ \\
+  $\eta_{\text{kernel}}^{\dtype}$ &
+    Sustained-to-peak \emph{kernel efficiency} (unitless, $\in (0,1]$).
+    The single calibrated knob whose drift across versions tells the story.
+    & Fit per version. \\
+  $\bw_{\text{HBM}}$ &
+    Peak device-memory bandwidth (used in roofline only). & $\SI{672}{\giga\byte\per\second}$ \\
+  $\bw_{\text{net}}^{\text{intra}}$ &
+    Effective per-direction GPU-to-GPU bandwidth between two GPUs
+    \emph{on the same node}, measured by a NCCL
+    \texttt{Send}/\texttt{Recv} pair microbench with both ranks pinned
+    to the same node via \texttt{--nodelist}. & PCIe~3.0 $\times 16 \approx \SI{12}{\giga\byte\per\second}$ \\
+  $\bw_{\text{net}}^{\text{inter}}$ &
+    Effective per-direction GPU-to-GPU bandwidth between two GPUs
+    \emph{on different nodes}, same microbench but with ranks pinned
+    to different nodes. Includes NIC + cluster-fabric latency and any
+    PCIe NIC-attach hop on each side. & Expected
+    $\sim$ a few $\si{\giga\byte\per\second}$ on this fabric;
+    calibrate before runs with $N > 1$. \\
+  $\alpha_{\text{NCCL}}^{\text{intra}}, \alpha_{\text{NCCL}}^{\text{inter}}$ &
+    Per-call NCCL latency floor (small-message overhead) for
+    intra-node and inter-node hops respectively.
+    Captures kernel-launch + protocol + fabric setup cost of one
+    ring transfer. & intra $\sim \SI{20}{\micro\second}$; inter
+    $\sim 1$--$\SI{10}{\milli\second}$ (cluster-dependent). \\
+  $\alpha_{\text{launch}}$ &
+    Per-step host launch overhead (CUDA-driver + event setup +
+    Python/MPI bookkeeping per ring step). & $\sim \SI{5}{\micro\second}$ \\
+  \bottomrule
+\end{longtable}
+
+\paragraph{Model outputs.}
+\begin{itemize}
+  \item $t_\comp$: total time the GPU spends inside the attention kernel(s)
+        for one ring pass. Sum of per-step \texttt{cudaEvent} intervals.
+  \item $t_\comm$: total time spent issuing transfers (D2H staging in
+        the MPI path, or \texttt{ncclSend/Recv} enqueue in the NCCL path)
+        plus any H2D staging.
+  \item $t_\wait$: \emph{unhidden} communication --- the portion of
+        $t_\comm$ not overlapped by $t_\comp$.
+  \item $t_\tot$: barrier-to-barrier wall-clock per iteration.
+\end{itemize}
+
+\section{Compute model}
+\label{sec:compute}
+
+\subsection{FLOP counts}
+
+Standard multi-head attention on a $(Q, K, V)$ triple of shapes
+$(B, H, S_q, D) \times (B, H, S_k, D) \times (B, H, S_k, D)$ costs
+\begin{equation}
+  \flops_{\text{dense}}(S_q, S_k)
+  = 4\,B\,H\,S_q\,S_k\,D
+  \label{eq:dense_flops}
+\end{equation}
+counting one fused-multiply-add as two operations and ignoring the
+softmax (an $O(S_q S_k)$ but FLOP-cheap pass). Eq.~\eqref{eq:dense_flops}
+absorbs both $QK^\top$ ($2 B H S_q S_k D$) and the score $\cdot V$
+matmul (the other $2 B H S_q S_k D$).
+
+\subsection{Per-step FLOPs under ring partitioning}
+
+At ring step $s \in \{0, \dots, P-1\}$ each rank holds queries of length
+$S_\ell = S/P$ and a key/value chunk of length $C = S/P$. Ignoring the
+causal mask for now, every step costs
+\begin{equation}
+  \flops_\step
+  = 4\,B\,H\,S_\ell\,C\,D
+  = 4\,B\,H\,\left(\frac{S}{P}\right)^{\!2} D ,
+\end{equation}
+and the cost of the full pass on one rank is $P$ times that:
+\begin{equation}
+  \flops_{\text{pass}}
+  = P \cdot \flops_\step
+  = \frac{4\,B\,H\,S^{2}\,D}{P} .
+  \label{eq:pass_flops}
+\end{equation}
+
+The work \emph{per rank} scales as $S^2/P$, so total system work
+scales as $S^2$, which matches single-GPU attention --- ring attention
+does not change FLOPs, it merely distributes them.
+
+\subsection{Causal masking and zig-zag balance}
+
+With causal masking on, only roughly half the dot products contribute
+non-zero gradients to the output. Naively the system work is
+\begin{equation}
+  \flops_{\text{pass}}^{\text{causal}}
+  \;\approx\; \frac{1}{2}\cdot \flops_{\text{pass}}
+\end{equation}
+but on a contiguous partition the work is severely unbalanced across
+ranks: rank $0$ does nearly $1/P$-th of the total work while rank
+$P-1$ does almost zero work. Zig-Zag assignment fixes this by giving
+each rank one ``early'' and one ``late'' chunk of size $S/(2P)$, so
+the per-rank causal workload becomes uniform.
+
+We model this with a single \emph{zig-zag balance factor}
+\begin{equation}
+  z(P, \text{causal}) =
+  \begin{cases}
+    1 & \text{if causal $=$ off} \\
+    \tfrac{1}{2} + \tfrac{1}{2 P} & \text{if causal $=$ on, zig-zag on}
+  \end{cases}
+  \label{eq:zigzag}
+\end{equation}
+The $1/(2P)$ correction captures the unavoidable
+diagonal-block fraction that no partition scheme can eliminate (a
+rank's queries can never look ahead of themselves into their own
+keys). For large $P$ the factor approaches $1/2$, recovering the
+intuitive ``causal halves the work'' estimate. Substituting,
+\begin{equation}
+  \flops_\step^\zz
+  = z(P, \text{causal}) \cdot 4\,B\,H\,\left(\frac{S}{P}\right)^{\!2} D .
+  \label{eq:flops_step_zz}
+\end{equation}
+
+\subsection{Per-step compute time}
+
+Given a calibrated kernel efficiency $\eta_{\text{kernel}}^\dtype$ and
+peak throughput $F_\peak^\dtype$,
+\begin{equation}
+  \boxed{\;
+    t_\comp^\step
+    = \frac{\flops_\step^\zz}{\eta_{\text{kernel}}^\dtype \cdot F_\peak^\dtype}
+    \;}
+  \label{eq:tcomp_step}
+\end{equation}
+and the full-pass compute time on one rank is
+\begin{equation}
+  t_\comp
+  = P \cdot t_\comp^\step
+  = \frac{4\,B\,H\,S^{2}\,D \cdot z(P,\text{causal})}
+         {P \cdot \eta_{\text{kernel}}^\dtype \cdot F_\peak^\dtype} .
+  \label{eq:tcomp_pass}
+\end{equation}
+
+\paragraph{Interpretation.} $\eta_{\text{kernel}}^\dtype$ is the only
+unobserved parameter. We fit it on a small calibration sweep
+(small $S$ where launch overhead is negligible, $P = 1$ to remove
+communication) and freeze it across the whole workload matrix in
+Sec.~\ref{sec:scope}. Drift in $\eta_{\text{kernel}}$ across versions
+$v_1, v_2, \dots$ is the model's headline summary of optimisation
+progress.
+
+\section{Communication model}
+\label{sec:comm}
+
+\subsection{Bytes transported per ring step}
+
+Each ring step transports one $K$ chunk \emph{and} one $V$ chunk
+between adjacent ranks. With dtype $\dtype$,
+\begin{equation}
+  \mathcal{B}_\step
+  = 2 \cdot B \cdot \frac{S}{P} \cdot H \cdot D \cdot \Bd
+  \label{eq:bytes_step}
+\end{equation}
+and a full pass requires $P - 1$ such transfers per rank (no transfer
+in the final step, since the result is consumed locally). On the
+default ring layout, traffic is symmetric: every rank sends to its
+\emph{next} neighbour and receives from its \emph{previous} neighbour
+in lockstep.
+
+\subsection{Heterogeneous ring under contiguous rank placement}
+
+With $P$ GPUs distributed across $N = \lceil P/g \rceil$ nodes and a
+contiguous rank-to-node mapping, the $P$ ring hops split into
+\begin{align}
+  k_\text{inter}(P, g) &= \min(P, N) \quad \text{inter-node hops}, \\
+  k_\text{intra}(P, g) &= P - k_\text{inter}(P, g) \quad \text{intra-node hops},
+  \label{eq:hop_count}
+\end{align}
+i.e.~one inter-node hop per node boundary the ring crosses, with the
+exception that for $N = 1$ (single-node, $P \le g$) we have
+$k_\text{inter} = 0$ and the ring closes intra-node. Concretely on
+\texttt{gpu-turing} ($g = 4$):
+\begin{center}
+\begin{tabular}{@{}cccc@{}}
+  \toprule
+  $P$ & $N$ & $k_\text{intra}$ & $k_\text{inter}$ \\
+  \midrule
+  2  & 1 & 2  & 0 \\
+  4  & 1 & 4  & 0 \\
+  8  & 2 & 6  & 2 \\
+  16 & 4 & 12 & 4 \\
+  20 & 5 & 15 & 5 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Per-step transfer time (single-node)}
+
+For $N = 1$ every hop is intra-node and the standard $\alpha$--$\beta$
+form applies:
+\begin{equation}
+    t_\comm^\step
+    = \alpha_{\text{NCCL}}^{\text{intra}}
+      + \frac{\mathcal{B}_\step}{\bw_{\text{net}}^{\text{intra}}} ,
+    \qquad (N = 1).
+  \label{eq:tcomm_step_intra}
+\end{equation}
+
+\subsection{Per-step transfer time (multi-node)}
+
+For $N > 1$ the steady-state ring step proceeds in lockstep across all
+ranks; the wall-clock time of one step is set by the \emph{slowest hop
+present in that step}, because every rank's compute starts only after
+\emph{its} K/V chunk has arrived. Under contiguous rank placement
+every step contains at least one inter-node hop (the chunk has to
+traverse a node boundary somewhere in the ring at every step). Hence
+\begin{equation}
+  \boxed{\;
+    t_\comm^\step
+    = \alpha_{\text{NCCL}}^{\text{inter}}
+      + \frac{\mathcal{B}_\step}{\bw_{\text{net}}^{\text{inter}}} ,
+    \qquad (N > 1).
+  \;}
+  \label{eq:tcomm_step_inter}
+\end{equation}
+Counter-intuitive but consistent with the
+\texttt{MPI\_Reduce(MAX)} convention used by the benchmark:
+$\bw_{\text{net}}^{\text{intra}}$ never appears in
+$t_\comm^\step$ for multi-node runs, because the rank waiting on an
+intra-node hop is already idle waiting for the inter-node-receiving
+neighbour to catch up. The intra-node bandwidth only matters
+\emph{within} the kernel (HBM traffic) or for the small fraction of
+runs where rank placement is non-contiguous (e.g.~\texttt{srun} with
+custom \texttt{--gres-flags=enforce-binding}); we do not consider
+those layouts in v1.
+
+\subsection{Allgather variant}
+
+For the all-gather baseline (\texttt{--mode=allgather}) we use the
+ring-allgather complexity model evaluated with the inter-node link
+when $N > 1$:
+\begin{equation}
+  t_\comm^{\text{allgather}}
+  = (P - 1)\,\alpha_{\text{NCCL}}^{\bullet} \;+\;
+    \frac{(P-1) \cdot \mathcal{B}_\step}{\bw_{\text{net}}^{\bullet}} ,
+  \label{eq:tcomm_allgather}
+\end{equation}
+where $\bullet = \text{intra}$ if $N = 1$ and $\bullet = \text{inter}$
+otherwise. NCCL's tree-based all-gather implementation may beat the
+ring formula by up to $\log_2 P$ at large $P$; we treat that as a
+calibration adjustment fitted from the $P=20$ allgather data point
+rather than modelling it in closed form.
+
+\section{Mode-level total time}
+\label{sec:modes}
+
+\subsection{Allgather baseline}
+
+\begin{equation}
+  t_\tot^{\text{allgather}}
+  = t_\comm^{\text{allgather}}
+    + t_\comp^{\text{single-GPU}}
+    + \alpha_{\text{launch}} ,
+  \label{eq:tot_allgather}
+\end{equation}
+where $t_\comp^{\text{single-GPU}}$ is Eq.~\eqref{eq:tcomp_pass}
+evaluated at $P=1$ (the kernel sees the full $S \times S$ matrix).
+Communication and compute are strictly serial.
+
+\subsection{Ring-blocking}
+
+\begin{equation}
+  t_\tot^{\text{blocking}}
+  = \sum_{s=0}^{P-1} \left(
+      t_\comp^\step
+      + \indicator{s < P-1}\,(t_\comm^\step + t_\wait^\step)
+    \right)
+    + P \cdot \alpha_{\text{launch}} .
+  \label{eq:tot_blocking}
+\end{equation}
+In the blocking mode the host posts the next-step transfer, runs the
+current-step kernel, then \emph{waits} on \texttt{MPI\_Waitall} /
+\texttt{cudaStreamSynchronize}. With no overlap the wait term equals
+the unhidden transfer time, which we model as zero plus jitter ---
+i.e., $t_\wait^\step \approx 0$ in the calibrated steady state ---
+because the host already paid for the synchronous handshake inside
+$t_\comm^\step$.
+
+\subsection{Ring-overlap}
+
+The two-stream design queues a kernel on \texttt{stream\_compute}
+while \texttt{stream\_copy} drives the next K/V transfer. Per step,
+the host-visible time is
+\begin{equation}
+  t_\step^{\text{overlap}}
+  = \max\!\bigl(t_\comp^\step,\, t_\comm^\step\bigr) ,
+  \label{eq:step_overlap}
+\end{equation}
+and the unhidden wait per step is the deficit
+\begin{equation}
+  t_\wait^\step
+  = \max\!\bigl(0,\, t_\comm^\step - t_\comp^\step\bigr) .
+  \label{eq:wait_overlap}
+\end{equation}
+Summed over $P$ steps,
+\begin{equation}
+  \boxed{\;
+  t_\tot^{\text{overlap}}
+  = \sum_{s=0}^{P-1} \max\!\bigl(t_\comp^\step,\, t_\comm^\step\bigr)
+  + P \cdot \alpha_{\text{launch}} .
+  \;}
+  \label{eq:tot_overlap}
+\end{equation}
+Because $\mathcal{B}_\step \propto S$ but $\flops_\step \propto S^2$,
+overlap eventually becomes compute-bound: for large enough $S$,
+$t_\comp^\step \gg t_\comm^\step$ and $t_\wait \to 0$. Let
+$\bw_{\text{net}}^{\bullet}$ denote
+$\bw_{\text{net}}^{\text{intra}}$ if $N = 1$ and
+$\bw_{\text{net}}^{\text{inter}}$ otherwise. The crossover
+sequence length $S^\star$ where $t_\comp^\step = t_\comm^\step$ solves
+\begin{equation}
+  S^\star(P, N) \;\approx\;
+  \frac{2\,P\,\Bd\,\eta_{\text{kernel}}^\dtype\,F_\peak^\dtype
+        \,(z(P,\text{causal}))^{-1}}
+       {\bw_{\text{net}}^{\bullet}(N)}
+  \label{eq:crossover}
+\end{equation}
+and is reported per cell as a diagnostic for whether a given
+$(S, P, N, \dtype, \text{causal})$ combination is in the
+communication-bound or compute-bound regime. Because
+$\bw_{\text{net}}^{\text{inter}} \ll \bw_{\text{net}}^{\text{intra}}$
+on the gpu-turing fabric, $S^\star$ jumps sharply upward at the
+transition $N: 1 \to 2$ (i.e.~at $P = 8$): the multi-node ring needs
+\emph{longer} sequences before the kernel hides communication. This
+is the headline qualitative prediction to validate against the
+$P \in \{8, 16, 20\}$ data.
+
+\subsection{Unified predictor}
+
+Define the indicator $\mathrm{ov}(\text{mode}) = 1$ for
+\texttt{ring-overlap} and $0$ for \texttt{ring-blocking}. The unified
+predictor is
+\begin{equation}
+  t_\tot^{\text{ring}}
+  = \sum_{s=0}^{P-1}\!\Big[
+      (1 - \mathrm{ov})\,(t_\comp^\step + t_\comm^\step) \;+\;
+      \mathrm{ov}\,\max(t_\comp^\step, t_\comm^\step)
+    \Big]
+    + P\,\alpha_{\text{launch}} .
+  \label{eq:tot_unified}
+\end{equation}
+This is the function fitted in Step~B of the per-version protocol
+(see PLAN.md \S 3).
+
+\section{Per-rank load imbalance under causal masking}
+\label{sec:imbalance}
+
+Even with zig-zag assignment, the per-rank kernel time varies because
+the \emph{step-by-step} workload is not constant. At ring step $s$
+on rank $r$, the foreign K-chunk source rank is
+$r_{\text{src}}(r, s) = (r - s) \bmod P$. Under causal masking
+the number of unmasked $(q, k)$ pairs in step $s$ is
+\begin{equation}
+  W_\zz(r, s) =
+  \frac{2}{P}\;\Big(
+    \indicator{r_{\text{src}} < r}
+    + \indicator{r_{\text{src}} = r} \cdot \tfrac{1}{2}
+  \Big)
+  \quad\text{(fraction of dense block).}
+\end{equation}
+Averaged over all ranks the per-step workload is constant
+($\tfrac{1}{2}$ of dense for $s>0$, $\tfrac{1}{4}$ on the diagonal),
+which is the property that makes zig-zag balanced \emph{on average}.
+Per-rank variance still exists at the level of individual steps but is
+absorbed by the \texttt{MPI\_Reduce(MAX)} step in the benchmark: we
+predict the slowest rank, not the mean. For coarse zig-zag
+(2 sub-groups per rank, our v1 implementation) the residual imbalance
+at small $P$ ($P{=}2$) is the largest source of model error in the
+causal column of the sweep.
+
+\section{Memory model}
+\label{sec:memory}
+
+\subsection{Persistent device-resident state}
+
+For one $(B, H, D)$ shape, each rank holds:
+\begin{align}
+  M_{Q}           &= B H S_\ell D \cdot \Bd & &\text{(local queries)}\\
+  M_{KV,\text{dbl}} &= 2 \cdot 2 \cdot B H S_\ell D \cdot \Bd
+                   & &\text{(double-buffered K and V)}\\
+  M_{O}           &= B H S_\ell D \cdot 4
+                   & &\text{(fp32 output accumulator, always fp32)} \\
+  M_{m,\ell}       &= 2 B H S_\ell \cdot 4
+                   & &\text{(running softmax max + sum, always fp32)}
+\end{align}
+The total device memory is
+\begin{equation}
+  M_\text{rank}
+  = B H S_\ell \bigl(5 D \Bd + 4 D + 8\bigr)
+  \approx 5\,B H S_\ell D\,\Bd
+  \quad\text{(for the fp16 path).}
+  \label{eq:mem_rank}
+\end{equation}
+
+\subsection{Memory-bound boundary}
+
+The largest $S$ admissible on a given GPU with memory capacity $M_{\text{HBM}}$
+is
+\begin{equation}
+  S_{\max} \approx \frac{P \cdot M_{\text{HBM}}}
+                        {B H D \,(5\Bd + 4)} .
+  \label{eq:smax}
+\end{equation}
+On a \SI{24}{\giga\byte} RTX 6000 with the Llama-3 8B anchor
+($B=1, H=32, D=128$) and fp16, this gives
+$S_{\max} \approx \num{1.4e6}\cdot P$ tokens, i.e. memory is not
+the binding constraint inside our $S \le 64$k sweep. The application
+track (Sec.~6 of \texttt{PLAN.md}) hits a tighter bound because
+Llama-3 8B's weights occupy $\approx 16$\,GB per rank.
+
+\section{Roofline}
+\label{sec:roofline}
+
+For the dense kernel body of one ring step the arithmetic intensity
+in FLOP / byte (assuming we re-read Q, K, V, O exactly once per step)
+is
+\begin{equation}
+  I_\step \;=\;
+  \frac{\flops_\step}{4 \cdot B H S_\ell D \cdot \Bd}
+  \;=\; \frac{S_\ell}{\Bd} ,
+  \label{eq:intensity}
+\end{equation}
+linear in $S_\ell$. Even at $S_\ell = 1024$ this is
+$I \approx 256$ FLOP/byte (fp16) ---  well past the
+$F_\peak/\bw_{\text{HBM}} \approx \num{195}$ FLOP/byte ridge of
+sm\_75 in fp16. So we expect the kernel to be \emph{compute-bound on the
+roofline} for all $S_\ell \gtrsim 1$k, except at $D = 32$ in fp32 where
+register spills (the $O_i[D]$ register array in
+\texttt{attention\_step.cu}) can swap us into a memory-bound stall regime;
+this is captured downstream in $\eta_{\text{kernel}}$.
+
+\section{Calibration protocol}
+\label{sec:calibration}
+
+The model has \emph{four} free constants. Each is measured once per
+hardware configuration and re-fit only when the kernel changes
+mechanism (e.g.~fp16 WMMA path swaps tile sizes).
+
+\begin{longtable}{@{}p{3.0cm}p{4.8cm}p{6.5cm}@{}}
+  \toprule
+  Constant & Measurement & Notes \\
+  \midrule
+  $F_\peak^\dtype$
+    & \texttt{cublasGemmEx} square GEMM micro-bench at the relevant dtype.
+    & Take the asymptote of the FLOP/s vs.~$N$ curve as $N \to \infty$. \\
+  $\bw_{\text{net}}^{\text{intra}}$
+    & Pairwise \texttt{ncclSend}/\texttt{ncclRecv} of \SI{64}{\mega\byte}
+      with both ranks on the \emph{same} node.
+    & Use \texttt{--nodelist=hpcc-gpu-5-1} (or any single node) to force
+      the placement. \\
+  $\bw_{\text{net}}^{\text{inter}}$
+    & Same micro-bench with the two ranks on \emph{different} nodes.
+    & \texttt{--nodes=2 --ntasks-per-node=1}. Often $5\times$--$20\times$
+      slower than intra; this gap is the dominant multi-node effect. \\
+  $\alpha_{\text{NCCL}}^{\text{intra}}, \alpha_{\text{NCCL}}^{\text{inter}}$
+    & Same micro-benches at \SI{4}{\byte} payload; the floor latency.
+    & Includes NCCL kernel-launch cost; the inter-node value also
+      includes fabric setup. \\
+  $\alpha_{\text{launch}}$
+    & Empty ring loop ($P$ no-op kernels), $S \le 256$.
+    & Per-step host overhead, dominated by \texttt{cudaEventRecord}. \\
+  $\eta_{\text{kernel}}^\dtype$
+    & Single-GPU ($P=1$) sweep over $S$, fit Eq.~\eqref{eq:tcomp_pass} to data.
+    & The only constant expected to move version-to-version. \\
+  \bottomrule
+\end{longtable}
+
+\section{Diagnostic outputs}
+\label{sec:diagnostics}
+
+For each cell of the workload matrix the calibrated predictor emits:
+\begin{enumerate}
+  \item Predicted $(t_\comp, t_\comm, t_\wait, t_\tot)$.
+  \item Measured $(t_\comp, t_\comm, t_\wait, t_\tot)$.
+  \item Residual $\Delta t_\tot = t_\tot^{\text{measured}} -
+        t_\tot^{\text{predicted}}$ and its sign.
+  \item Regime label, from Eq.~\eqref{eq:crossover}:
+        \texttt{comp-bound} if $t_\comp^\step > 2\,t_\comm^\step$;
+        \texttt{comm-bound} if $t_\comm^\step > 2\,t_\comp^\step$;
+        \texttt{balanced} otherwise.
+  \item Topology label: \texttt{single-node} ($N=1$) or
+        \texttt{multi-node} ($N>1$). For multi-node cells, the
+        achieved fraction of $\bw_{\text{net}}^{\text{inter}}$ from
+        Eq.~\eqref{eq:tcomm_step_inter} is the second headline number;
+        it captures whether NCCL's inter-node path is saturating the
+        fabric or is starved (e.g.~by GPU-Direct~RDMA falling back to
+        host-staged transfers).
+  \item Achieved fraction of peak $\eta_{\text{kernel}}^{\text{measured}}$
+        for compute-bound cells. Drift in this number across the v1--v4
+        sequence is the headline plot of the report.
+\end{enumerate}
+
+The cells with the largest \emph{positive} residuals (system slower
+than predicted) are the bottleneck hypotheses that drive the next
+kernel version. Step~B of the protocol in PLAN.md formalises this loop.
+
+\section{Limits of the model}
+\label{sec:limits}
+
+The following effects are intentionally \emph{not} captured and will
+appear as residuals:
+
+\begin{itemize}
+  \item \textbf{Causal load imbalance within a step.} Modelled as
+        average-of-rank in Sec.~\ref{sec:imbalance}; the per-rank
+        worst-case (which the \texttt{MAX} reduction selects)
+        can exceed the average by 10--15\,\% at small $P$.
+  \item \textbf{NCCL stream contention.} When \texttt{stream\_copy}
+        and \texttt{stream\_compute} both touch HBM, effective
+        memory bandwidth drops below the \texttt{ncclSend}-only
+        microbench. Shows up as larger-than-predicted $t_\comm$
+        in long-$S$ \texttt{ring-overlap} cells.
+  \item \textbf{Kernel-launch jitter at small $S$.} Variance in
+        $\alpha_{\text{launch}}$ across runs is multiplicative in
+        $P$ and dominates total time once $t_\comp^\step \lesssim
+        \alpha_{\text{launch}}$.
+  \item \textbf{Register spill at $D = 256$.} The
+        $O_i[D]$ per-thread register array in
+        \texttt{attention\_step.cu} spills to local memory at
+        $D=256$ on sm\_75; $\eta_{\text{kernel}}$ falls sharply.
+        Predicted as a separate $\eta$ value when needed.
+  \item \textbf{Multi-layer effects.} The single-call benchmark
+        does not amortise communicator setup across the
+        32 layers of the Llama-3 prefill. Sec.~6 of PLAN.md handles
+        that separately.
+  \item \textbf{Inter-node tail latency.} The fabric latency
+        $\alpha_{\text{NCCL}}^{\text{inter}}$ has a heavy upper tail
+        on shared cluster fabrics (other users' traffic). The model
+        uses the median; at $P = 20$ the variance in $t_\wait$ across
+        iterations is itself a useful diagnostic.
+  \item \textbf{Non-contiguous rank placement.} If the launcher
+        scatters ranks across nodes in a non-blocked layout
+        (e.g.~round-robin), every hop becomes inter-node and
+        Eq.~\eqref{eq:tcomm_step_inter} still holds; but
+        $k_\text{inter}$ in Eq.~\eqref{eq:hop_count} becomes $P$ and
+        the all-gather variant penalty grows accordingly. Pin
+        \texttt{--ntasks-per-node} explicitly to guarantee the
+        contiguous layout assumed throughout this document.
+\end{itemize}
+
+\section{Worked examples}
+\label{sec:example}
+
+Common constants across both examples:
+$B=1$, $H=32$, $D=128$, fp16, causal on, mode = ring-overlap,
+$F_\peak^{\text{fp16}} = \SI{130.5}{TFLOP\per\second}$,
+$\eta_{\text{kernel}}^{\text{fp16}} = 0.35$,
+$\bw_{\text{net}}^{\text{intra}} = \SI{12}{\giga\byte\per\second}$,
+$\bw_{\text{net}}^{\text{inter}} = \SI{2}{\giga\byte\per\second}$
+(placeholder --- calibrate before runs),
+$\alpha_{\text{NCCL}}^{\text{intra}} = \SI{20}{\micro\second}$,
+$\alpha_{\text{NCCL}}^{\text{inter}} = \SI{2}{\milli\second}$,
+$\alpha_{\text{launch}} = \SI{5}{\micro\second}$.
+
+\subsection{Single-node ($P = 4$, $N = 1$)}
+
+For $S = 32$k:
+\begin{align}
+  S_\ell &= 8\text{k},\quad C = 8\text{k} \\
+  z(P,\text{causal}) &= 0.5 + \tfrac{1}{8} = 0.625 \\
+  \flops_\step^\zz   &= 0.625 \cdot 4 \cdot 32 \cdot 8192^2 \cdot 128
+                       \approx 6.87 \cdot 10^{11} \\
+  t_\comp^\step      &= \frac{6.87\!\cdot\!10^{11}}
+                              {0.35 \cdot 1.305\!\cdot\!10^{14}}
+                       \approx \SI{15.0}{\milli\second} \\
+  \mathcal{B}_\step  &= 2 \cdot 8192 \cdot 32 \cdot 128 \cdot 2
+                       \approx \SI{134}{\mega\byte} \\
+  t_\comm^\step      &= 0.02 + 134/12000
+                       \approx \SI{11.2}{\milli\second} \\
+  t_\step^{\text{overlap}} &= \max(15.0, 11.2) = \SI{15.0}{\milli\second} \\
+  t_\tot             &= 4 \cdot 15.0 + 4 \cdot 0.005
+                       \approx \SI{60.0}{\milli\second}
+\end{align}
+The cell is just barely compute-bound
+($t_\comp^\step / t_\comm^\step \approx 1.34$).
+
+\subsection{Multi-node ($P = 20$, $N = 5$)}
+
+Same problem at $P = 20$, $N = 5$, $S = 32$k:
+\begin{align}
+  S_\ell &= S/P = 1638,\quad C = 1638 \\
+  z(P,\text{causal}) &= 0.5 + \tfrac{1}{40} = 0.525 \\
+  \flops_\step^\zz   &= 0.525 \cdot 4 \cdot 32 \cdot 1638^2 \cdot 128
+                       \approx 2.31 \cdot 10^{10} \\
+  t_\comp^\step      &= \frac{2.31\!\cdot\!10^{10}}
+                              {0.35 \cdot 1.305\!\cdot\!10^{14}}
+                       \approx \SI{0.51}{\milli\second} \\
+  \mathcal{B}_\step  &= 2 \cdot 1638 \cdot 32 \cdot 128 \cdot 2
+                       \approx \SI{26.8}{\mega\byte} \\
+  t_\comm^\step      &= 0.002 + 26.8 / 2000
+                       \approx \SI{15.4}{\milli\second}
+                       \quad\text{(uses } \bw_{\text{net}}^{\text{inter}}\text{)} \\
+  t_\step^{\text{overlap}} &= \max(0.51, 15.4) = \SI{15.4}{\milli\second} \\
+  t_\tot             &= 20 \cdot 15.4 + 20 \cdot 0.005
+                       \approx \SI{308}{\milli\second}
+\end{align}
+This cell is \emph{severely} comm-bound: the kernel
+finishes in \SI{0.5}{\milli\second} but each ring step waits
+\SI{15}{\milli\second} for the next inter-node K/V chunk to arrive.
+$t_\wait^\step \approx \SI{14.9}{\milli\second}$ per step ---
+i.e.~the ring spends $\approx 97\%$ of wall-clock waiting on the
+fabric. Two consequences fall out of this:
+
+\begin{itemize}
+  \item \textbf{Scaling efficiency collapses past $P = 4$.} At $P = 4$
+        (single node) the same problem takes $\sim 60$\,ms; at
+        $P = 20$ it takes $\sim 308$\,ms --- a $5\times$
+        \emph{slowdown} despite using $5\times$ more GPUs. The crossover
+        sequence Eq.~\eqref{eq:crossover} at $N=5$ shifts to
+        $S^\star \approx \num{1.9e6}$, so reaching the compute-bound
+        regime needs $S \gtrsim 2\text{M}$ tokens at $P = 20$.
+  \item \textbf{The headline plot is the strong-scaling efficiency
+        $E(P) = T(1) / (P \cdot T(P))$ as a function of $S$.}
+        Predicted: $E(P)$ stays above 0.7 for $P \le 4$ at
+        $S \ge 16$k; drops below 0.2 at $P = 20$ until $S$ reaches
+        $\sim 1$M tokens. The measured curve is what the v1 doc reports.
+\end{itemize}
+
+The placeholder $\bw_{\text{net}}^{\text{inter}} = 2\,\si{GB/s}$ used
+above is a \emph{conservative guess}; the actual fabric throughput on
+gpu-turing needs measurement (see Sec.~\ref{sec:calibration})
+before the $P > 4$ predictions are trusted. The shape of the
+qualitative conclusion --- multi-node is comm-bound until $S$ is
+very large --- is robust to that number within a factor of $\sim 5$.
+
+\begin{thebibliography}{9}
+  \bibitem{liu2023ring}
+    H.~Liu, M.~Zaharia, P.~Abbeel.
+    \emph{Ring Attention with Blockwise Transformers for Near-Infinite Context}.
+    arXiv:2310.01889, 2023.
+  \bibitem{brandon2023ringflash}
+    W.~Brandon, A.~Nrusimha, K.~Qian, et al.
+    \emph{Striped Attention: Faster Ring Attention for Causal Transformers}.
+    arXiv:2311.09431, 2023.
+  \bibitem{dao2022flash}
+    T.~Dao, D.~Y.~Fu, S.~Ermon, A.~Rudra, C.~R\'e.
+    \emph{FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness}.
+    NeurIPS, 2022.
+\end{thebibliography}
+
+\end{document}

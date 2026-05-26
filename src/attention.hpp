@@ -79,9 +79,18 @@ void launch_attention_init(float* out, float* m, float* l, const AttentionShape&
 /// Global token positions are `(q_offset + i)` for queries and
 /// `(k_offset + j)` for keys; causal masking visibility is
 /// `k_offset + j <= q_offset + i`.
+///
+/// @param attn_bias   Optional additive bias, shape `[B, H, seq_q, seq_k]`.
+///                    Caller pre-slices to match the current chunk's key window.
+///                    Nullptr disables the feature.
+/// @param segment_ids Optional token segment labels, shape `[B, seq_global]`.
+///                    Cross-segment pairs are masked to -inf. Nullptr disables.
+/// @param seq_global  Global sequence length used to stride into `segment_ids`.
+///                    Ignored when `segment_ids` is nullptr.
 void launch_attention_step(const float* q, const float* k, const float* v, float* out, float* m,
                            float* l, const AttentionShape& shape, int q_offset, int k_offset,
-                           bool causal, cudaStream_t stream = 0);
+                           bool causal, cudaStream_t stream = 0, const float* attn_bias = nullptr,
+                           const int* segment_ids = nullptr, int seq_global = 0);
 
 /// Finalize the ring: divide `out` by the per-row sum `l` (no-op rows where
 /// `l == 0` are zeroed). After this call, `out` contains the final attention
@@ -97,9 +106,15 @@ void launch_attention_finalize(float* out, const float* l, const AttentionShape&
 /// are reused unchanged.
 ///
 /// Supported `head_dim`: 32, 64, 128. Requires sm_70+.
+///
+/// @param attn_bias   Optional FP32 additive bias, shape `[B, H, seq_q, seq_k]`.
+/// @param segment_ids Optional segment labels, shape `[B, seq_global]`.
+/// @param seq_global  Stride for `segment_ids`; ignored when nullptr.
 void launch_attention_step_fp16(const __half* q, const __half* k, const __half* v, float* out,
                                 float* m, float* l, const AttentionShape& shape, int q_offset,
-                                int k_offset, bool causal, cudaStream_t stream = 0);
+                                int k_offset, bool causal, cudaStream_t stream = 0,
+                                const float* attn_bias = nullptr, const int* segment_ids = nullptr,
+                                int seq_global = 0);
 
 /// Element-wise FP32 → FP16 cast on the device. Used to stage Q (and K/V in
 /// tests) into the FP16 path without a CPU round-trip.

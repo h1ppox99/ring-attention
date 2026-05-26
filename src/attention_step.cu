@@ -79,16 +79,21 @@ __global__ void finalize_kernel(float* O, const float* L, int H, int Sq, int D) 
 /// @param q_offset  Global position of the first local query row. Used only
 ///                  for causal masking; identifies where this Q slice sits
 ///                  in the full (pre-zigzag) sequence.
-/// @param k_offset  Global position of the first key in this chunk. Combined
-///                  with the local `j` index to recover `j_global` for the
-///                  causal predicate. Lets the ring pass non-contiguous chunks
-///                  (e.g. zig-zag) without changing the kernel.
+/// @param k_offset    Global position of the first key in this chunk. Combined
+///                    with the local `j` index to recover `j_global` for the
+///                    causal predicate. Lets the ring pass non-contiguous chunks
+///                    (e.g. zig-zag) without changing the kernel.
+/// @param attn_bias   Optional additive bias, shape [B, H, Sq, Sk]. Nullptr = disabled.
+/// @param segment_ids Optional token segment labels, shape [B, seq_global].
+///                    Cross-segment scores are set to -inf. Nullptr = disabled.
+/// @param seq_global  Stride into `segment_ids` (global sequence length).
 template <int BR, int BC, int D>
 __global__ void attention_step_kernel(const float* __restrict__ Q, const float* __restrict__ K,
                                       const float* __restrict__ V, float* __restrict__ O,
                                       float* __restrict__ M, float* __restrict__ L, int H, int Sq,
-                                      int Sk, float scale, bool causal, int q_offset,
-                                      int k_offset) {
+                                      int Sk, float scale, bool causal, int q_offset, int k_offset,
+                                      const float* __restrict__ attn_bias,
+                                      const int* __restrict__ segment_ids, int seq_global) {
   const int tid = threadIdx.x;
   const int q_tile = blockIdx.x;
   const int h = blockIdx.y;
@@ -154,14 +159,22 @@ __global__ void attention_step_kernel(const float* __restrict__ Q, const float* 
     for (int j = 0; j < BC; ++j) {
       const int j_local_in_chunk = j_base + j;
       const int j_global = k_offset + j_local_in_chunk;
-      const bool visible = (j_local_in_chunk < Sk) && (!causal || (j_global <= i_global));
+      bool visible = (j_local_in_chunk < Sk) && (!causal || (j_global <= i_global));
+      if (visible && segment_ids) {
+        visible =
+            (segment_ids[b * seq_global + i_global] == segment_ids[b * seq_global + j_global]);
+      }
       if (visible) {
         float dot = 0.0f;
 #pragma unroll
         for (int d = 0; d < D; ++d) dot += Q_tile[tid * D + d] * K_tile[j * D + d];
-        const float v = dot * scale;
-        s[j] = v;
-        if (v > m_new) m_new = v;
+        float score = dot * scale;
+        if (attn_bias) {
+          score +=
+              attn_bias[((long)b * H + h) * (long)Sq * Sk + (long)i_local * Sk + j_local_in_chunk];
+        }
+        s[j] = score;
+        if (score > m_new) m_new = score;
       } else {
         s[j] = -INFINITY;
       }
@@ -202,12 +215,14 @@ __global__ void attention_step_kernel(const float* __restrict__ Q, const float* 
 template <int BR, int BC, int D>
 void launch_step_typed(const float* q, const float* k, const float* v, float* out, float* m,
                        float* l, const AttentionShape& shape, int q_offset, int k_offset,
-                       bool causal, cudaStream_t stream) {
+                       bool causal, cudaStream_t stream, const float* attn_bias,
+                       const int* segment_ids, int seq_global) {
   const dim3 grid(ceil_div(shape.seq_q, BR), shape.heads, shape.batch);
   const dim3 block(BR);
   const float scale = 1.0f / std::sqrt(static_cast<float>(D));
-  attention_step_kernel<BR, BC, D><<<grid, block, 0, stream>>>(
-      q, k, v, out, m, l, shape.heads, shape.seq_q, shape.seq_k, scale, causal, q_offset, k_offset);
+  attention_step_kernel<BR, BC, D>
+      <<<grid, block, 0, stream>>>(q, k, v, out, m, l, shape.heads, shape.seq_q, shape.seq_k, scale,
+                                   causal, q_offset, k_offset, attn_bias, segment_ids, seq_global);
   cudaCheck(cudaGetLastError());
 }
 
@@ -225,19 +240,24 @@ void launch_attention_init(float* out, float* m, float* l, const AttentionShape&
 
 void launch_attention_step(const float* q, const float* k, const float* v, float* out, float* m,
                            float* l, const AttentionShape& shape, int q_offset, int k_offset,
-                           bool causal, cudaStream_t stream) {
+                           bool causal, cudaStream_t stream, const float* attn_bias,
+                           const int* segment_ids, int seq_global) {
   switch (shape.head_dim) {
     case 32:
-      launch_step_typed<64, 64, 32>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_step_typed<64, 64, 32>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream,
+                                    attn_bias, segment_ids, seq_global);
       break;
     case 64:
-      launch_step_typed<32, 32, 64>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_step_typed<32, 32, 64>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream,
+                                    attn_bias, segment_ids, seq_global);
       break;
     case 128:
-      launch_step_typed<32, 16, 128>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_step_typed<32, 16, 128>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream,
+                                     attn_bias, segment_ids, seq_global);
       break;
     case 256:
-      launch_step_typed<16, 8, 256>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_step_typed<16, 8, 256>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream,
+                                    attn_bias, segment_ids, seq_global);
       break;
     default:
       fprintf(stderr, "attention_step: unsupported head_dim=%d (supported: 32, 64, 128, 256)\n",

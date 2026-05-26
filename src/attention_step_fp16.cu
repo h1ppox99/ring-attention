@@ -44,7 +44,8 @@ __global__ void attention_step_fp16_kernel(const __half* __restrict__ Q,
                                            const __half* __restrict__ V, float* __restrict__ O,
                                            float* __restrict__ M, float* __restrict__ L, int H,
                                            int Sq, int Sk, float scale, bool causal, int q_offset,
-                                           int k_offset) {
+                                           int k_offset, const float* __restrict__ attn_bias,
+                                           const int* __restrict__ segment_ids, int seq_global) {
   static_assert(D % kMmaK == 0, "D must be a multiple of 16 for wmma path");
   constexpr int kDSlices = D / kMmaK;
 
@@ -145,8 +146,16 @@ __global__ void attention_step_fp16_kernel(const __half* __restrict__ Q,
         for (int j = 0; j < kBC; ++j) {
           const int j_local_in_chunk = j_base + j;
           const int j_global = k_offset + j_local_in_chunk;
-          const bool visible = (j_local_in_chunk < Sk) && (!causal || (j_global <= i_global));
-          const float s = visible ? S_f[r * kBC + j] : -INFINITY;
+          bool visible = (j_local_in_chunk < Sk) && (!causal || (j_global <= i_global));
+          if (visible && segment_ids) {
+            visible =
+                (segment_ids[b * seq_global + i_global] == segment_ids[b * seq_global + j_global]);
+          }
+          float s = visible ? S_f[r * kBC + j] : -INFINITY;
+          if (visible && attn_bias) {
+            s += attn_bias[((long)b * H + h) * (long)Sq * Sk + (long)i_local * Sk +
+                           j_local_in_chunk];
+          }
           S_f[r * kBC + j] = s;
           if (s > m_new) m_new = s;
         }
@@ -225,12 +234,14 @@ __global__ void float_to_half_kernel(const float* __restrict__ src, __half* __re
 template <int D>
 void launch_step_fp16_typed(const __half* q, const __half* k, const __half* v, float* o, float* m,
                             float* l, const AttentionShape& shape, int q_offset, int k_offset,
-                            bool causal, cudaStream_t stream) {
+                            bool causal, cudaStream_t stream, const float* attn_bias,
+                            const int* segment_ids, int seq_global) {
   const dim3 grid(ceil_div(shape.seq_q, kBR), shape.heads, shape.batch);
   const dim3 block(32);
   const float scale = 1.0f / std::sqrt(static_cast<float>(D));
-  attention_step_fp16_kernel<D><<<grid, block, 0, stream>>>(
-      q, k, v, o, m, l, shape.heads, shape.seq_q, shape.seq_k, scale, causal, q_offset, k_offset);
+  attention_step_fp16_kernel<D>
+      <<<grid, block, 0, stream>>>(q, k, v, o, m, l, shape.heads, shape.seq_q, shape.seq_k, scale,
+                                   causal, q_offset, k_offset, attn_bias, segment_ids, seq_global);
   cudaCheck(cudaGetLastError());
 }
 
@@ -238,19 +249,24 @@ void launch_step_fp16_typed(const __half* q, const __half* k, const __half* v, f
 
 void launch_attention_step_fp16(const __half* q, const __half* k, const __half* v, float* o,
                                 float* m, float* l, const AttentionShape& shape, int q_offset,
-                                int k_offset, bool causal, cudaStream_t stream) {
+                                int k_offset, bool causal, cudaStream_t stream,
+                                const float* attn_bias, const int* segment_ids, int seq_global) {
   switch (shape.head_dim) {
     case 32:
-      launch_step_fp16_typed<32>(q, k, v, o, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_step_fp16_typed<32>(q, k, v, o, m, l, shape, q_offset, k_offset, causal, stream,
+                                 attn_bias, segment_ids, seq_global);
       break;
     case 64:
-      launch_step_fp16_typed<64>(q, k, v, o, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_step_fp16_typed<64>(q, k, v, o, m, l, shape, q_offset, k_offset, causal, stream,
+                                 attn_bias, segment_ids, seq_global);
       break;
     case 128:
-      launch_step_fp16_typed<128>(q, k, v, o, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_step_fp16_typed<128>(q, k, v, o, m, l, shape, q_offset, k_offset, causal, stream,
+                                  attn_bias, segment_ids, seq_global);
       break;
     case 256:
-      launch_step_fp16_typed<256>(q, k, v, o, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_step_fp16_typed<256>(q, k, v, o, m, l, shape, q_offset, k_offset, causal, stream,
+                                  attn_bias, segment_ids, seq_global);
       break;
     default:
       fprintf(stderr,
