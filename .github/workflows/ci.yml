@@ -106,10 +106,12 @@ jobs:
           method: network
           sub-packages: '["nvcc", "cudart", "cudart-dev"]'
 
-      - name: Install MPI
+      - name: Install MPI + NCCL
+        # NCCL ships as a separate apt package (libnccl-dev) from NVIDIA's repo,
+        # which the cuda-toolkit action above already configured.
         run: |
           sudo apt-get update
-          sudo apt-get install -y libopenmpi-dev openmpi-bin
+          sudo apt-get install -y libopenmpi-dev openmpi-bin libnccl-dev libnccl2
 
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1.2
