@@ -160,3 +160,102 @@ considered and rejected: BC reduction is blocked by the register limit, and
 `__launch_bounds__`-driven spills would push the per-block local-memory
 working set past L1's capacity at the higher block counts (≥ 5 blocks/SM ⇒
 local-mem thrashing).
+
+---
+
+## Round 4 — manual FMA fusion in the dot product and V accumulation
+
+Profile: `results/ncu/2026-05-26_21-59/`, `results/nsys/2026-05-26_21-59/`.
+Baseline for comparison: the flat-layout `results/ncu/*.ncu-rep` snapshot
+from end of Round 3.
+
+### Step-level breakdown (where the time actually goes)
+
+Per-rank totals over 3 iters at `seq=16384, D=128, causal=1`:
+
+| mode                 | kernel | MPI_Waitall | kernel : MPI |
+|---                   |---     |---          |---           |
+| ring-blocking        | 50.9 ms | 564.9 ms   | 1 : 11       |
+| ring-overlap         | 50.6 ms | 449.3 ms   | 1 : 9        |
+| ring-overlap-zigzag  | 219.9 ms | 226.9 ms  | ~1 : 1       |
+
+In non-zigzag modes MPI_Waitall dwarfs the kernel by ~10×: the per-step
+8 MB × 4-message round trip over the cluster's Ethernet network simply
+takes longer than the kernel does. In ring-overlap, the kernel finishes
+inside the Waitall window (so it *is* hidden), and Waitall is recorded as
+host-blocked time, not GPU stall time — the GPU is doing real work during
+those 449 ms. Critical-path wall-clock is bounded below by `max(kernel,
+comm)`, and at this shape `comm` already wins; no kernel-side change can
+shorten it.
+
+**ring-overlap + zigzag is the production configuration** (smaller K/V
+chunks per step + more kernel launches → comm and compute end up balanced
+~1:1, exactly the regime where each ms of kernel speedup translates ~1:1
+to end-to-end). That is the mode where Round 4's kernel work pays off.
+
+### Bottlenecks identified
+
+- **Short Scoreboard still dominates the kernel** (D=128, c=0: 6.7 cycles =
+  69.1 % of 9.7-cycle inter-issue gap). Smem broadcast load (`LDS.128` from
+  `K_tile` / `V_tile`) → dependent FMA. Round 3 already cut the load
+  *count* 4× with `float4`; the remaining stall is per-load latency, which
+  is structural. Hypothesis: only a warp-cooperative dot product (Q/K split
+  across 32 lanes via `__shfl_xor`) materially moves this on Turing —
+  Round 3's documented ceiling. Not in scope for this round.
+- **Non-fused FP32 ≈ 25 % of arithmetic** (Nsight "Instruction Statistics":
+  7.66 B fused + 2.59 B non-fused FP32 → up to **13 % kernel speedup** from
+  pairing → ~6 % end-to-end in zigzag mode). Source pattern: `s[j] +=
+  q0*k.x + q1*k.y + q2*k.z + q3*k.w` and the V-accumulation `acc.x +=
+  s[j]*v.x; …` give nvcc enough algebraic freedom to emit FMUL+FADD pairs
+  instead of FMA chains. Manual `fmaf` chains force fusion. Hypothesis:
+  this is the only bottleneck addressable without a structural rewrite
+  this round.
+- **Eligible warps per scheduler = 0.20** (1.87 active, 10.7 % eligible).
+  Symptom of bottleneck #1 — too many warps stalled on the same smem load
+  at once. Not directly addressable without restructuring.
+
+MPI tuning is **not** in scope: the non-zigzag overhead is network-bound
+(no source-level fix), and the production zigzag config already overlaps
+comm with compute at ~1:1, so further overlap-engineering buys nothing.
+Memory access pattern warnings (uncoalesced global loads / stores) carry
+< 0.25 % estimated speedup each — not real bottlenecks, ignored.
+
+### Changes attempted and reverted
+
+- **Manual `fmaf` chain in the Q·K^T inner matmul + V accumulation + `l_i`
+  update** (`attention_step.cu`). Replaced `s[j] += q0*k.x + q1*k.y +
+  q2*k.z + q3*k.w` with four serialised `s[j] = fmaf(q?, k.?, s[j])` calls;
+  similarly rewrote `acc.? += s[j] * v.?` and `l_i = alpha*l_i + row_sum`
+  with explicit `fmaf`. Theory: forces FMA where nvcc was reportedly
+  leaving 25 % of FP32 non-fused (per the Nsight rule). Tests passed
+  (`atol=rtol=1e-3` against the Python reference, all 16 cases).
+- **Practice: regressed by 7-10 % across all four ring modes** (re-profile
+  job 87398, `results/{ncu,nsys}/2026-05-26_22-37/`):
+    - `ring-overlap-zigzag` `attention_step` avg: 6.11 ms → 6.73 ms (+10.1 %)
+    - `ring-overlap` avg:                          12.65 ms → 13.59 ms (+7.4 %)
+    - `ring-blocking` avg:                         12.74 ms → 13.70 ms (+7.5 %)
+    - `allgather` avg:                             49.71 ms → 53.96 ms (+8.6 %)
+  - Warp Cycles Per Issued Instruction at D=128 c=0: 9.72 → 11.12 (+14 %).
+  - D=64 register pressure: 247 → 255 (now saturated).
+  - **Why**: the original `s[j] += q0*k.x + q1*k.y + q2*k.z + q3*k.w` lets
+    nvcc emit 4 independent FMULs (parallel issue) followed by a small
+    reduction tree — high ILP, ~5 cycle wide latency. The fmaf chain
+    `s[j] = fmaf(q0, k.x, s[j]); s[j] = fmaf(q1, ...);` serialises on
+    `s[j]` for ~24 cycles of dependent FMAs (6-cycle Turing FMA latency).
+    The 16 independent `s[j]` accumulators are not enough to hide this
+    given the per-thread state already pinning 255 registers/thread.
+  - **Reverted**. `src/attention_step.cu` is back to its post-Round-3
+    state. The Nsight "13 % non-fused FP32" rule was misleading here: the
+    parenthesised mul-then-sum form was already optimal in the
+    latency-vs-ILP trade-off, even though it scores as "non-fused".
+
+### Where this leaves us
+
+Round 4 produced no kernel improvement. The actionable improvements
+visible to Nsight at this stage are either (a) symptoms of an addressed
+ceiling (eligible-warps, scheduler issue rate — both downstream of Short
+Scoreboard, which itself requires a structural rewrite), or (b)
+mis-classified ILP wins that look like FMA-fusion opportunities but
+aren't. The Round 3 conclusion — *FlashAttention-v2-style
+warp-cooperative D reduction is the next real lever* — still holds and
+is the correct framing for a future round.
