@@ -61,10 +61,11 @@ int run_ring(const AttentionShape& full, int num_chunks, bool causal, std::uint3
     return 1;
   }
   const int chunk_k = full.seq_k / num_chunks;
+  const int kv_H = (full.kv_heads > 0) ? full.kv_heads : full.heads;
 
   const std::size_t qn = (std::size_t)full.batch * full.heads * full.seq_q * full.head_dim;
-  const std::size_t kn_total = (std::size_t)full.batch * full.heads * full.seq_k * full.head_dim;
-  const std::size_t kn_chunk = (std::size_t)full.batch * full.heads * chunk_k * full.head_dim;
+  const std::size_t kn_total = (std::size_t)full.batch * kv_H * full.seq_k * full.head_dim;
+  const std::size_t kn_chunk = (std::size_t)full.batch * kv_H * chunk_k * full.head_dim;
   const std::size_t m_count = (std::size_t)full.batch * full.heads * full.seq_q;
 
   std::vector<float> q(qn), k(kn_total), v(kn_total);
@@ -97,10 +98,9 @@ int run_ring(const AttentionShape& full, int num_chunks, bool causal, std::uint3
   for (int p = 0; p < num_chunks; ++p) {
     const int k_off = p * chunk_k;
     for (int b = 0; b < full.batch; ++b) {
-      for (int h = 0; h < full.heads; ++h) {
-        const std::size_t src_head =
-            (((std::size_t)b * full.heads) + h) * full.seq_k * full.head_dim;
-        const std::size_t dst_head = (((std::size_t)b * full.heads) + h) * chunk_k * full.head_dim;
+      for (int h = 0; h < kv_H; ++h) {
+        const std::size_t src_head = (((std::size_t)b * kv_H) + h) * full.seq_k * full.head_dim;
+        const std::size_t dst_head = (((std::size_t)b * kv_H) + h) * chunk_k * full.head_dim;
         const std::size_t src_off = src_head + (std::size_t)k_off * full.head_dim;
         const std::size_t bytes = (std::size_t)chunk_k * full.head_dim * sizeof(float);
         std::memcpy(k_chunk_host.data() + dst_head, k.data() + src_off, bytes);
@@ -145,6 +145,21 @@ int main() {
 
   rc |= run_ring({1, 2, 32, 64, 64}, 1, false, 9u, "fp16 P=1 sanity non-causal");
   rc |= run_ring({1, 2, 64, 64, 64}, 1, true, 10u, "fp16 P=1 sanity causal");
+
+  // GQA: 8 Q heads, 2 KV heads.
+  {
+    AttentionShape s{1, 8, 64, 64, 64};
+    s.kv_heads = 2;
+    rc |= run_ring(s, 2, false, 11u, "fp16 GQA H=8 kv=2 P=2 non-causal");
+    rc |= run_ring(s, 2, true, 12u, "fp16 GQA H=8 kv=2 P=2 causal");
+  }
+  // MQA: 4 Q heads, 1 KV head.
+  {
+    AttentionShape s{1, 4, 64, 64, 64};
+    s.kv_heads = 1;
+    rc |= run_ring(s, 4, false, 13u, "fp16 MQA H=4 kv=1 P=4 non-causal");
+    rc |= run_ring(s, 4, true, 14u, "fp16 MQA H=4 kv=1 P=4 causal");
+  }
 
   if (rc == 0) printf("attention_step_fp16 OK\n");
   return rc;

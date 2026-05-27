@@ -43,6 +43,7 @@ struct RingConfig {
   int heads;
   int seq;  ///< Global sequence length (must be divisible by cp_size).
   int head_dim;
+  int kv_heads{0};  ///< KV head count for GQA/MQA; 0 means same as heads (MHA).
   bool causal;
   bool zigzag;
   bool verify;

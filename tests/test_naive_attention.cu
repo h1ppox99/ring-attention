@@ -46,8 +46,9 @@ int max_err_or_fail(const std::vector<float>& gpu, const std::vector<float>& cpu
 }
 
 int run_case(const AttentionShape& s, bool causal, std::uint32_t seed, const char* tag) {
+  const int kv_H = (s.kv_heads > 0) ? s.kv_heads : s.heads;
   const std::size_t qn = (std::size_t)s.batch * s.heads * s.seq_q * s.head_dim;
-  const std::size_t kn = (std::size_t)s.batch * s.heads * s.seq_k * s.head_dim;
+  const std::size_t kn = (std::size_t)s.batch * kv_H * s.seq_k * s.head_dim;
 
   std::vector<float> q(qn), k(kn), v(kn);
   XorShift32 rng(seed);
@@ -83,6 +84,22 @@ int main() {
   rc |= run_case({1, 2, 16, 48, 24}, false, 5u, "Sq<Sk non-causal");
   rc |= run_case({1, 2, 16, 48, 24}, true, 6u, "Sq<Sk causal-aligned");
   rc |= run_case({1, 1, 64, 64, 64}, true, 7u, "64x64x64 causal");
+
+  // GQA: 8 Q heads, 2 KV heads.
+  {
+    AttentionShape s{1, 8, 32, 32, 32};
+    s.kv_heads = 2;
+    rc |= run_case(s, false, 8u, "GQA H=8 kv=2 non-causal");
+    rc |= run_case(s, true, 9u, "GQA H=8 kv=2 causal");
+  }
+  // MQA: 4 Q heads, 1 KV head.
+  {
+    AttentionShape s{1, 4, 32, 32, 32};
+    s.kv_heads = 1;
+    rc |= run_case(s, false, 10u, "MQA H=4 kv=1 non-causal");
+    rc |= run_case(s, true, 11u, "MQA H=4 kv=1 causal");
+  }
+
   if (rc == 0) printf("naive_attention OK\n");
   return rc;
 }

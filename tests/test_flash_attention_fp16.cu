@@ -48,8 +48,9 @@ int compare(const std::vector<float>& gpu, const std::vector<float>& cpu, const 
 }
 
 int run_case(const AttentionShape& s, bool causal, std::uint32_t seed, const char* tag) {
+  const int kv_H = (s.kv_heads > 0) ? s.kv_heads : s.heads;
   const std::size_t qn = (std::size_t)s.batch * s.heads * s.seq_q * s.head_dim;
-  const std::size_t kn = (std::size_t)s.batch * s.heads * s.seq_k * s.head_dim;
+  const std::size_t kn = (std::size_t)s.batch * kv_H * s.seq_k * s.head_dim;
 
   std::vector<float> q(qn), k(kn), v(kn);
   XorShift32 rng(seed);
@@ -97,6 +98,21 @@ int main() {
   // head_dim = 128.
   rc |= run_case({1, 1, 32, 64, 128}, false, 9u, "fp16 d=128 32x64 non-causal");
   rc |= run_case({1, 1, 64, 64, 128}, true, 10u, "fp16 d=128 64x64 causal");
+
+  // GQA: 8 Q heads, 2 KV heads.
+  {
+    AttentionShape s{1, 8, 64, 64, 64};
+    s.kv_heads = 2;
+    rc |= run_case(s, false, 11u, "fp16 GQA H=8 kv=2 non-causal");
+    rc |= run_case(s, true, 12u, "fp16 GQA H=8 kv=2 causal");
+  }
+  // MQA: 4 Q heads, 1 KV head.
+  {
+    AttentionShape s{1, 4, 64, 64, 64};
+    s.kv_heads = 1;
+    rc |= run_case(s, false, 13u, "fp16 MQA H=4 kv=1 non-causal");
+    rc |= run_case(s, true, 14u, "fp16 MQA H=4 kv=1 causal");
+  }
 
   // head_dim = 256.
   rc |= run_case({1, 1, 32, 64, 256}, false, 11u, "fp16 d=256 32x64 non-causal");

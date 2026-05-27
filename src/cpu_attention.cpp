@@ -24,6 +24,7 @@ void cpu_attention(const float* q, const float* k, const float* v, float* out,
                    const AttentionShape& shape, bool causal) {
   const int B = shape.batch;
   const int H = shape.heads;
+  const int kv_H = (shape.kv_heads > 0) ? shape.kv_heads : shape.heads;
   const int Sq = shape.seq_q;
   const int Sk = shape.seq_k;
   const int D = shape.head_dim;
@@ -37,8 +38,8 @@ void cpu_attention(const float* q, const float* k, const float* v, float* out,
   for (int b = 0; b < B; ++b) {
     for (int h = 0; h < H; ++h) {
       const float* q_h = q + head_offset(b, h, H, Sq, D);
-      const float* k_h = k + head_offset(b, h, H, Sk, D);
-      const float* v_h = v + head_offset(b, h, H, Sk, D);
+      const float* k_h = k + head_offset(b, h % kv_H, kv_H, Sk, D);
+      const float* v_h = v + head_offset(b, h % kv_H, kv_H, Sk, D);
       float* o_h = out + head_offset(b, h, H, Sq, D);
 
       for (int i = 0; i < Sq; ++i) {

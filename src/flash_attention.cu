@@ -30,7 +30,8 @@ namespace {
 template <int BR, int BC, int D>
 __global__ void flash_attention_kernel(const float* __restrict__ Q, const float* __restrict__ K,
                                        const float* __restrict__ V, float* __restrict__ O, int H,
-                                       int Sq, int Sk, float scale, bool causal, int causal_shift) {
+                                       int kv_H, int Sq, int Sk, float scale, bool causal,
+                                       int causal_shift) {
   const int tid = threadIdx.x;  // 0 .. BR-1
   const int q_tile = blockIdx.x;
   const int h = blockIdx.y;
@@ -40,7 +41,7 @@ __global__ void flash_attention_kernel(const float* __restrict__ Q, const float*
   const bool active = (i_global < Sq);
 
   const long head_q = ((long)b * H + h) * Sq * D;
-  const long head_k = ((long)b * H + h) * Sk * D;
+  const long head_k = ((long)b * kv_H + (h % kv_H)) * Sk * D;
 
   __shared__ float Q_tile[BR * D];
   __shared__ float K_tile[BC * D];
@@ -140,10 +141,11 @@ void launch_typed(const float* q, const float* k, const float* v, float* out,
                   const AttentionShape& shape, bool causal, cudaStream_t stream) {
   const dim3 grid(ceil_div(shape.seq_q, BR), shape.heads, shape.batch);
   const dim3 block(BR);
+  const int kv_H = (shape.kv_heads > 0) ? shape.kv_heads : shape.heads;
   const int causal_shift = shape.seq_k - shape.seq_q;
   const float scale = 1.0f / std::sqrt(static_cast<float>(D));
   flash_attention_kernel<BR, BC, D><<<grid, block, 0, stream>>>(
-      q, k, v, out, shape.heads, shape.seq_q, shape.seq_k, scale, causal, causal_shift);
+      q, k, v, out, shape.heads, kv_H, shape.seq_q, shape.seq_k, scale, causal, causal_shift);
   cudaCheck(cudaGetLastError());
 }
 

@@ -111,6 +111,89 @@ int test_hand_computed_2x2() {
   return 0;
 }
 
+/// GQA: verify each Q head attends to the correct KV head (h % kv_H).
+/// For each KV head, compare the GQA output for the mapped Q heads against a
+/// 1-head MHA call using that KV head's K/V slice (the Q tensors differ across
+/// heads, so outputs differ — the check is that the K/V slice used matches the
+/// h % kv_H mapping).
+int test_gqa_head_sharing() {
+  // H=4 Q heads, kv_H=2 KV heads: Q heads {0,2} → KV head 0; {1,3} → KV head 1.
+  AttentionShape s{1, 4, 8, 8, 4};
+  s.kv_heads = 2;
+  const int kv_H = 2;
+
+  const std::size_t qn = (std::size_t)s.batch * s.heads * s.seq_q * s.head_dim;
+  const std::size_t kn = (std::size_t)s.batch * kv_H * s.seq_k * s.head_dim;
+  std::vector<float> q(qn), k(kn), v(kn), o(qn, 0.0f);
+  XorShift32 rng(0xABCDu);
+  rng.fill_uniform(q);
+  rng.fill_uniform(k);
+  rng.fill_uniform(v);
+
+  cpu_attention(q.data(), k.data(), v.data(), o.data(), s, /*causal*/ false);
+
+  // Q heads 0 and 2 use KV head 0; their outputs must differ (different Q) but
+  // we can verify they used the same K/V by running single-head MHA and comparing.
+  for (int pair = 0; pair < 2; ++pair) {
+    const int h0 = pair;      // Q head mapping to KV head `pair`
+    const int h1 = pair + 2;  // Q head also mapping to KV head `pair`
+    // Extract the output rows for both Q heads and verify they are not identical
+    // (they have different Q, so outputs differ).  The real check is that swapping
+    // which KV head they attend to would change the result — we confirm by running
+    // two 1-head MHA calls with the correct KV head and comparing to cpu_attention.
+    AttentionShape s1{1, 1, s.seq_q, s.seq_k, s.head_dim};
+
+    // Build single-head Q tensors for h0 and h1.
+    const std::size_t hstride_q = (std::size_t)s.seq_q * s.head_dim;
+    const std::size_t hstride_kv = (std::size_t)s.seq_k * s.head_dim;
+    std::vector<float> q0(hstride_q), q1(hstride_q);
+    std::vector<float> kv(hstride_kv), vv(hstride_kv);
+    std::copy(q.begin() + h0 * hstride_q, q.begin() + (h0 + 1) * hstride_q, q0.begin());
+    std::copy(q.begin() + h1 * hstride_q, q.begin() + (h1 + 1) * hstride_q, q1.begin());
+    std::copy(k.begin() + pair * hstride_kv, k.begin() + (pair + 1) * hstride_kv, kv.begin());
+    std::copy(v.begin() + pair * hstride_kv, v.begin() + (pair + 1) * hstride_kv, vv.begin());
+
+    std::vector<float> o0(hstride_q, 0.0f), o1(hstride_q, 0.0f);
+    cpu_attention(q0.data(), kv.data(), vv.data(), o0.data(), s1, false);
+    cpu_attention(q1.data(), kv.data(), vv.data(), o1.data(), s1, false);
+
+    for (std::size_t i = 0; i < hstride_q; ++i) {
+      EXPECT(approx_equal(o[h0 * hstride_q + i], o0[i]), "GQA head h0 output mismatch");
+      EXPECT(approx_equal(o[h1 * hstride_q + i], o1[i]), "GQA head h1 output mismatch");
+    }
+  }
+  return 0;
+}
+
+/// MQA: single KV head shared by all Q heads.
+int test_mqa_single_kv() {
+  AttentionShape s{1, 4, 8, 8, 4};
+  s.kv_heads = 1;
+
+  const std::size_t qn = (std::size_t)s.batch * s.heads * s.seq_q * s.head_dim;
+  const std::size_t kn = (std::size_t)s.batch * 1 * s.seq_k * s.head_dim;
+  std::vector<float> q(qn), k(kn), v(kn), o(qn, 0.0f);
+  XorShift32 rng(0xDEADu);
+  rng.fill_uniform(q);
+  rng.fill_uniform(k);
+  rng.fill_uniform(v);
+
+  cpu_attention(q.data(), k.data(), v.data(), o.data(), s, /*causal*/ false);
+
+  // Verify each Q head against a 1-head MHA call with the single KV head.
+  const std::size_t hstride_q = (std::size_t)s.seq_q * s.head_dim;
+  const std::size_t hstride_kv = (std::size_t)s.seq_k * s.head_dim;
+  AttentionShape s1{1, 1, s.seq_q, s.seq_k, s.head_dim};
+  for (int h = 0; h < s.heads; ++h) {
+    std::vector<float> qh(hstride_q), oh(hstride_q, 0.0f);
+    std::copy(q.begin() + h * hstride_q, q.begin() + (h + 1) * hstride_q, qh.begin());
+    cpu_attention(qh.data(), k.data(), v.data(), oh.data(), s1, false);
+    for (std::size_t i = 0; i < hstride_q; ++i)
+      EXPECT(approx_equal(o[h * hstride_q + i], oh[i]), "MQA head output mismatch");
+  }
+  return 0;
+}
+
 /// Cross-attention shape Sq != Sk with causal alignment shift Sk - Sq.
 /// Sq=1, Sk=3, query "i=0" sees keys j <= 0 + (3-1) = 2 → all keys; should match non-causal.
 int test_causal_alignment_cross() {
@@ -135,6 +218,8 @@ int main() {
   rc |= test_causal_first_row();
   rc |= test_hand_computed_2x2();
   rc |= test_causal_alignment_cross();
+  rc |= test_gqa_head_sharing();
+  rc |= test_mqa_single_kv();
   if (rc == 0) printf("cpu_attention OK\n");
   return rc;
 }

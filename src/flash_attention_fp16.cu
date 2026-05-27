@@ -57,8 +57,8 @@ template <int D>
 __global__ void flash_attention_fp16_kernel(const float* __restrict__ Q,
                                             const float* __restrict__ K,
                                             const float* __restrict__ V, float* __restrict__ O,
-                                            int H, int Sq, int Sk, float scale, bool causal,
-                                            int causal_shift) {
+                                            int H, int kv_H, int Sq, int Sk, float scale,
+                                            bool causal, int causal_shift) {
   static_assert(D % kMmaK == 0, "D must be a multiple of 16 for wmma path");
   constexpr int kDSlices = D / kMmaK;
 
@@ -68,7 +68,7 @@ __global__ void flash_attention_fp16_kernel(const float* __restrict__ Q,
   const int b = blockIdx.z;
 
   const long head_q = ((long)b * H + h) * Sq * D;
-  const long head_k = ((long)b * H + h) * Sk * D;
+  const long head_k = ((long)b * kv_H + (h % kv_H)) * Sk * D;
 
   __shared__ __half Q_h[kBR * D];
   __shared__ __half K_h[kBC * D];
@@ -237,10 +237,11 @@ void launch_typed(const float* q, const float* k, const float* v, float* out,
                   const AttentionShape& shape, bool causal, cudaStream_t stream) {
   const dim3 grid(ceil_div(shape.seq_q, kBR), shape.heads, shape.batch);
   const dim3 block(32);  // one warp per block
+  const int kv_H = (shape.kv_heads > 0) ? shape.kv_heads : shape.heads;
   const int causal_shift = shape.seq_k - shape.seq_q;
   const float scale = 1.0f / std::sqrt(static_cast<float>(D));
   flash_attention_fp16_kernel<D><<<grid, block, 0, stream>>>(
-      q, k, v, out, shape.heads, shape.seq_q, shape.seq_k, scale, causal, causal_shift);
+      q, k, v, out, shape.heads, kv_H, shape.seq_q, shape.seq_k, scale, causal, causal_shift);
   cudaCheck(cudaGetLastError());
 }
 
