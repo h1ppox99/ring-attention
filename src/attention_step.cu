@@ -4,21 +4,28 @@
 /// K/V chunk, and writes the updated state back. A separate finalize divides
 /// O by l after all chunks have been consumed.
 ///
-/// Shared-memory access notes (driven by Nsight Compute feedback on
+/// Shared-memory / occupancy notes (driven by Nsight Compute feedback on
 /// bank conflicts, MIO stalls, and SM occupancy):
 ///   1. Q lives in per-thread *registers* (`Q_reg[D]`), not shared memory.
 ///      Q is per-query-row and never shared across threads, so shared was the
-///      wrong tier. Killing `Q_tile` halves per-block smem (e.g. 32 KB -> 16 KB
-///      at D=128, BR=32), letting more blocks be resident per SM and lifting
-///      the 12.5% occupancy ceiling we hit when Q was in shared. `#pragma
-///      unroll` on the d loop keeps `Q_reg[d]` register-indexed so nvcc does
-///      not lower the array to local memory.
+///      wrong tier. `#pragma unroll` on the d loop keeps `Q_reg[d]` register-
+///      indexed so nvcc does not lower the array to local memory. With Q out
+///      of shared, per-block smem is just `K_tile + V_tile` = 16 KB
+///      (independent of BR), so bumping BR adds warps "for free" — see (4).
 ///   2. The Q*K^T loop is iterated as `for d { q = Q_reg[d]; for j { s[j] += q*K[j][d]; } }`,
 ///      so Q comes from registers (no bank conflicts possible) and K is a
 ///      warp-wide broadcast (also conflict-free). Masking/scaling runs as a
 ///      small post-pass.
-///   3. K/V cooperative loads use float4 (LDS.128 / STS.128) which issues 4x
-///      fewer instructions and reduces MIO-queue pressure.
+///   3. The inner matmul and the output accumulation read K_tile / V_tile via
+///      float4 (LDS.128). Each access is still a warp-wide broadcast (1
+///      wavefront), but the issued *instruction* count drops 4x, which
+///      directly relieves the Short Scoreboard / MIO-queue stalls.
+///   4. BR is sized so each block has 2-4 warps (was 1) — same smem footprint,
+///      more resident warps per SM, lifting theoretical occupancy from 12.5%
+///      to 25-37.5% on Turing for the D=64 / D=128 configs.
+///   5. K/V cooperative loads use float4 (LDS.128 / STS.128) which issues 4x
+///      fewer instructions and reduces MIO-queue pressure on the load path
+///      too.
 
 #include <cmath>
 #include <cstdio>
@@ -185,19 +192,24 @@ __global__ void attention_step_kernel(const float* __restrict__ Q, const float* 
 
     if (!active) continue;
 
-    // Q . K^T matmul. Q comes from registers (`Q_reg[d]`), K is a warp-wide
-    // broadcast load from shared. Both operands are conflict-free; the d loop
-    // is unrolled so `Q_reg[d]` stays register-indexed.
+    // Q . K^T matmul. Q comes from registers (`Q_reg[d]`); K is a warp-wide
+    // broadcast load from shared. We walk d in groups of 4 and read K_tile via
+    // float4 (LDS.128) — same broadcast wavefront count, 4x fewer issued
+    // shared-load instructions, which is what the Short Scoreboard waits on.
     float s[BC];
 #pragma unroll
     for (int j = 0; j < BC; ++j) s[j] = 0.0f;
 
 #pragma unroll
-    for (int d = 0; d < D; ++d) {
-      const float q = Q_reg[d];
+    for (int d4 = 0; d4 < D / 4; ++d4) {
+      const float q0 = Q_reg[d4 * 4 + 0];
+      const float q1 = Q_reg[d4 * 4 + 1];
+      const float q2 = Q_reg[d4 * 4 + 2];
+      const float q3 = Q_reg[d4 * 4 + 3];
 #pragma unroll
       for (int j = 0; j < BC; ++j) {
-        s[j] += q * K_tile[j * D + d];
+        const float4 k4 = *reinterpret_cast<const float4*>(&K_tile[j * D + d4 * 4]);
+        s[j] += q0 * k4.x + q1 * k4.y + q2 * k4.z + q3 * k4.w;
       }
     }
 
@@ -228,14 +240,28 @@ __global__ void attention_step_kernel(const float* __restrict__ Q, const float* 
       row_sum += s[j];
     }
 
+    // Output accumulation: O_i <- alpha * O_i + sum_j s[j] * V_j.
+    // V_tile broadcast read via float4 — same idea as the inner matmul: 4x
+    // fewer issued shared-load instructions.
 #pragma unroll
-    for (int d = 0; d < D; ++d) {
-      float acc = alpha * O_i[d];
+    for (int d4 = 0; d4 < D / 4; ++d4) {
+      float4 acc;
+      acc.x = alpha * O_i[d4 * 4 + 0];
+      acc.y = alpha * O_i[d4 * 4 + 1];
+      acc.z = alpha * O_i[d4 * 4 + 2];
+      acc.w = alpha * O_i[d4 * 4 + 3];
 #pragma unroll
       for (int j = 0; j < BC; ++j) {
-        acc += s[j] * V_tile[j * D + d];
+        const float4 v4 = *reinterpret_cast<const float4*>(&V_tile[j * D + d4 * 4]);
+        acc.x += s[j] * v4.x;
+        acc.y += s[j] * v4.y;
+        acc.z += s[j] * v4.z;
+        acc.w += s[j] * v4.w;
       }
-      O_i[d] = acc;
+      O_i[d4 * 4 + 0] = acc.x;
+      O_i[d4 * 4 + 1] = acc.y;
+      O_i[d4 * 4 + 2] = acc.z;
+      O_i[d4 * 4 + 3] = acc.w;
     }
     l_i = alpha * l_i + row_sum;
     m_i = m_new;
@@ -279,15 +305,20 @@ void launch_attention_init(float* out, float* m, float* l, const AttentionShape&
 void launch_attention_step(const float* q, const float* k, const float* v, float* out, float* m,
                            float* l, const AttentionShape& shape, int q_offset, int k_offset,
                            bool causal, cudaStream_t stream) {
+  // BR is sized so each block has 2-4 warps; per-block smem is just K+V
+  // (16 KB) regardless of BR, so packing more warps per block lifts occupancy
+  // without changing the smem footprint.
+  // D=256 keeps BR=16 because Q_reg[256] already spills heavily; bigger BR
+  // would multiply local-memory traffic across more threads.
   switch (shape.head_dim) {
     case 32:
-      launch_step_typed<64, 64, 32>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_step_typed<128, 64, 32>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
       break;
     case 64:
-      launch_step_typed<32, 32, 64>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_step_typed<64, 32, 64>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
       break;
     case 128:
-      launch_step_typed<32, 16, 128>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_step_typed<64, 16, 128>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
       break;
     case 256:
       launch_step_typed<16, 8, 256>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
