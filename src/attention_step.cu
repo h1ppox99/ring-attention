@@ -3,6 +3,22 @@
 /// ring step. The kernel reads (O, m, l) from global memory, processes one
 /// K/V chunk, and writes the updated state back. A separate finalize divides
 /// O by l after all chunks have been consumed.
+///
+/// Shared-memory access notes (driven by Nsight Compute feedback on
+/// bank conflicts, MIO stalls, and SM occupancy):
+///   1. Q lives in per-thread *registers* (`Q_reg[D]`), not shared memory.
+///      Q is per-query-row and never shared across threads, so shared was the
+///      wrong tier. Killing `Q_tile` halves per-block smem (e.g. 32 KB -> 16 KB
+///      at D=128, BR=32), letting more blocks be resident per SM and lifting
+///      the 12.5% occupancy ceiling we hit when Q was in shared. `#pragma
+///      unroll` on the d loop keeps `Q_reg[d]` register-indexed so nvcc does
+///      not lower the array to local memory.
+///   2. The Q*K^T loop is iterated as `for d { q = Q_reg[d]; for j { s[j] += q*K[j][d]; } }`,
+///      so Q comes from registers (no bank conflicts possible) and K is a
+///      warp-wide broadcast (also conflict-free). Masking/scaling runs as a
+///      small post-pass.
+///   3. K/V cooperative loads use float4 (LDS.128 / STS.128) which issues 4x
+///      fewer instructions and reduces MIO-queue pressure.
 
 #include <cmath>
 #include <cstdio>
@@ -89,6 +105,10 @@ __global__ void attention_step_kernel(const float* __restrict__ Q, const float* 
                                       float* __restrict__ M, float* __restrict__ L, int H, int kv_H,
                                       int Sq, int Sk, float scale, bool causal, int q_offset,
                                       int k_offset) {
+  static_assert(D % 4 == 0, "D must be a multiple of 4 for float4 K/V loads.");
+  static_assert((BC * D) % (BR * 4) == 0,
+                "Cooperative float4 K/V load assumes BC*D/4 divides evenly across BR threads.");
+
   const int tid = threadIdx.x;
   const int q_tile = blockIdx.x;
   const int h = blockIdx.y;
@@ -101,15 +121,20 @@ __global__ void attention_step_kernel(const float* __restrict__ Q, const float* 
   const long head_k = ((long)b * kv_H + (h % kv_H)) * Sk * D;
   const long row_idx = ((long)b * H + h) * Sq + i_local;
 
-  __shared__ float Q_tile[BR * D];
   __shared__ float K_tile[BC * D];
   __shared__ float V_tile[BC * D];
 
+  // Q lives in registers, one row per thread. With the d loop fully unrolled
+  // below, `Q_reg[d]` is compile-time indexed and nvcc keeps the array in
+  // registers (no local-memory spill).
+  float Q_reg[D];
   if (active) {
     const float* q_src = Q + head_q + (long)i_local * D;
-    for (int d = 0; d < D; ++d) Q_tile[tid * D + d] = q_src[d];
+#pragma unroll
+    for (int d = 0; d < D; ++d) Q_reg[d] = q_src[d];
   } else {
-    for (int d = 0; d < D; ++d) Q_tile[tid * D + d] = 0.0f;
+#pragma unroll
+    for (int d = 0; d < D; ++d) Q_reg[d] = 0.0f;
   }
 
   // Load persistent state for this row.
@@ -128,27 +153,57 @@ __global__ void attention_step_kernel(const float* __restrict__ Q, const float* 
   const int i_global = q_offset + i_local;
   const int num_k_tiles = (Sk + BC - 1) / BC;
 
+  // Each float4 iteration moves 4 contiguous floats of K (and V) from global
+  // to shared. With our (BR, BC, D) instantiations the loop count divides
+  // evenly across BR threads.
+  constexpr int kTileVec4 = (BC * D) / 4;
+
   for (int kt = 0; kt < num_k_tiles; ++kt) {
     __syncthreads();
     const int j_base = kt * BC;
 
-    for (int idx = tid; idx < BC * D; idx += BR) {
+    // Cooperative K/V load with float4 (LDS.128 / STS.128). 4x fewer shared
+    // store instructions than a per-float loop, easing MIO pressure.
+    for (int idx4 = tid; idx4 < kTileVec4; idx4 += BR) {
+      const int idx = idx4 * 4;
       const int j_local = idx / D;
-      const int d = idx % D;
+      const int d = idx - j_local * D;
       const int j_local_in_chunk = j_base + j_local;
+      float4 k4;
+      float4 v4;
       if (j_local_in_chunk < Sk) {
-        K_tile[idx] = K[head_k + (long)j_local_in_chunk * D + d];
-        V_tile[idx] = V[head_k + (long)j_local_in_chunk * D + d];
+        k4 = *reinterpret_cast<const float4*>(K + head_k + (long)j_local_in_chunk * D + d);
+        v4 = *reinterpret_cast<const float4*>(V + head_k + (long)j_local_in_chunk * D + d);
       } else {
-        K_tile[idx] = 0.0f;
-        V_tile[idx] = 0.0f;
+        k4 = float4{0.0f, 0.0f, 0.0f, 0.0f};
+        v4 = float4{0.0f, 0.0f, 0.0f, 0.0f};
       }
+      *reinterpret_cast<float4*>(K_tile + idx) = k4;
+      *reinterpret_cast<float4*>(V_tile + idx) = v4;
     }
     __syncthreads();
 
     if (!active) continue;
 
+    // Q . K^T matmul. Q comes from registers (`Q_reg[d]`), K is a warp-wide
+    // broadcast load from shared. Both operands are conflict-free; the d loop
+    // is unrolled so `Q_reg[d]` stays register-indexed.
     float s[BC];
+#pragma unroll
+    for (int j = 0; j < BC; ++j) s[j] = 0.0f;
+
+#pragma unroll
+    for (int d = 0; d < D; ++d) {
+      const float q = Q_reg[d];
+#pragma unroll
+      for (int j = 0; j < BC; ++j) {
+        s[j] += q * K_tile[j * D + d];
+      }
+    }
+
+    // Apply scale + bounds/causal mask, find tile-local row max.
+    // K_tile rows for j_local_in_chunk >= Sk were zeroed in the cooperative
+    // load, so s[j] for those rows is 0; we still overwrite with -INFINITY.
     float m_new = m_i;
 #pragma unroll
     for (int j = 0; j < BC; ++j) {
@@ -156,12 +211,8 @@ __global__ void attention_step_kernel(const float* __restrict__ Q, const float* 
       const int j_global = k_offset + j_local_in_chunk;
       const bool visible = (j_local_in_chunk < Sk) && (!causal || (j_global <= i_global));
       if (visible) {
-        float dot = 0.0f;
-#pragma unroll
-        for (int d = 0; d < D; ++d) dot += Q_tile[tid * D + d] * K_tile[j * D + d];
-        const float v = dot * scale;
-        s[j] = v;
-        if (v > m_new) m_new = v;
+        s[j] *= scale;
+        if (s[j] > m_new) m_new = s[j];
       } else {
         s[j] = -INFINITY;
       }
