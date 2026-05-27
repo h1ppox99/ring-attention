@@ -27,6 +27,7 @@
 #include "attention.hpp"
 #include "cpu_attention.hpp"
 #include "device_tensor.hpp"
+#include "nccl_utils.hpp"
 #include "ring_gen.hpp"
 #include "ring_loop.hpp"
 #include "ring_partition.hpp"
@@ -252,7 +253,8 @@ ring_attention::RingResult run_ring_blocking_fp16(const ring_attention::RingConf
   const std::size_t kv_local_elem = static_cast<std::size_t>(nsg) * kv_sg_elem;
   const std::size_t m_sg = static_cast<std::size_t>(B) * H * Sl;
   const std::size_t m_count = static_cast<std::size_t>(nsg) * m_sg;
-  const std::size_t kv_bytes = kv_local_elem * sizeof(__half);
+  // Used only on the MPI path; the NCCL build never references it.
+  [[maybe_unused]] const std::size_t kv_bytes = kv_local_elem * sizeof(__half);
 
   const int next_rank = part.next_rank();
   const int prev_rank = part.prev_rank();
@@ -298,12 +300,17 @@ ring_attention::RingResult run_ring_blocking_fp16(const ring_attention::RingConf
   AttentionShape sg_shape{B, H, Sl, Sl, D};
   sg_shape.kv_heads = kv_H;
 
+#ifdef RING_USE_NCCL
+  // NCCL communicator: GPU-to-GPU direct, no host staging needed.
+  ncclComm_t nccl_comm = ring_attention::nccl_init(R, P);
+#else
   // Pinned host stagers, sized in fp16 bytes for K/V.
   __half *K_send_h = nullptr, *V_send_h = nullptr, *K_recv_h = nullptr, *V_recv_h = nullptr;
   cudaHostAlloc(&K_send_h, kv_bytes, cudaHostAllocDefault);
   cudaHostAlloc(&V_send_h, kv_bytes, cudaHostAllocDefault);
   cudaHostAlloc(&K_recv_h, kv_bytes, cudaHostAllocDefault);
   cudaHostAlloc(&V_recv_h, kv_bytes, cudaHostAllocDefault);
+#endif
 
   auto one_pass = [&]() -> std::tuple<double, double, double> {
     // Reset K/V to local chunk. scratch_f was sized to max(q_local_elem, kv_local_elem)
@@ -321,13 +328,32 @@ ring_attention::RingResult run_ring_blocking_fp16(const ring_attention::RingConf
     cudaEvent_t ev0, ev1;
     cudaEventCreate(&ev0);
     cudaEventCreate(&ev1);
+#ifdef RING_USE_NCCL
+    // Bracket NCCL with its own events; otherwise the on-device transfer time
+    // is invisible in every sub-metric (see run_ring_blocking for details).
+    cudaEvent_t ev_nccl0, ev_nccl1;
+    cudaEventCreate(&ev_nccl0);
+    cudaEventCreate(&ev_nccl1);
+#endif
 
     for (int step = 0; step < P; ++step) {
+#ifndef RING_USE_NCCL
       MPI_Request reqs[4];
       int n_req = 0;
+#endif
 
       const double t_post0 = MPI_Wtime();
       if (step < P - 1) {
+#ifdef RING_USE_NCCL
+        cudaEventRecord(ev_nccl0, 0);
+        ncclGroupStart();
+        NCCL_CHECK(ncclSend(K_cur, kv_local_elem, ncclHalf, next_rank, nccl_comm, 0));
+        NCCL_CHECK(ncclRecv(K_recv, kv_local_elem, ncclHalf, prev_rank, nccl_comm, 0));
+        NCCL_CHECK(ncclSend(V_cur, kv_local_elem, ncclHalf, next_rank, nccl_comm, 0));
+        NCCL_CHECK(ncclRecv(V_recv, kv_local_elem, ncclHalf, prev_rank, nccl_comm, 0));
+        NCCL_CHECK(ncclGroupEnd());
+        cudaEventRecord(ev_nccl1, 0);
+#else
         cudaMemcpy(K_send_h, K_cur, kv_bytes, cudaMemcpyDeviceToHost);
         cudaMemcpy(V_send_h, V_cur, kv_bytes, cudaMemcpyDeviceToHost);
         const int n = mpi_int_count(kv_bytes, "run_ring_blocking_fp16/MPI_Isend|Irecv");
@@ -335,6 +361,7 @@ ring_attention::RingResult run_ring_blocking_fp16(const ring_attention::RingConf
         MPI_Irecv(K_recv_h, n, MPI_BYTE, prev_rank, /*tag=*/0, MPI_COMM_WORLD, &reqs[n_req++]);
         MPI_Isend(V_send_h, n, MPI_BYTE, next_rank, /*tag=*/1, MPI_COMM_WORLD, &reqs[n_req++]);
         MPI_Irecv(V_recv_h, n, MPI_BYTE, prev_rank, /*tag=*/1, MPI_COMM_WORLD, &reqs[n_req++]);
+#endif
       }
       const double t_post1 = MPI_Wtime();
       comm_acc += (t_post1 - t_post0) * 1e3;
@@ -358,6 +385,17 @@ ring_attention::RingResult run_ring_blocking_fp16(const ring_attention::RingConf
       comp_acc += comp_float_ms;
 
       if (step < P - 1) {
+#ifdef RING_USE_NCCL
+        // Stream 0 already drained by cudaEventSynchronize(ev1); wait ≈ 0 by
+        // construction. The NCCL transfer cost is attributed to comm_ms below.
+        const double t_wait0 = MPI_Wtime();
+        cudaStreamSynchronize(0);
+        const double t_wait1 = MPI_Wtime();
+        wait_acc += (t_wait1 - t_wait0) * 1e3;
+        float nccl_ms = 0.f;
+        cudaEventElapsedTime(&nccl_ms, ev_nccl0, ev_nccl1);
+        comm_acc += nccl_ms;
+#else
         const double t_wait0 = MPI_Wtime();
         MPI_Waitall(n_req, reqs, MPI_STATUSES_IGNORE);
         const double t_wait1 = MPI_Wtime();
@@ -368,7 +406,7 @@ ring_attention::RingResult run_ring_blocking_fp16(const ring_attention::RingConf
         cudaMemcpy(V_recv, V_recv_h, kv_bytes, cudaMemcpyHostToDevice);
         const double t_h2d1 = MPI_Wtime();
         comm_acc += (t_h2d1 - t_h2d0) * 1e3;
-
+#endif
         std::swap(K_cur, K_recv);
         std::swap(V_cur, V_recv);
       }
@@ -379,6 +417,10 @@ ring_attention::RingResult run_ring_blocking_fp16(const ring_attention::RingConf
     cudaDeviceSynchronize();
     cudaEventDestroy(ev0);
     cudaEventDestroy(ev1);
+#ifdef RING_USE_NCCL
+    cudaEventDestroy(ev_nccl0);
+    cudaEventDestroy(ev_nccl1);
+#endif
     return {comm_acc, comp_acc, wait_acc};
   };
 
@@ -451,10 +493,14 @@ ring_attention::RingResult run_ring_blocking_fp16(const ring_attention::RingConf
   }
   res.max_err = max_err;
 
+#ifdef RING_USE_NCCL
+  ncclCommDestroy(nccl_comm);
+#else
   cudaFreeHost(K_send_h);
   cudaFreeHost(V_send_h);
   cudaFreeHost(K_recv_h);
   cudaFreeHost(V_recv_h);
+#endif
   return res;
 }
 
@@ -523,11 +569,15 @@ ring_attention::RingResult run_ring_overlap_fp16(const ring_attention::RingConfi
   AttentionShape sg_shape{B, H, Sl, Sl, D};
   sg_shape.kv_heads = kv_H;
 
+#ifdef RING_USE_NCCL
+  ncclComm_t nccl_comm = ring_attention::nccl_init(R, P);
+#else
   __half *K_send_h = nullptr, *V_send_h = nullptr, *K_recv_h = nullptr, *V_recv_h = nullptr;
   cudaHostAlloc(&K_send_h, kv_bytes, cudaHostAllocDefault);
   cudaHostAlloc(&V_send_h, kv_bytes, cudaHostAllocDefault);
   cudaHostAlloc(&K_recv_h, kv_bytes, cudaHostAllocDefault);
   cudaHostAlloc(&V_recv_h, kv_bytes, cudaHostAllocDefault);
+#endif
 
   cudaStream_t stream_compute = nullptr, stream_copy = nullptr;
   cudaStreamCreate(&stream_compute);
@@ -589,6 +639,19 @@ ring_attention::RingResult run_ring_overlap_fp16(const ring_attention::RingConfi
       cudaEventRecord(ev_ends[step], stream_compute);
 
       if (step < P - 1) {
+#ifdef RING_USE_NCCL
+        if (step >= 1) cudaStreamWaitEvent(stream_copy, ev_ends[step - 1], 0);
+
+        cudaEventRecord(ev_h2d_starts[step], stream_copy);
+        ncclGroupStart();
+        NCCL_CHECK(ncclSend(K_cur, kv_local_elem, ncclHalf, next_rank, nccl_comm, stream_copy));
+        NCCL_CHECK(ncclRecv(K_recv, kv_local_elem, ncclHalf, prev_rank, nccl_comm, stream_copy));
+        NCCL_CHECK(ncclSend(V_cur, kv_local_elem, ncclHalf, next_rank, nccl_comm, stream_copy));
+        NCCL_CHECK(ncclRecv(V_recv, kv_local_elem, ncclHalf, prev_rank, nccl_comm, stream_copy));
+        NCCL_CHECK(ncclGroupEnd());
+        cudaEventRecord(ev_h2d_ends[step], stream_copy);
+        cudaEventRecord(comm_done, stream_copy);
+#else
         const double t_post0 = MPI_Wtime();
         cudaMemcpyAsync(K_send_h, K_cur, kv_bytes, cudaMemcpyDeviceToHost, stream_copy);
         cudaMemcpyAsync(V_send_h, V_cur, kv_bytes, cudaMemcpyDeviceToHost, stream_copy);
@@ -614,6 +677,7 @@ ring_attention::RingResult run_ring_overlap_fp16(const ring_attention::RingConfi
         cudaMemcpyAsync(V_recv, V_recv_h, kv_bytes, cudaMemcpyHostToDevice, stream_copy);
         cudaEventRecord(ev_h2d_ends[step], stream_copy);
         cudaEventRecord(comm_done, stream_copy);
+#endif
 
         std::swap(K_cur, K_recv);
         std::swap(V_cur, V_recv);
@@ -718,10 +782,14 @@ ring_attention::RingResult run_ring_overlap_fp16(const ring_attention::RingConfi
   cudaEventDestroy(comm_done);
   cudaStreamDestroy(stream_compute);
   cudaStreamDestroy(stream_copy);
+#ifdef RING_USE_NCCL
+  ncclCommDestroy(nccl_comm);
+#else
   cudaFreeHost(K_send_h);
   cudaFreeHost(V_send_h);
   cudaFreeHost(K_recv_h);
   cudaFreeHost(V_recv_h);
+#endif
   cudaFreeHost(k_init_h16);
   cudaFreeHost(v_init_h16);
   return res;
