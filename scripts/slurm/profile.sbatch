@@ -16,8 +16,10 @@
 #   bash scripts/slurm/profile.sbatch
 #
 # Outputs:
-#   results/nsys/<mode>_p<N>.nsys-rep   <- open with nsys-ui on your laptop
-#   results/ncu/flash_*.ncu-rep         <- open with ncu-ui on your laptop
+#   results/nsys/<timestamp>/<mode>_p<N>.nsys-rep   <- open with nsys-ui on your laptop
+#   results/ncu/<timestamp>/flash_*.ncu-rep         <- open with ncu-ui on your laptop
+# <timestamp> = YYYY-MM-DD_HH-MM so successive runs never overwrite each other
+# (these are the source artifacts for the writeup).
 
 set -euo pipefail
 
@@ -29,10 +31,14 @@ cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 source scripts/env/activate.sh
 
 CLI=./build/release/apps/ring_attention_cli/ring_attention_cli
-NSYS_DIR=results/nsys
-NCU_DIR=results/ncu
+TIMESTAMP="${PROFILE_TIMESTAMP:-$(date +%Y-%m-%d_%H-%M)}"
+NSYS_DIR=results/nsys/${TIMESTAMP}
+NCU_DIR=results/ncu/${TIMESTAMP}
 
 mkdir -p "${NSYS_DIR}" "${NCU_DIR}" "/tmp/${USER}"
+
+# Also record the timestamp so downstream tools can find this run
+echo "${TIMESTAMP}" > results/.last_profile_timestamp
 
 # Build (no-op if already up to date)
 cmake --preset=release -DCMAKE_CUDA_ARCHITECTURES=75 >/dev/null
@@ -139,7 +145,7 @@ run_ncu 128 1 "s${SEQ}_d128_c1"
 # ----------------------------------------------------------------------------
 echo ""
 echo "============================================================"
-echo "Profiling complete"
+echo "Profiling complete  (timestamp: ${TIMESTAMP})"
 echo "============================================================"
 echo ""
 echo "Nsight Systems files (open with nsys-ui):"
