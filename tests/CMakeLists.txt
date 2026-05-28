@@ -6,6 +6,59 @@ add_executable(test_device_tensor test_device_tensor.cu)
 target_link_libraries(test_device_tensor PRIVATE ring_attention)
 add_test(NAME device_tensor COMMAND test_device_tensor)
 
+add_executable(test_kv_cache test_kv_cache.cu)
+target_link_libraries(test_kv_cache PRIVATE ring_attention)
+add_test(NAME kv_cache COMMAND test_kv_cache)
+
+add_executable(test_decode_op test_decode_op.cu)
+target_link_libraries(test_decode_op PRIVATE ring_attention)
+add_test(NAME decode_op COMMAND test_decode_op)
+
+add_executable(test_ring_decode test_ring_decode.cu)
+target_link_libraries(test_ring_decode PRIVATE ring_attention)
+# Multi-rank smoke: prefill 32, decode 4 tokens across cp_size=2.
+# Requires NCCL + 2 GPUs (same as ring_smoke_* tests). On a 1-GPU allocation
+# this test will fail to bind both ranks; that's expected.
+if(MPIRUN_EXECUTABLE)
+  add_test(
+    NAME ring_decode_smoke
+    COMMAND ${MPIRUN_EXECUTABLE} -n 2 $<TARGET_FILE:test_ring_decode>
+            --prompt_len 32 --n_decode 4 --batch 1 --heads 2 --head_dim 32)
+  set_tests_properties(ring_decode_smoke PROPERTIES
+    PASS_REGULAR_EXPRESSION "ring_decode[^\n]*PASS"
+    LABELS "mpi;gpu")
+
+  # Larger head_dim variant — exercises the kernel's D=64 dispatch path.
+  add_test(
+    NAME ring_decode_smoke_d64
+    COMMAND ${MPIRUN_EXECUTABLE} -n 2 $<TARGET_FILE:test_ring_decode>
+            --prompt_len 32 --n_decode 4 --batch 1 --heads 2 --head_dim 64)
+  set_tests_properties(ring_decode_smoke_d64 PROPERTIES
+    PASS_REGULAR_EXPRESSION "ring_decode[^\n]*PASS"
+    LABELS "mpi;gpu")
+
+  # 4-rank decode: exercises the cp_size=4 ring path. Needs 4 GPUs.
+  add_test(
+    NAME ring_decode_smoke_cp4
+    COMMAND ${MPIRUN_EXECUTABLE} -n 4 $<TARGET_FILE:test_ring_decode>
+            --prompt_len 32 --n_decode 4 --batch 1 --heads 2 --head_dim 32)
+  set_tests_properties(ring_decode_smoke_cp4 PROPERTIES
+    PASS_REGULAR_EXPRESSION "ring_decode[^\n]*PASS"
+    LABELS "mpi;gpu")
+
+  # CLI --run decode smoke: exercises the CLI's decode benchmark path
+  # (run_decode_benchmark, --csv, --csv-header). Pass criterion: the summary
+  # line printed on rank 0 ends with "cp_size=2".
+  add_test(
+    NAME ring_decode_cli_csv
+    COMMAND ${MPIRUN_EXECUTABLE} -n 2 $<TARGET_FILE:ring_attention_cli>
+            --run decode --prompt-len 64 --decode-tokens 3
+            --batch 1 --heads 2 --head_dim 32 --csv-header --csv)
+  set_tests_properties(ring_decode_cli_csv PROPERTIES
+    PASS_REGULAR_EXPRESSION "decode summary[^\n]*cp_size=2"
+    LABELS "mpi;gpu")
+endif()
+
 add_executable(test_cpu_attention test_cpu_attention.cpp)
 target_link_libraries(test_cpu_attention PRIVATE ring_attention)
 add_test(NAME cpu_attention COMMAND test_cpu_attention)

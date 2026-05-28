@@ -33,7 +33,7 @@ Run these once and save the results as your reference:
 
 ---
 
-## 1. Zigzag scheme: coarse (this repo) vs. fine-grained (reference)
+## 1. Zigzag scheme: coarse (this repo) vs. fine-grained (reference)  [POST-PONED]
 
 **What the reference does.**  In `ringattention_jax.py` the index origin of each step is
 `k_block_idx = (lax.axis_index(axis_name) - idx) % axis_size`, which rotates the *whole*
@@ -61,7 +61,7 @@ per-call `(q_offset, k_offset)` pairs, so the kernel itself does not need to cha
 
 ---
 
-## 2. No backward pass (no gradient computation)
+## 2. No backward pass (no gradient computation) [POST-PONED]
 
 **What the reference does.**  `ringattention_jax.py` defines `ring_attention` with
 `@partial(jax.custom_vjp, ...)`, a full `_ring_attention_fwd` that saves `(output, q, k,
@@ -89,7 +89,7 @@ algorithm template.
 
 ---
 
-## 3. Attention bias (`attn_bias`) not supported
+## 3. Attention bias (`attn_bias`) not supported [COMPLETED]
 
 **What the reference does.**  `_ring_attention_fwd` accepts an `attn_bias` tensor of shape
 `[batch, heads, q_len, kv_len]` and, inside `_chunk_attention_bias`, slices the relevant
@@ -109,7 +109,7 @@ before the max-reduction.  The ring loop in `ring_loop.cu` would need to pass th
 
 ---
 
-## 4. Segment IDs not supported
+## 4. Segment IDs not supported  [COMPLETED]
 
 **What the reference does.**  `_ring_attention_fwd` accepts `segment_ids` (shape
 `[batch, seq_len]`).  `_chunk_attention_bias` computes a boolean mask
@@ -145,7 +145,7 @@ Reference algorithm: `ringattention_jax.py`, `_blockwise_attention_fwd`, lines ~
 
 ---
 
-## 6. Arbitrary `head_dim` not supported ✓ COMPLETED
+## 6. Arbitrary `head_dim` not supported [COMPLETED]
 
 **What the reference does.**  `_blockwise_attention_fwd` uses `jnp.einsum('bqhd,bkhd->bhqk',
 q_chunk, k_chunk)` which works for any dimension `d`.  No template specialisation is needed.
@@ -200,7 +200,7 @@ l).  Reference: `ringattention_jax_inference.py::_ring_attention_inference_fwd`.
 
 ---
 
-## 9. MPI used for GPU-to-GPU transfers instead of NCCL ✓ COMPLETED
+## 9. MPI used for GPU-to-GPU transfers instead of NCCL  [COMPLETED]
 
 **What the reference does.**  Uses JAX's `lax.ppermute`, which on NVIDIA GPUs compiles to
 NCCL send/recv or NVLink direct transfers depending on the topology.  NCCL is GPU-aware and

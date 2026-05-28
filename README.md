@@ -63,10 +63,10 @@ mpirun -n 2 ./build/release/apps/ring_attention_cli/ring_attention_cli \
     --mode ring-overlap --iters 10 --verify
 ```
 
-**Modes** (`--mode`):
-- `allgather` — baseline: `MPI_Allgather` the full K/V, one local attention pass.
-- `ring-blocking` — ring rotation with blocking `MPI_Waitall` between steps (no overlap).
-- `ring-overlap` — ring rotation with two CUDA streams hiding MPI behind the kernel.
+**Modes** (`--mode`, default `ring-overlap`):
+- `ring-overlap` — **production path.** Ring rotation with two CUDA streams hiding MPI/NCCL behind the kernel. This is the only mode optimized; use it for any real benchmark.
+- `ring-blocking` — *baseline.* Ring rotation with blocking comm between steps. Kept as the experimental control for the overlap numbers in `KERNEL_OPTIMIZATIONS.md`; do not use for production timings.
+- `allgather` — *baseline.* `MPI_Allgather` the full K/V, one local pass. Reference for the "no ring" upper bound on memory and the lower bound on comm hiding.
 
 **Flags**:
 - `--causal 1` — apply lower-triangular mask.
