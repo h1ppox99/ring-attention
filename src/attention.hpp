@@ -80,9 +80,22 @@ void launch_attention_init(float* out, float* m, float* l, const AttentionShape&
 /// Global token positions are `(q_offset + i)` for queries and
 /// `(k_offset + j)` for keys; causal masking visibility is
 /// `k_offset + j <= q_offset + i`.
+///
+/// When `shape.seq_q == 1` this dispatches automatically to the
+/// `launch_attention_decode_step` kernel, which is structurally different
+/// (one warp per (B,H) row, lane-split D, no shared memory) — see
+/// `src/attention_decode.cu` and KERNEL_OPTIMIZATIONS.md Round 5.
 void launch_attention_step(const float* q, const float* k, const float* v, float* out, float* m,
                            float* l, const AttentionShape& shape, int q_offset, int k_offset,
                            bool causal, cudaStream_t stream = 0);
+
+/// Decode-specialized step kernel — `seq_q = 1`, one warp per `(batch, head)`.
+/// Same `(M, L, O)` persistent-state semantics as `launch_attention_step` so
+/// the ring decode loop can call it once per ring step. Supports
+/// `head_dim ∈ {32, 64, 128, 256}` (must be a multiple of 32).
+void launch_attention_decode_step(const float* q, const float* k, const float* v, float* out,
+                                  float* m, float* l, const AttentionShape& shape, int q_offset,
+                                  int k_offset, bool causal, cudaStream_t stream = 0);
 
 /// Finalize the ring: divide `out` by the per-row sum `l` (no-op rows where
 /// `l == 0` are zeroed). After this call, `out` contains the final attention
