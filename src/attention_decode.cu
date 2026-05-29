@@ -33,12 +33,12 @@
 /// 64-of-72-SMs-idle problem Round 8 left in place.
 
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 
 #include "attention.hpp"
 #include "common.cuh"
-#include "device_tensor.hpp"
 
 namespace ring_attention {
 
@@ -46,6 +46,23 @@ namespace {
 
 constexpr int K_SPLIT = 8;
 constexpr int NUM_WARPS = 4;
+
+// Process-static decode workspace. Holds [M_partial | L_partial | O_partial]
+// contiguously. Grows on demand; never freed (released by the CUDA driver at
+// program exit). Single-stream / single-thread use only — see Round 10 in
+// KERNEL_OPTIMIZATIONS.md for the trade-off and the path to a session-level
+// allocator.
+float* g_decode_workspace = nullptr;
+std::size_t g_decode_workspace_floats = 0;
+
+float* ensure_decode_workspace(std::size_t needed_floats) {
+  if (needed_floats > g_decode_workspace_floats) {
+    if (g_decode_workspace != nullptr) cudaCheck(cudaFree(g_decode_workspace));
+    cudaCheck(cudaMalloc(&g_decode_workspace, needed_floats * sizeof(float)));
+    g_decode_workspace_floats = needed_floats;
+  }
+  return g_decode_workspace;
+}
 
 /// Per-block split-K compute kernel.
 ///
@@ -265,29 +282,30 @@ void launch_decode_typed(const float* q, const float* k, const float* v, float* 
   const int B = shape.batch;
   const int H = shape.heads;
 
-  // Per-call workspace for K_SPLIT × B × H partials. At the production shape
-  // (K_SPLIT=8, B=1, H=8, D=128) this is 32.5 KB — tiny relative to the
-  // ~16 MB of K/V the kernel will read, but the cudaMalloc/cudaFree pair is
-  // ~50 µs each. Acceptable for now; a session-level workspace would
-  // eliminate this if it ever shows up in profiles.
+  // Workspace layout: [M_partial | L_partial | O_partial], all contiguous.
+  // Production shape (K_SPLIT=8, B=1, H=8, D=128) wants 8 320 floats = 32.5
+  // KB. The first call cudaMallocs; subsequent calls at the same or smaller
+  // shape reuse the buffer for free.
   const std::size_t partial_count = static_cast<std::size_t>(K_SPLIT) * B * H;
-  DeviceTensor<float> M_partial(partial_count);
-  DeviceTensor<float> L_partial(partial_count);
-  DeviceTensor<float> O_partial(partial_count * D);
+  const std::size_t needed = 2 * partial_count + partial_count * D;
+  float* ws = ensure_decode_workspace(needed);
+  float* M_partial = ws;
+  float* L_partial = ws + partial_count;
+  float* O_partial = ws + 2 * partial_count;
 
   // Compute: split-K kernel.
   const dim3 grid_split(K_SPLIT, H, B);
   const dim3 block_split(128);  // 4 warps × 32 lanes.
-  attention_decode_split_kernel<D><<<grid_split, block_split, 0, stream>>>(
-      q, k, v, M_partial.data(), L_partial.data(), O_partial.data(), H, kv_H, shape.seq_k, scale,
-      causal, q_offset, k_offset);
+  attention_decode_split_kernel<D>
+      <<<grid_split, block_split, 0, stream>>>(q, k, v, M_partial, L_partial, O_partial, H, kv_H,
+                                               shape.seq_k, scale, causal, q_offset, k_offset);
   cudaCheck(cudaGetLastError());
 
   // Reduce: fold K_SPLIT partials into persistent state.
   const dim3 grid_reduce(H, B);
   const dim3 block_reduce(32);
-  attention_decode_reduce_kernel<D><<<grid_reduce, block_reduce, 0, stream>>>(
-      M_partial.data(), L_partial.data(), O_partial.data(), m, l, out, H);
+  attention_decode_reduce_kernel<D>
+      <<<grid_reduce, block_reduce, 0, stream>>>(M_partial, L_partial, O_partial, m, l, out, H);
   cudaCheck(cudaGetLastError());
 }
 

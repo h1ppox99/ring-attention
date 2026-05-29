@@ -808,3 +808,117 @@ won't matter at cp>1 where comm dominates anyway.
   Turing PCIe-DDR ceiling for this workload. Going further requires
   reducing the actual byte traffic — fp16 K/V cache would halve the bytes
   and probably double the throughput in absolute terms.
+
+---
+
+## Round 10 — cached decode workspace (cudaMalloc out of the hot path)
+
+Profile: `results/ncu/2026-05-28_18-32/` (Round 9 baseline; new profile
+written by this round's re-run).
+
+### Bottlenecks identified
+
+- **Per-call workspace allocation dominates the cp=1 wall-clock.**
+  Round 9 left a 0.68 ms gap between the kernel (`comp_ms = 0.34 ms`) and
+  the total per-token decode time (`total_ms = 1.02 ms`) at D=128
+  prompt=16k cp=1. The decode launch path calls
+  `DeviceTensor<float> M_partial(...), L_partial(...), O_partial(...)`
+  — 3 cudaMalloc + 3 cudaFree per decode kernel call — and inside the
+  ring loop `run_ring_decode_step` adds 4 more transit buffers. The
+  cudaMalloc cost is small per call (~30–50 µs) but the *count* adds up:
+  3 + 4 = 7 alloc/free pairs per cp=1 decode step, ~cp_size× that at
+  cp_size > 1. At the kernel's new 0.34 ms time the alloc cost is the
+  *single largest* contributor to total wall-clock.
+- **Memory throughput is already at ~70 % of peak** (Round 9). Further
+  kernel wins require either (a) cutting the byte traffic (fp16 KV) or
+  (b) the comm/comp overlap for cp>1 — neither of which the per-call
+  allocator overhead is on the critical path for. Round 10 closes the
+  cheap allocator gap first so the next round sees a clean baseline.
+
+### Changes
+
+- **Process-static decode workspace** (`src/attention_decode.cu`). A
+  single static buffer `g_workspace` holds the K_SPLIT × B × H × (D + 2)
+  floats of partial state. `ensure_workspace(needed)` grows it on demand
+  and never frees — the buffer persists for the life of the process.
+  `launch_decode_typed` slices `M_partial`, `L_partial`, `O_partial`
+  pointers out of `g_workspace` instead of allocating fresh
+  `DeviceTensor`s. Eliminates 3 cudaMalloc + 3 cudaFree per decode kernel
+  call.
+- **Thread-safety caveat.** The static workspace is not stream- or
+  thread-safe; concurrent decode launches on different streams would
+  race on the partial buffers. This is fine for the current
+  `ring_attention_cli` and the test suite (single host thread,
+  default stream); a `RingDecodeSession`-owned workspace is the right
+  long-term home but adds API surface area not yet motivated by a real
+  caller.
+
+### Practice — Nsight Compute (D=128, prompt=16384, B=1, H=8)
+
+The split kernel itself is **unchanged** at the device level, so the
+device metrics are identical to Round 9 within run-to-run noise:
+
+| metric                          | Round 9         | Round 10        |
+|---                              |---              |---              |
+| Memory Throughput (SoL)         | 69.72 %         | 70.27 %         |
+| Compute (SM) Throughput         | 14.03 %         | 14.13 %         |
+| Issue Slots Busy                | 16.15 %         | 16.17 %         |
+| Memory Throughput (bytes/s)     | 432 GB/s        | 433 GB/s        |
+| Warp Cycles / Issued Instruction| 6.20 cycles     | 6.18 cycles     |
+| Achieved Occupancy              | 12.49 %         | 12.49 %         |
+
+This is the expected signature: Round 10's win is host-side (allocator
+overhead removed), not device-side. The kernel itself was already
+DRAM-bandwidth-bound at ~70 % of peak.
+
+### Practice — end-to-end (`bench_decode.sbatch`, full sweep)
+
+`results/bench_decode_round9.csv` → `results/bench_decode_round10.csv`.
+Per-token decode latency, fp32, B=1 H=8, mean over 16 tokens.
+
+**cp_size = 1** (the configuration most exposed to fixed per-call cost):
+
+| prompt_len | D=64 R9  | D=64 R10 | Δ        | D=128 R9 | D=128 R10 | **Δ**    |
+|---         |---       |---       |---       |---       |---        |---       |
+| 1 024      | 0.06 ms  | 0.04 ms  | **1.44×**| 0.07 ms  | 0.06 ms   | 1.19×    |
+| 4 096      | 0.15 ms  | 0.14 ms  | 1.06×    | 0.24 ms  | 0.23 ms   | 1.06×    |
+| 16 384     | 0.56 ms  | 0.55 ms  | 1.02×    | 1.02 ms  | **0.88 ms**   | **1.16×**|
+
+The relative gain is biggest at small `prompt_len` where the kernel is
+fastest and the fixed allocator cost is a larger fraction of the total.
+At prompt=16k D=128 the kernel itself is 0.32 ms (down from 0.34 ms in
+R9, equal within noise); the remaining 0.56 ms of total comes from the
+`run_ring_decode_step` transit-buffer allocs (4 × ~67 MB at this shape)
+plus kernel-launch overhead — Round 11's natural target if cp=1 still
+matters.
+
+**cp_size = 2 and 4** (comm-dominated; very little for Round 10 to give
+because the kernel is no longer a meaningful slice of the per-token wall):
+
+| prompt_len | D=128 cp=2 R9 | D=128 cp=2 R10 | Δ      | D=128 cp=4 R9 | D=128 cp=4 R10 | Δ      |
+|---         |---            |---             |---     |---            |---             |---     |
+| 1 024      | 0.51 ms       | 0.48 ms        | 1.05×  | 0.84 ms       | 0.80 ms        | 1.05×  |
+| 4 096      | 1.73 ms       | 1.69 ms        | 1.02×  | 2.68 ms       | 2.65 ms        | 1.01×  |
+| 16 384     | 6.59 ms       | 6.61 ms        | ≈ 1.0× | 10.08 ms      | 10.01 ms       | 1.01×  |
+
+**Combined Round 4 → Round 10 totals** at the headline configs:
+
+| config                    | Round 4   | Round 10  | total speedup |
+|---                        |---        |---        |---            |
+| D=128 cp=1 prompt=16384   | 49.68 ms  | 0.88 ms   | **56.5×**     |
+| D=128 cp=1 prompt=1024    | 3.14 ms   | 0.06 ms   | **52.3×**     |
+| D=64  cp=1 prompt=16384   | 13.37 ms  | 0.55 ms   | **24.3×**     |
+| D=128 cp=4 prompt=16384   | 59.36 ms  | 10.01 ms  | **5.93×**     |
+
+### What this doesn't fix
+
+- **Transit-buffer allocations inside `run_ring_decode_step`** are now
+  the visible host overhead at cp=1: 4 × `DeviceTensor<float>(transit_elem)`
+  per call, where `transit_elem = B × kv_H × max_chunk × D` reaches
+  ~67 MB / buffer at the production shape. Folding these into the same
+  static-workspace pattern is the cheapest available next win and would
+  likely close most of the remaining cp=1 gap.
+- **Comm dominates at cp_size > 1.** Unchanged from Round 9 — the
+  per-call allocator removal has nothing to do with NCCL latency.
+  Decode-mode compute/comm overlap is still the next architectural
+  lever for the cp>1 numbers.
