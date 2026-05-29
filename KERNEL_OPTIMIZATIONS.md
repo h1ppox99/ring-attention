@@ -922,3 +922,75 @@ because the kernel is no longer a meaningful slice of the per-token wall):
   per-call allocator removal has nothing to do with NCCL latency.
   Decode-mode compute/comm overlap is still the next architectural
   lever for the cp>1 numbers.
+
+---
+
+## Round 11 — cached ring-decode transit buffers [REVERTED]
+
+Profile: same `results/ncu/2026-05-28_18-53/` (kernel is unchanged;
+this round targeted host-side allocator overhead in the orchestrator).
+Bench comparison: `bench-decode-88132.out` (Round 10 baseline) vs
+`bench-decode-88139.out` (Round 11 candidate).
+
+### Bottlenecks identified
+
+- **Transit-buffer allocations in `run_ring_decode_step`** were
+  hypothesised to dominate the cp=1 host overhead after Round 10. Per
+  call the function constructs six `DeviceTensor<float>` instances —
+  `K_a`, `K_b`, `V_a`, `V_b` of `B × kv_H × max_chunk × D` floats each,
+  plus tiny `m_d`, `l_d` of `B × H` floats — and destructs them at
+  scope exit. At the production shape (B=1, kv_H=8, prompt=16384,
+  D=128) each of the four transit buffers is ~67 MB.
+- At cp>1 the kernel calls (cp_size of them) all share the same six
+  buffers — they're allocated once at the top of the function — so the
+  per-token overhead is independent of cp_size.
+
+### Changes attempted
+
+- **Process-static ring workspace** (`src/ring_decode.cu`). One single
+  static buffer holds `[K_a | K_b | V_a | V_b | m | ℓ]` contiguously.
+  `ensure_ring_workspace(needed)` grows on demand (Round 10 pattern),
+  never frees. The six former `DeviceTensor` constructions become
+  pointer slices out of the workspace — no allocation in the hot path.
+
+### Practice — regression at cp=1, no change at cp>1
+
+| metric (D=128, prompt=16k) | Round 10 (88132) | Round 11 (88139) | Δ |
+|---                          |---               |---               |---|
+| cp=1  total_ms              | 0.881            | **1.020**        | +15.7 % (slower) |
+| cp=1  comp_ms               | 0.326            | **0.382**        | +17.2 % (slower) |
+| cp=2  total_ms              | 6.611            | 6.614            | within noise |
+| cp=2  comp_ms               | 0.338            | 0.338            | within noise |
+| cp=4  total_ms              | 10.135           | 10.138           | within noise |
+| cp=4  comp_ms               | 0.371            | 0.370            | within noise |
+
+`comp_ms` is the sum of cuda-event-timed kernel intervals — so the
+regression is **inside the GPU kernel time**, not the host alloc path.
+Repeated the bench (job 88139) to rule out noise; the regression
+reproduced. Correctness preserved end-to-end (`ring_decode max_err=7.45e-08`,
+all 10 GPU tests pass).
+
+### Why this failed (hypothesis)
+
+The premise was wrong. `cudaMalloc/cudaFree` of 67 MB inside a hot
+loop are *not* free, but CUDA's caching allocator (and our
+`DeviceTensor` wrapper which sits on top of it) already pools repeat
+same-size allocations — the per-call alloc cost was nowhere near the
+0.5 ms / 6 alloc-pairs the original bullet estimated. Swapping for a
+namespace-static workspace removed the (small) alloc cost but
+**changed the resident memory footprint**: the 268 MB workspace now
+lives permanently in the address space across the whole run, whereas
+the `DeviceTensor` version reused the same address bands per call.
+The cp=1 kernel is bandwidth-bound (Round 10's 70 % memory SoL), and a
+permanently-resident large workspace appears to perturb either the L2
+victim set or the page-table residency enough to add ~50 µs to a
+kernel that totals ~330 µs. The cp>1 cases don't show it because
+comm dominates by 10×, swallowing any sub-100 µs kernel jitter.
+
+### Reverted
+
+`src/ring_decode.cu` restored to the original `DeviceTensor` allocations
+(`git checkout -- src/ring_decode.cu`). The takeaway — *resident
+workspace caching at this size can perturb the kernel's effective
+memory hierarchy and is not free* — argues for *per-shape* caches
+rather than one big monolithic workspace if we ever revisit this.
