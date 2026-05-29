@@ -99,13 +99,16 @@ run_ncu_decode() {
   echo ""
   echo ">>> ncu decode: head_dim=${head_dim}"
 
-  # Round 5 onwards: the seq_q=1 path dispatches to attention_decode_step_kernel,
-  # so filter on that. (attention_step_kernel kept as a fallback alternation
-  # in case the dispatch in launch_attention_step is ever disabled.)
+  # The seq_q=1 path dispatches to a decode-specialized kernel that has
+  # changed names across rounds:
+  #   Round 5–8: attention_decode_step_kernel
+  #   Round 9+ : attention_decode_split_kernel  (split-K + reduce)
+  # Regex matches whichever is current. Skip the reduce kernel (separate
+  # filter would be needed if we want it; it's tiny).
   TMPDIR="/tmp/${USER}" mpirun -n 1 -x TMPDIR ncu \
     --set full \
-    --kernel-name 'regex:attention_(decode_step|step)_kernel' \
-    --launch-skip 1 \
+    --kernel-name 'regex:attention_decode_(step|split)_kernel|attention_step_kernel' \
+    --launch-skip 2 \
     --launch-count 1 \
     --export "${NCU_DIR}/decode_${tag}.ncu-rep" \
     --force-overwrite \

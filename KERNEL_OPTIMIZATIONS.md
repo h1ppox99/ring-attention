@@ -684,3 +684,127 @@ NCCL transfer time becomes the headline term):
   prefetch. If split-K lands and we want every micro-cycle back, an
   smem-staged tile may finally beat the register approach because it
   removes the spill ceiling.
+
+---
+
+## Round 9 — split-K across blocks
+
+Profile: `results/ncu/2026-05-28_17-42/` (Round 8 baseline; new profile
+written by this round's re-run).
+
+### Bottlenecks identified
+
+- **Grid Size still 8.** Round 8 lifted Achieved Occupancy from 3.12 %
+  → 12.5 % by widening each block from 1 → 4 warps, but the grid still
+  emits only `B × H = 8` blocks. On a 72-SM Quadro RTX 6000 that leaves
+  ~64 SMs idle. The kernel is *structurally* capped at 12.5 % achieved
+  occupancy as long as the grid stays at 8.
+- **Memory Throughput 9.54 %.** Same root cause: only 8 SMs are issuing
+  loads against DRAM. With 8× more concurrent blocks we should be able
+  to hit ~30–40 % SoL.
+
+### Changes
+
+- **Two-kernel split-K design** (`src/attention_decode.cu`).
+  1. `attention_decode_split_kernel<D, K_SPLIT>` — grid
+     `(K_SPLIT, H, B)` = 64 blocks at the production shape with
+     `K_SPLIT = 8`. Each block owns a `Sk / K_SPLIT` slice of K and runs
+     the Round-8 4-warp pipeline on it, with the intra-block partial
+     merge writing to a per-block `(m, ℓ, O)` partial buffer in global
+     memory rather than to the persistent `(M, L, O)`.
+  2. `attention_decode_reduce_kernel<D>` — grid `(H, B)`, 32 threads /
+     block. Each warp reads the existing persistent `(M, L, O)` and folds
+     in all `K_SPLIT` partials sequentially using the same FlashAttention
+     partial-merge recurrence as Round 8's intra-block merge. Cost: a
+     single-warp sweep with `K_SPLIT` iterations — a few μs.
+- **Per-call temp workspace** sized
+  `K_SPLIT × B × H × (D + 2)` floats. For the production shape (B=1, H=8,
+  D=128, K_SPLIT=8): 8 × 1 × 8 × 130 = 8 320 floats = 32.5 KB. Allocated
+  inside `launch_decode_typed` with a `DeviceTensor` and freed at end of
+  call. The cudaMalloc/cudaFree overhead (~50 μs each) is dwarfed by the
+  ~2 ms kernel time at prompt=16k; can be hoisted into the ring-decode
+  session later if that 50 μs becomes a fraction of a smaller kernel.
+- **API unchanged.** `launch_attention_decode_step` keeps the same
+  signature; `K_SPLIT` is hidden inside the launch function. The reduce
+  kernel runs after the compute kernel on the same stream, so the
+  persistent `(M, L, O)` semantics observed by the ring loop are
+  identical to Round 8.
+
+### Practice — Nsight Compute (D=128, prompt=16384, B=1, H=8)
+
+Comparing the Round 8 single-kernel against the Round 9 split kernel
+(the reduce is single-warp and runs in a few μs — not the headline):
+
+| metric                          | Round 8         | Round 9 (split)     | Δ            |
+|---                              |---              |---                   |---           |
+| Grid Size                       | 8               | **64**               | **8×**       |
+| Memory Throughput (SoL)         | 9.54 %          | **69.72 %**          | **7.3×**     |
+| Memory Throughput (bytes/s)     | 59.2 GB/s       | **432 GB/s**         | 7.3×         |
+| Compute (SM) Throughput         | 1.89 %          | 14.03 %              | 7.4×         |
+| Issue Slots Busy                | 17.12 %         | 16.15 %              | ≈            |
+| Achieved Occupancy              | 12.50 %         | 12.49 %              | ≈            |
+| Theoretical Occupancy           | 100 %           | 100 %                | =            |
+| Avg. Active Threads / Warp      | 32              | 32                   | =            |
+| Top stall                       | Short SB 2.8c   | Short SB 3.0c        | similar      |
+
+The kernel is now **DRAM-bandwidth-bound**: 432 GB/s out of ~600 GB/s peak
+on the Quadro RTX 6000. Compute throughput tracks memory the same way it
+did in Round 8 because per-block compute hasn't changed — we just have 8×
+more blocks issuing the same load pattern in parallel. Per-block Achieved
+Occupancy stays at 12.5 % (4 warps/SM) but the *grid* now covers 64 of the
+72 SMs instead of 8, which is what unlocks the memory-bandwidth scaling.
+
+### Practice — end-to-end (`bench_decode.sbatch`, full sweep)
+
+`results/bench_decode_round8.csv` → `results/bench_decode_round9.csv`.
+Per-token decode latency, fp32, B=1 H=8, mean over 16 tokens.
+
+**cp_size = 1** (kernel-dominated):
+
+| prompt_len | D=64 R8  | D=64 R9  | Δ        | D=128 R8 | D=128 R9 | **Δ**    |
+|---         |---       |---       |---       |---       |---       |---       |
+| 1 024      | 0.14 ms  | 0.06 ms  | **2.20×**| 0.18 ms  | 0.07 ms  | **2.49×**|
+| 4 096      | 0.56 ms  | 0.15 ms  | **3.62×**| 0.70 ms  | 0.24 ms  | **2.88×**|
+| 16 384     | 2.24 ms  | **0.56 ms** | **4.00×**| 2.74 ms  | **1.02 ms** | **2.70×**|
+
+Note: at cp=1 prompt=16384 D=128 the kernel itself is 0.34 ms; the
+remaining 0.68 ms of total is the cudaMalloc/cudaFree pair of the
+per-call workspace (~50 µs × 3 buffers × 2 sync points). This is
+mechanical overhead, not algorithmic — moving the workspace into a
+session-level cache would shave ~0.5 ms more off the cp=1 numbers but
+won't matter at cp>1 where comm dominates anyway.
+
+**cp_size = 2 and 4** (comm-dominated):
+
+| prompt_len | D=128 cp=2 R8 | D=128 cp=2 R9 | Δ        | D=128 cp=4 R8 | D=128 cp=4 R9 | Δ        |
+|---         |---            |---            |---       |---            |---            |---       |
+| 1 024      | 0.60 ms       | 0.51 ms       | 1.17×    | 0.86 ms       | 0.84 ms       | 1.03×    |
+| 4 096      | 2.18 ms       | 1.73 ms       | 1.26×    | 3.10 ms       | 2.68 ms       | 1.16×    |
+| 16 384     | 8.53 ms       | 6.59 ms       | **1.29×**| 11.85 ms      | 10.08 ms      | **1.18×**|
+
+**Combined Round 4 → Round 9 totals** at the headline configs:
+
+| config                    | Round 4   | Round 9   | total speedup |
+|---                        |---        |---        |---            |
+| D=128 cp=1 prompt=16384   | 49.68 ms  | 1.02 ms   | **48.7×**     |
+| D=128 cp=4 prompt=16384   | 59.36 ms  | 10.08 ms  | **5.89×**     |
+| D=64  cp=1 prompt=16384   | 13.37 ms  | 0.56 ms   | **23.9×**     |
+| D=64  cp=1 prompt=1024    | 0.88 ms   | 0.06 ms   | **14.7×**     |
+
+### What this doesn't fix
+
+- **Workspace cudaMalloc/Free per call.** At cp=1 prompt=16k D=128 the
+  raw kernel is 0.34 ms but total is 1.02 ms — most of the gap is the
+  per-call workspace allocation. A `RingDecodeSession`-level workspace
+  would close that gap (the design doc already named the session as the
+  right home for streams/comm/cache).
+- **Comm dominates at cp_size > 1.** Round 9's kernel speedup is buried
+  behind NCCL Send/Recv time at cp_size > 1; D=128 cp=4 prompt=16k spends
+  ~80 % of the per-token wall-clock in comm now. Overlapping the local
+  kernel with the next-step NCCL transfer (the same trick `ring-overlap`
+  uses for prefill, but adapted to the single-shot decode call) is the
+  next lever for the cp > 1 numbers.
+- **Memory-bandwidth ceiling reached at ~70 %.** The kernel sits at the
+  Turing PCIe-DDR ceiling for this workload. Going further requires
+  reducing the actual byte traffic — fp16 K/V cache would halve the bytes
+  and probably double the throughput in absolute terms.
