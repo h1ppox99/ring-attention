@@ -2,6 +2,12 @@
 /// Ring-attention distributed driver. One MPI rank per GPU.
 
 #include <cuda_runtime.h>
+#if __has_include(<cuda_profiler_api.h>)
+#include <cuda_profiler_api.h>
+#define HAS_CUDA_PROFILER 1
+#else
+#define HAS_CUDA_PROFILER 0
+#endif
 #include <mpi.h>
 
 #include <algorithm>
@@ -201,7 +207,9 @@ void run_decode_benchmark(const Config& cfg, int rank, int cp_size) {
     printf("run,cp_size,prompt_len,decode_token_idx,context_len,comm_ms,comp_ms,total_ms\n");
   }
 
+#if HAS_CUDA_PROFILER
   cudaProfilerStart();
+#endif
   double sum_total = 0.0, sum_comp = 0.0, sum_comm = 0.0;
   for (int t = 0; t < cfg.decode_tokens; ++t) {
     rng.fill_uniform(q_h);
@@ -228,7 +236,9 @@ void run_decode_benchmark(const Config& cfg, int rank, int cp_size) {
   }
 
   MPI_Barrier(MPI_COMM_WORLD);
+#if HAS_CUDA_PROFILER
   cudaProfilerStop();
+#endif
   ncclCommDestroy(comm);
 
   if (rank == 0) {
