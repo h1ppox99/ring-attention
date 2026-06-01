@@ -305,6 +305,12 @@ void launch_attention_init(float* out, float* m, float* l, const AttentionShape&
 void launch_attention_step(const float* q, const float* k, const float* v, float* out, float* m,
                            float* l, const AttentionShape& shape, int q_offset, int k_offset,
                            bool causal, cudaStream_t stream) {
+  // Decode regime: one query row, fall through to the warp-cooperative kernel
+  // (see attention_decode.cu / KERNEL_OPTIMIZATIONS.md Round 5).
+  if (shape.seq_q == 1) {
+    launch_attention_decode_step(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
+    return;
+  }
   // BR is sized so each block has 2-4 warps; per-block smem is just K+V
   // (16 KB) regardless of BR, so packing more warps per block lifts occupancy
   // without changing the smem footprint.

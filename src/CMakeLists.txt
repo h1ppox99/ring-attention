@@ -12,6 +12,7 @@ add_library(ring_attention STATIC
   flash_attention_fp16.cu
   attention_step.cu
   attention_step_fp16.cu
+  attention_decode.cu
   ring_partition.cpp
   ring_loop.cu
   ring_loop_fp16.cu
