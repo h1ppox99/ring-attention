@@ -192,8 +192,10 @@ RingResult run_ring_decode_step(const RingDecodeConfig& cfg, const float* q, con
   {
     const dim3 grid(BH);
     const dim3 block(D);
-    decode_partial_merge_kernel<<<grid, block, 0, 0> > >(recv_partials.data(), out, m_d.data(),
-                                                         l_d.data(), cp_size, BH, D);
+    // clang-format off
+    decode_partial_merge_kernel<<<grid, block, 0, 0>>>(recv_partials.data(), out, m_d.data(),
+                                                       l_d.data(), cp_size, BH, D);
+    // clang-format on
     cudaCheck(cudaGetLastError());
   }
   AttentionShape final_sh{B, H, 1, 1, D};
