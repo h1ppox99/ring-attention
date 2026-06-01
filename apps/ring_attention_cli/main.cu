@@ -1,7 +1,6 @@
 /// @file
 /// Ring-attention distributed driver. One MPI rank per GPU.
 
-#include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
 #include <mpi.h>
 
