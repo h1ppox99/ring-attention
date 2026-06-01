@@ -718,6 +718,7 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
     float* V_cur = V_a.data();
     float* K_recv = K_b.data();
     float* V_recv = V_b.data();
+#ifdef RING_USE_NCCL
     // Narrow the local FP32 chunk to the FP16 send buffer (on stream_copy, so
     // it is ordered before step 0's send). Received FP16 is forwarded as-is.
     __half* K_h_cur = K_ha.data();
@@ -726,6 +727,7 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
     __half* V_h_recv = V_hb.data();
     launch_float_to_half(K_cur, K_h_cur, kv_local_elem, stream_copy);
     launch_float_to_half(V_cur, V_h_cur, kv_local_elem, stream_copy);
+#endif
     cudaEventRecord(comm_done, stream_copy);
 
     launch_attention_init(out_d.data(), m_d.data(), l_d.data(), init_shape, m_count,
