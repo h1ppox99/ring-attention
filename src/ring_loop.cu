@@ -2,6 +2,7 @@
 /// Host-side ring-attention orchestrator.
 /// Implements all three modes: allgather, ring-blocking, ring-overlap.
 
+#include <cuda_fp16.h>
 #include <mpi.h>
 
 #include <algorithm>
@@ -312,6 +313,13 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
   DeviceTensor<float> K_a(kv_local_elem), K_b(kv_local_elem);
   DeviceTensor<float> V_a(kv_local_elem), V_b(kv_local_elem);
   DeviceTensor<float> out_d(q_local_elem), m_d(m_count), l_d(m_count);
+#ifdef RING_USE_NCCL
+  // FP16 transit buffers: the NCCL ring moves __half (half the bytes); the
+  // kernel still reads FP32. See KERNEL_OPTIMIZATIONS.md Round 14. (Round 16
+  // tried INT8 here — ~1.5-1.9× less comm but breached tol=1e-3; reverted.)
+  DeviceTensor<__half> K_ha(kv_local_elem), K_hb(kv_local_elem);
+  DeviceTensor<__half> V_ha(kv_local_elem), V_hb(kv_local_elem);
+#endif
 
   // init_shape seq_q = Sl_local initialises all sub-groups in one call;
   // sg_shape seq_q = Sl is used per (sg_q, sg_k) kernel call.
@@ -340,6 +348,16 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
     float* V_cur = V_a.data();
     float* K_recv = K_b.data();
     float* V_recv = V_b.data();
+#ifdef RING_USE_NCCL
+    // Narrow the local chunk to FP16 once; received FP16 chunks are forwarded
+    // as-is next step (no re-narrowing).
+    __half* K_h_cur = K_ha.data();
+    __half* V_h_cur = V_ha.data();
+    __half* K_h_recv = K_hb.data();
+    __half* V_h_recv = V_hb.data();
+    launch_float_to_half(K_cur, K_h_cur, kv_local_elem, 0);
+    launch_float_to_half(V_cur, V_h_cur, kv_local_elem, 0);
+#endif
 
     launch_attention_init(out_d.data(), m_d.data(), l_d.data(), init_shape, m_count);
 
@@ -375,12 +393,15 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
         // hidden inside cudaEventSynchronize(ev1) below).
         cudaEventRecord(ev_nccl0, 0);
         ncclGroupStart();
-        NCCL_CHECK(ncclSend(K_cur, kv_local_elem, ncclFloat, next_rank, nccl_comm, 0));
-        NCCL_CHECK(ncclRecv(K_recv, kv_local_elem, ncclFloat, prev_rank, nccl_comm, 0));
-        NCCL_CHECK(ncclSend(V_cur, kv_local_elem, ncclFloat, next_rank, nccl_comm, 0));
-        NCCL_CHECK(ncclRecv(V_recv, kv_local_elem, ncclFloat, prev_rank, nccl_comm, 0));
+        NCCL_CHECK(ncclSend(K_h_cur, kv_local_elem, ncclHalf, next_rank, nccl_comm, 0));
+        NCCL_CHECK(ncclRecv(K_h_recv, kv_local_elem, ncclHalf, prev_rank, nccl_comm, 0));
+        NCCL_CHECK(ncclSend(V_h_cur, kv_local_elem, ncclHalf, next_rank, nccl_comm, 0));
+        NCCL_CHECK(ncclRecv(V_h_recv, kv_local_elem, ncclHalf, prev_rank, nccl_comm, 0));
         NCCL_CHECK(ncclGroupEnd());
         cudaEventRecord(ev_nccl1, 0);
+        // Widen received FP16 → FP32 for the next step's kernel.
+        launch_half_to_float(K_h_recv, K_recv, kv_local_elem, 0);
+        launch_half_to_float(V_h_recv, V_recv, kv_local_elem, 0);
 #else
         // (1) D2H stage current K/V → host pinned buffer + (2) post MPI exchange.
         cudaMemcpy(K_send_h, K_cur, kv_bytes, cudaMemcpyDeviceToHost);
@@ -452,6 +473,10 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
         //     be reused as the next recv target.
         std::swap(K_cur, K_recv);
         std::swap(V_cur, V_recv);
+#ifdef RING_USE_NCCL
+        std::swap(K_h_cur, K_h_recv);
+        std::swap(V_h_cur, V_h_recv);
+#endif
       }
     }
 
@@ -635,6 +660,13 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
   DeviceTensor<float> K_a(kv_local_elem), K_b(kv_local_elem);
   DeviceTensor<float> V_a(kv_local_elem), V_b(kv_local_elem);
   DeviceTensor<float> out_d(q_local_elem), m_d(m_count), l_d(m_count);
+#ifdef RING_USE_NCCL
+  // FP16 transit buffers — the NCCL ring moves __half (half the bytes); the
+  // kernel reads FP32. See KERNEL_OPTIMIZATIONS.md Round 14. (Round 16 tried
+  // INT8 here — breached tol=1e-3; reverted.)
+  DeviceTensor<__half> K_ha(kv_local_elem), K_hb(kv_local_elem);
+  DeviceTensor<__half> V_ha(kv_local_elem), V_hb(kv_local_elem);
+#endif
 
   const AttentionShape init_shape{B, H, Sl_local, S, D};
   AttentionShape sg_shape{B, H, Sl, Sl, D};
@@ -681,12 +713,20 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
     // kernel waits on it (uniform treatment of step 0 vs. step s>0).
     cudaMemcpyAsync(K_a.data(), k_h_init.data(), kv_bytes, cudaMemcpyHostToDevice, stream_copy);
     cudaMemcpyAsync(V_a.data(), v_h_init.data(), kv_bytes, cudaMemcpyHostToDevice, stream_copy);
-    cudaEventRecord(comm_done, stream_copy);
 
     float* K_cur = K_a.data();
     float* V_cur = V_a.data();
     float* K_recv = K_b.data();
     float* V_recv = V_b.data();
+    // Narrow the local FP32 chunk to the FP16 send buffer (on stream_copy, so
+    // it is ordered before step 0's send). Received FP16 is forwarded as-is.
+    __half* K_h_cur = K_ha.data();
+    __half* V_h_cur = V_ha.data();
+    __half* K_h_recv = K_hb.data();
+    __half* V_h_recv = V_hb.data();
+    launch_float_to_half(K_cur, K_h_cur, kv_local_elem, stream_copy);
+    launch_float_to_half(V_cur, V_h_cur, kv_local_elem, stream_copy);
+    cudaEventRecord(comm_done, stream_copy);
 
     launch_attention_init(out_d.data(), m_d.data(), l_d.data(), init_shape, m_count,
                           stream_compute);
@@ -730,12 +770,18 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
         // comm_ms is captured via ev_h2d_starts/ends after the loop.
         cudaEventRecord(ev_h2d_starts[step], stream_copy);
         ncclGroupStart();
-        NCCL_CHECK(ncclSend(K_cur, kv_local_elem, ncclFloat, next_rank, nccl_comm, stream_copy));
-        NCCL_CHECK(ncclRecv(K_recv, kv_local_elem, ncclFloat, prev_rank, nccl_comm, stream_copy));
-        NCCL_CHECK(ncclSend(V_cur, kv_local_elem, ncclFloat, next_rank, nccl_comm, stream_copy));
-        NCCL_CHECK(ncclRecv(V_recv, kv_local_elem, ncclFloat, prev_rank, nccl_comm, stream_copy));
+        NCCL_CHECK(ncclSend(K_h_cur, kv_local_elem, ncclHalf, next_rank, nccl_comm, stream_copy));
+        NCCL_CHECK(ncclRecv(K_h_recv, kv_local_elem, ncclHalf, prev_rank, nccl_comm, stream_copy));
+        NCCL_CHECK(ncclSend(V_h_cur, kv_local_elem, ncclHalf, next_rank, nccl_comm, stream_copy));
+        NCCL_CHECK(ncclRecv(V_h_recv, kv_local_elem, ncclHalf, prev_rank, nccl_comm, stream_copy));
         NCCL_CHECK(ncclGroupEnd());
         cudaEventRecord(ev_h2d_ends[step], stream_copy);
+        // Widen received FP16 → FP32 (on stream_copy, after the WAR fence at
+        // the top of this block) so the next step's kernel reads FP32.
+        // comm_done is recorded *after* the widen so the consuming kernel waits
+        // for the widened buffer, not just the raw FP16 receive.
+        launch_half_to_float(K_h_recv, K_recv, kv_local_elem, stream_copy);
+        launch_half_to_float(V_h_recv, V_recv, kv_local_elem, stream_copy);
         cudaEventRecord(comm_done, stream_copy);
         // wait_acc remains 0: no blocking host wait exists in the NCCL path.
 #else
@@ -787,6 +833,8 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
         //     is still in flight on stream_copy and is gated by comm_done.
         std::swap(K_cur, K_recv);
         std::swap(V_cur, V_recv);
+        std::swap(K_h_cur, K_h_recv);
+        std::swap(V_h_cur, V_h_recv);
       }
     }
 

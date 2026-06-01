@@ -222,6 +222,37 @@ __global__ void float_to_half_kernel(const float* __restrict__ src, __half* __re
   }
 }
 
+/// Cast a half buffer back to float element-wise. Inverse of
+/// `float_to_half_kernel`; widens an FP16 KV chunk received over NCCL.
+__global__ void half_to_float_kernel(const __half* __restrict__ src, float* __restrict__ dst,
+                                     std::size_t n) {
+  for (std::size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (std::size_t)gridDim.x * blockDim.x) {
+    dst[i] = __half2float(src[i]);
+  }
+}
+
+// Symmetric INT8 quant with a fixed scale of 127. The ring-attention inputs
+// are bounded in [-1, 1) (gen_elem / XorShift32::next_uniform), so 127 maps
+// the full range with no clipping; the clamp guards stray out-of-range values.
+__global__ void float_to_int8_kernel(const float* __restrict__ src, signed char* __restrict__ dst,
+                                     std::size_t n) {
+  for (std::size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (std::size_t)gridDim.x * blockDim.x) {
+    int q = __float2int_rn(src[i] * 127.0f);
+    q = max(-127, min(127, q));
+    dst[i] = static_cast<signed char>(q);
+  }
+}
+
+__global__ void int8_to_float_kernel(const signed char* __restrict__ src, float* __restrict__ dst,
+                                     std::size_t n) {
+  for (std::size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (std::size_t)gridDim.x * blockDim.x) {
+    dst[i] = static_cast<float>(src[i]) * (1.0f / 127.0f);
+  }
+}
+
 template <int D>
 void launch_step_fp16_typed(const __half* q, const __half* k, const __half* v, float* o, float* m,
                             float* l, const AttentionShape& shape, int q_offset, int k_offset,
@@ -266,6 +297,27 @@ void launch_float_to_half(const float* src, __half* dst, std::size_t n, cudaStre
   const int block = 256;
   const int grid = static_cast<int>((n + block - 1) / block);
   float_to_half_kernel<<<grid, block, 0, stream>>>(src, dst, n);
+  cudaCheck(cudaGetLastError());
+}
+
+void launch_half_to_float(const __half* src, float* dst, std::size_t n, cudaStream_t stream) {
+  const int block = 256;
+  const int grid = static_cast<int>((n + block - 1) / block);
+  half_to_float_kernel<<<grid, block, 0, stream>>>(src, dst, n);
+  cudaCheck(cudaGetLastError());
+}
+
+void launch_float_to_int8(const float* src, signed char* dst, std::size_t n, cudaStream_t stream) {
+  const int block = 256;
+  const int grid = static_cast<int>((n + block - 1) / block);
+  float_to_int8_kernel<<<grid, block, 0, stream>>>(src, dst, n);
+  cudaCheck(cudaGetLastError());
+}
+
+void launch_int8_to_float(const signed char* src, float* dst, std::size_t n, cudaStream_t stream) {
+  const int block = 256;
+  const int grid = static_cast<int>((n + block - 1) / block);
+  int8_to_float_kernel<<<grid, block, 0, stream>>>(src, dst, n);
   cudaCheck(cudaGetLastError());
 }
 

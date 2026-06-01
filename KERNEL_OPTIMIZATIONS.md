@@ -994,3 +994,521 @@ comm dominates by 10×, swallowing any sub-100 µs kernel jitter.
 workspace caching at this size can perturb the kernel's effective
 memory hierarchy and is not free* — argues for *per-shape* caches
 rather than one big monolithic workspace if we ever revisit this.
+
+---
+
+## Round 12 — FP16 inter-rank KV transfer (multi-node decode, cp_size=8)
+
+Profile: `results/ncu/2026-05-28_23-14/`, `results/nsys/2026-05-28_23-14/`.
+Baseline for comparison: same dir (first multi-node profile — 2 nodes ×
+4 GPUs = 8 ranks, `scripts/slurm/profile_multinode.sbatch`). This is the
+first round profiled across the inter-node Ethernet fabric, per the brief
+to exercise the kernels on ≥2 nodes with ≥4 GPUs/node.
+
+### Bottlenecks identified
+
+Decode ring loop, GPU-time breakdown (nsys `cuda_gpu_kern_sum`, rank 0):
+
+| config            | NCCL SendRecv      | attention kernel | comm : comp |
+|---                |---                 |---               |---          |
+| cp4 (1 node, PCIe)| 48.3 ms (96.4 %)   | 1.72 ms          | ~28 : 1     |
+| cp8 (2 nodes, Eth)| **5406 ms** (100 %)| 1.88 ms          | **~2900 : 1** |
+
+- **Communication is 96–100 % of GPU time at every cp_size > 1.** At cp8
+  across 2 nodes each `ncclKernel_SendRecv` averages **154 ms** to move
+  ~16 MB (8 MB K + 8 MB V) — ~104 MB/s, i.e. the inter-node link is ~1 GbE.
+  The decode kernel (Round 9 split-K, DRAM-bound at ~70 %) is now
+  *invisible*: 1.9 ms out of ~5400 ms. Hypothesis: only cutting bytes on
+  the wire moves the needle; FP16 K/V halves the transfer (the documented
+  Round 9 lever).
+- **Compute/comm overlap is NOT worth it here** (the obvious first guess).
+  Even a perfect overlap hides at most the compute time behind comm —
+  1.9 ms of 5406 ms at cp8 (0.03 %), 1.7 ms of 50 ms at cp4 (3.4 %). The
+  profile kills the overlap hypothesis outright; the sequential loop stays.
+- **Byte count, not latency, dominates.** 16 MB messages at ~1 GbE are
+  bandwidth-bound, not latency-bound — so halving the payload should
+  roughly halve comm wall-clock, ~2× end-to-end at cp_size > 1.
+
+### Changes
+
+- **FP16 inter-rank KV transit** (`src/ring_decode.cu`). The kernel still
+  reads FP32 (`K_cur`/`V_cur`), but the NCCL Send/Recv now moves `__half`
+  buffers (`ncclHalf`): half the bytes. Per step the received FP16 chunk
+  is widened back to FP32 via a new `launch_half_to_float` before the next
+  kernel reads it; the FP16 buffer received this step is forwarded
+  unchanged next step (no re-narrowing, no double quantization). A rank's
+  *own* chunk (step 0, `origin == rank`) is consumed at full FP32; only
+  chunks received from other ranks are FP16. cp_size == 1 skips the
+  FP16 path entirely (no comm), so single-rank numerics are unchanged.
+- **`launch_half_to_float` / `half_to_float_kernel`** (`src/attention_step_fp16.cu`,
+  declared in `src/attention.hpp`). Element-wise FP16→FP32 widen — the
+  inverse of the existing `launch_float_to_half`.
+- **Loop kept sequential.** No two-stream overlap (the profile shows comm
+  dwarfs compute ~2900:1 at cp8, so overlap buys nothing). The win is
+  purely fewer bytes on the wire.
+
+### Practice — Nsight Systems (re-profile `2026-05-28_23-27`)
+
+NCCL `SendRecv` GPU time, rank 0 (the comm term that is ~96-100 % of the
+decode loop):
+
+| config            | FP32 (`23-14`)  | FP16 (`23-27`)  | speedup | per-step avg      |
+|---                |---              |---              |---      |---                |
+| cp8 (2 nodes, Eth)| 5406 ms         | **3085 ms**     | **1.75×** | 154 ms → 88 ms   |
+| cp4 (1 node, PCIe)| 48.3 ms         | **33.6 ms**     | 1.44×   | median 3.14 → 1.62 ms (1.94×) |
+
+- **cp8 (the multi-node target): 1.75× less comm.** Short of the ideal 2×
+  because NCCL ring SendRecv has fixed per-message protocol/latency cost
+  that doesn't scale with payload; the 16 MB → 8 MB payload cut is
+  bandwidth-bound so most of it lands. Since comm is **99.9 %** of GPU
+  time at cp8, this is ~1.75× end-to-end decode speedup across 2 nodes.
+- **cp4 intra-node: ~1.9× by median.** The total/avg (1.44×) is skewed by
+  a single 10.5 ms PCIe-contention outlier in the FP16 run; the median
+  per-step (3.14 → 1.62 ms) shows the clean ~2× payload effect.
+- **Attention kernel untouched**, as designed: cp8 1.88 → 1.89 ms, cp4
+  1.72 → 1.73 ms (run-to-run noise). The Round 9 split-K kernel and its
+  NCU metrics are unchanged.
+- **Convert overhead is negligible**: `half_to_float` 1.92 ms +
+  `float_to_half` 0.28 ms = 2.2 ms total at cp8 — **0.07 %** of the 3085 ms
+  comm. The FP16↔FP32 staging more than pays for itself.
+
+### Practice — correctness
+
+All 5 decode CTests pass (`validate_decode.sbatch`, job 88410):
+`decode_op`, `ring_decode_smoke` (cp2), `ring_decode_smoke_d64` (cp2),
+`ring_decode_smoke_cp4` (cp4), `ring_decode_cli_csv`. The cp2/cp4 tests
+exercise the FP16 transit path and stay under `tol=1e-3` — i.e. quantizing
+the *transferred* KV to FP16 keeps the decode output within the project's
+documented FP16 tolerance, well inside the 1e-3 bound. cp_size == 1 is
+bit-identical to before (FP16 path skipped).
+
+### What this doesn't fix
+
+- **Comm is still 99.9 % of GPU time at cp8** — just 1.75× cheaper. The
+  next byte-cutting lever would be an FP16 (or lower) *resident* KV cache
+  so the pack step doesn't widen, but the wire cost is already FP16; the
+  remaining ~88 ms/step is the raw ~1 GbE inter-node bandwidth moving
+  8 MB. Only a faster fabric or a fundamentally different (non-ring)
+  collective changes that.
+- **The ~1 GbE inter-node link is the hard floor.** At 8 MB/step and
+  ~100 MB/s effective, cp8 decode is network-bound; no kernel or host-side
+  change moves it further without cutting bytes again (e.g. FP8/int8 KV,
+  which Turing Tensor Cores can consume but which would need a quantized
+  decode kernel and a looser tolerance).
+
+> **Superseded by Round 13.** Round 12 made the *existing* (KV-rotating)
+> decode comm 1.75× cheaper. Round 13 realised the KV should not be on the
+> wire at all for decode and removed the rotation entirely, so the FP16
+> transit code in `ring_decode.cu` was replaced. The `launch_half_to_float`
+> helper added here stays (general-purpose, pairs with `launch_float_to_half`).
+> Round 12's measurements remain a valid characterisation of the
+> KV-rotation regime and of FP16-over-NCCL bandwidth.
+
+---
+
+## Round 13 — rotate nothing: local partial + all-gather merge (decode)
+
+Profile: `results/ncu/2026-05-28_23-27/`, `results/nsys/2026-05-28_23-27/`
+(Round 12 re-profile = Round 13 baseline). Re-profile written by this round.
+
+### Bottlenecks identified
+
+- **Decode rotates 8 MB of KV/step to move what 4 KB of Q could.** After
+  Round 12, comm is still **99.9 %** of decode GPU time at cp8 (3085 ms
+  `SendRecv`). But decode has `seq_q = 1`: Q is a single token
+  (B·H·D = 1024 floats ≈ 4 KB) **replicated on every rank**
+  (`ring_decode.hpp` contract; `test_ring_decode` builds Q from a shared
+  seed). The ring was rotating the entire KV *shard* (8 MB FP16/step) past
+  every rank so a stationary Q could see all of it — the inverse of what is
+  cheap. Hypothesis: keep KV resident, compute `attention(Q, local_shard)`
+  on each rank, and merge the tiny per-rank partials. Online softmax is
+  associative, so the merged result is identical to the sequential ring.
+- **The whole prompt KV is re-rotated every decoded token.** The 16384-token
+  prompt is static, yet each new token re-ships it around the ring. Removing
+  rotation removes that waste too.
+
+### Changes
+
+- **Replaced the KV-rotation ring with a partial-merge** in
+  `run_ring_decode_step` (`src/ring_decode.cu`). Per call: (1) owner appends
+  the new token; (2) each rank packs its *local* cache and runs one decode
+  kernel `attention(q, local_shard)` → unnormalized partial `(O_r, m_r, l_r)`;
+  (3) one `ncclAllGather` of the packed partial `[O | m | l]` =
+  `B·H·(D+2)` floats/rank; (4) `decode_partial_merge_kernel` folds the
+  cp_size partials with the FlashAttention recurrence
+  (`m = max m_r`, `l = Σ e^{m_r−m} l_r`, `O = Σ e^{m_r−m} O_r`); (5) the
+  existing `launch_attention_finalize` divides `O/l`. No ring loop, no
+  Send/Recv, no KV on the wire.
+- **`decode_partial_merge_kernel`** (`src/ring_decode.cu`, anonymous ns).
+  One block per `(b,h)`, `D` threads; merges across ranks. `−∞` partials
+  (a rank that somehow saw 0 rows) get scale 0, so empty shards are safe.
+- **Comm volume**: from `~cp_size × kv_shard` (tens of MB/token) to one
+  all-gather of `cp_size × B·H·(D+2)` floats. At B=1 H=8 D=128 cp=8 that is
+  **33 KB total**, independent of prompt length.
+- **Bit-exactness**: the merge is FP32 and associative, so the result
+  matches the old sequential ring to round-off — `test_ring_decode` should
+  return to ~1e-7 (vs Round 12's FP16-transit ~1e-3-class error).
+
+### Practice — Nsight Systems comm collapse (`2026-05-29_09-36`)
+
+GPU comm time, decode rank 0, cp8 across 2 nodes (4 tokens + warmup):
+
+| approach                          | comm primitive       | total comm GPU time |
+|---                                |---                   |---                  |
+| FP32 KV rotation (`23-14`)        | `SendRecv` ×35       | 5406 ms             |
+| FP16 KV rotation (R12, `23-27`)   | `SendRecv` ×35       | 3085 ms             |
+| **partial-merge (R13, `09-36`)**  | **`AllGather` ×5**   | **4.48 ms**         |
+
+**688× less comm than Round 12, 1207× less than the original FP32.** The
+KV `SendRecv` (one 8 MB transfer/step) is gone, replaced by one 33 KB
+all-gather/token. The new merge/reduce kernels are negligible
+(`decode_partial_merge_kernel` 1.9 µs, reduce 2.8 µs).
+
+cp8 decode GPU time is now 94 % all-gather (4.48 ms) / 5 % kernel
+(0.24 ms) — but the **absolute** comm is latency-bound (33 KB), not
+bandwidth-bound. At cp4 (1 node) decode is **compute-bound again**: kernel
+0.44 ms (62 %) > all-gather 0.24 ms (33 %), exactly the regime Rounds 5-9
+left the kernel in before comm swamped it.
+
+### Practice — end-to-end (`bench_decode_mn.sbatch`, job 88457)
+
+Per-token decode latency, prompt=16384 D=128 H=8, mean over 16 tokens,
+clean (no profiler):
+
+| config            | comm_ms | comp_ms | **total_ms** | prior baseline       | speedup |
+|---                |---      |---      |---           |---                   |---      |
+| cp4 (1 node)      | 0.103   | 0.094   | **0.232**    | 10.01 ms (R10)       | **43×** |
+| cp8 (2 nodes)     | 0.459   | 0.055   | **0.625**    | ~617 ms/tok comm (R12, profile) | **~1000×** |
+
+cp4 is the first apples-to-apples vs a committed number (R10 cp4
+prompt=16k D=128 = 10.01 ms): **43× faster**, because the 10 ms was almost
+all KV-rotation comm that no longer happens. cp8 has no prior committed
+end-to-end (Round 13 is the first multi-node bench), but the Round 12
+profile put cp8 comm at ~617 ms/token, so 0.625 ms/token total is ~1000×.
+
+The cp8 `comm_ms` (0.459 ms for a 33 KB all-gather) is pure inter-node
+**latency**, not bandwidth — the NCCL `AllGather_RING_LL` low-latency
+protocol round-trip across the ~1 GbE link. That is the new floor.
+
+### Correctness
+
+`test_ring_decode` (`validate_decode.sbatch`, job 88455): **max_err =
+1.043e-07** at both cp2 and cp4 (production-ish shape prompt=2048 D=128
+H=8), vs `tol=1e-3`. All 5 decode CTests pass. As predicted, the FP32
+associative merge is bit-for-bit equivalent to the sequential ring — the
+~1e-7 confirms it (and is tighter than Round 12's FP16-transit error).
+
+### What this doesn't fix
+
+- **cp8 is now inter-node latency-bound** (0.46 ms all-gather round-trip).
+  Halving the two `MPI_Barrier`s bracketing the call (one is only there for
+  the timing window) would shave host latency; the all-gather itself is at
+  the NCCL LL-protocol floor for a 33 KB payload.
+- **Prefill is untouched and still rotates FP32 KV** — at cp8 it is the
+  remaining GB-scale comm cost (ring-overlap `SendRecv` ~4347 ms). That is
+  the high-value multi-node target now; decode is effectively solved.
+
+---
+
+## Round 14 — FP16 KV transit for the prefill ring (multi-node comm)
+
+Profile: `results/ncu/2026-05-29_09-36/`, `results/nsys/2026-05-29_09-36/`
+(Round 13 re-profile = baseline). Re-profile written by this round
+(`2026-05-29_09-45`).
+
+### Bottlenecks identified
+
+- **Prefill still rotates FP32 KV — the last GB-scale multi-node cost.**
+  Round 13 solved decode, but prefill is unchanged: at cp8 across 2 nodes
+  the ring `SendRecv` is **4620 ms (99.4 %)** in ring-blocking and
+  **4347 ms (95.3 %)** in ring-overlap-zigzag, against ~26 ms / ~212 ms of
+  kernel. Unlike decode, prefill cannot avoid rotation (both Q and KV are
+  full-sequence sharded), so the only lever is fewer bytes per message.
+  Hypothesis: the same FP16 transit as Round 12 — narrow → NCCL `ncclHalf`
+  → widen — halves the payload. Prefill messages are larger than decode's
+  (full local KV, all sub-groups) so the fixed-overhead fraction is smaller
+  and we should land closer to the ideal 2×.
+
+### Changes
+
+- **FP16 transit in both NCCL prefill paths** (`src/ring_loop.cu`,
+  `run_ring_blocking` and `run_ring_overlap`). The kernel still reads FP32;
+  the ring `ncclSend`/`ncclRecv` move `__half`. The local chunk is narrowed
+  once per pass; received FP16 chunks are forwarded as-is (no re-narrow,
+  no double quantization) and widened to FP32 right before the kernel
+  consumes them. In overlap mode the narrow/widen sit on `stream_copy` and
+  `comm_done` is recorded *after* the widen, so the existing WAR fence
+  (`stream_copy` waits on the prior kernel's `ev_ends`) already protects the
+  widened write. The MPI (non-NCCL) host-staging paths are left FP32 — they
+  are unused on this cluster.
+- **No new kernels** — reuses Round 12's `launch_float_to_half` /
+  `launch_half_to_float`.
+
+### Practice — Nsight Systems (`2026-05-29_09-45`)
+
+Prefill `SendRecv` GPU time, rank 0, cp8 across 2 nodes:
+
+| mode                  | FP32 (`23-14`) | FP16 (`09-45`) | speedup | per-step avg     |
+|---                    |---             |---             |---      |---               |
+| ring-blocking         | 4620 ms        | **2480 ms**    | 1.86×   | 165 ms → 88.6 ms |
+| ring-overlap-zigzag   | 4347 ms        | **2130 ms**    | **2.04×** | 155 ms → 76 ms |
+
+- **~2× less prefill comm at cp8**, as predicted — the larger messages
+  amortize NCCL's fixed per-message cost better than decode's did
+  (Round 12 got 1.75× on smaller chunks). Comm is 91-99 % of cp8 prefill
+  time, so this is ~2× end-to-end at the production seq.
+- **Attention kernel untouched**: blocking 26.4 → 26.5 ms, overlap-zigzag
+  212.1 → 211.8 ms (run-to-run noise). The Round 1-4 prefill kernel and its
+  NCU metrics are unchanged.
+
+### Practice — correctness
+
+All 6 `ring_smoke` CTests pass (`validate_prefill.sbatch`, job 88458),
+including the FP32 `--verify` at seq=128 (tol=1e-3) — the worst case for
+FP16 quant error (weakest softmax averaging). Larger-seq `--verify`
+(cp2, causal+zigzag, D=128, H=4) confirms the error is well-controlled and
+*shrinks* with sequence length:
+
+| seq  | max_err (FP32-compute / FP16-transit) |
+|---   |---                                    |
+| 256  | 7.03e-05                              |
+| 1024 | 2.70e-05                              |
+| 4096 | 1.68e-05                              |
+
+All ~14-60× inside the 1e-3 bound, so no gating is needed — FP16 transit is
+the default for the prefill ring. (Quantizing only the *transferred* chunks,
+with each rank's own chunk staying FP32, keeps the error far below the
+full-FP16 compute path's 5e-2 tolerance.)
+
+### What this doesn't fix
+
+- **Prefill is still bandwidth-bound at cp8** — just 2× cheaper (2130 ms).
+  The FP16 KV is still large; the next byte-cut would be int8/FP8 KV
+  (Turing has int8 but not FP8), which needs per-tensor scaling and would
+  likely breach the seq=128 smoke tol=1e-3 (FP16 already uses a chunk of the
+  budget at short seq). Not attempted.
+- **The ~1 GbE inter-node link remains the floor** for prefill, which
+  genuinely must move all KV around the ring.
+
+---
+
+## Round 15 — drop the decode leading barrier [REVERTED]
+
+Profile/bench baseline: Round 13 decode (`bench_decode_mn.sbatch` job 88457:
+cp4 0.232 ms, cp8 0.625 ms per token).
+
+### Bottlenecks identified
+
+- After Round 13 the decode KV no longer rotates, so cp8 per-token latency
+  (0.625 ms) is dominated by the **33 KB all-gather round-trip plus host
+  sync**, not bandwidth. `run_ring_decode_step` brackets the work with two
+  `MPI_Barrier`s. Hypothesis: the **leading** barrier is redundant — the
+  all-gather is a collective and self-synchronizes, and the previous token's
+  trailing barrier + device sync already aligned the ranks — so dropping it
+  should remove one inter-node round trip per decoded token.
+
+### Change attempted
+
+- Removed the leading `MPI_Barrier(MPI_COMM_WORLD)` before `t_start` in
+  `run_ring_decode_step` (`src/ring_decode.cu`), keeping the trailing barrier
+  for cross-rank timing.
+
+### Practice — regressed, no improvement
+
+Clean bench (`round15_check.sbatch` job 88460), prompt=16384 D=128 H=8,
+16 tokens:
+
+| config | Round 13 (barrier) | Round 15 (no barrier) | Δ            |
+|---     |---                 |---                    |---           |
+| cp4    | 0.232 ms           | **0.388 ms**          | **+67 % (worse)** |
+| cp8    | 0.625 ms           | 0.634 ms              | flat (noise) |
+
+`comm_ms` at cp4 rose 0.103 → 0.165 ms. All decode CTests still pass
+(correctness is unaffected — the barrier was never a correctness device).
+
+### Why this failed
+
+The leading barrier is **not** pure overhead: it aligns the ranks so the
+*timed* all-gather runs without straggler wait. Removing it lets inter-token
+rank skew (varying owner / `current_len`, allocator jitter) fall **into** the
+timed collective, so the all-gather absorbs the wait and per-token latency
+*rises*. At cp4 (single node, ~0.2 ms op) the skew is a large fraction of the
+op, so the regression is stark; at cp8 the 0.46 ms all-gather round-trip
+dominates and the change washes out. Net: the barrier is doing useful
+load-balancing for a tiny-message latency-bound collective, not wasting time.
+
+### Reverted
+
+`src/ring_decode.cu` restored to the Round 13 two-barrier form. Takeaway —
+*for a sub-millisecond collective, a pre-barrier that aligns ranks can be
+cheaper than letting the collective serialize behind stragglers*; the obvious
+"remove the redundant sync" instinct is wrong here. Decode at cp8 (0.625 ms,
+all-gather-latency-bound) is the practical floor on this ~1 GbE fabric.
+
+---
+
+## Summary — Rounds 12-15 (multi-node campaign, 2 nodes × 4 GPUs)
+
+Profiled across the inter-node Ethernet fabric (cp_size=8) throughout. The
+multi-node profile reframed the whole problem: at cp_size > 1 **communication
+is 95-100 % of GPU time** for both kernels, so these rounds targeted comm, not
+the (already-tuned) kernels.
+
+| round | change | effect |
+|---    |---     |---     |
+| 12 | FP16 KV transit (decode ring) | comm 1.75× at cp8; superseded by R13 |
+| 13 | **decode: local partial + all-gather merge (no KV rotation)** | **comm ~1000×, decode 0.625 ms/token at cp8; fp32-exact (1e-7)** |
+| 14 | FP16 KV transit (prefill ring) | prefill comm ~2× at cp8; max_err 7e-5 |
+| 15 | drop decode leading barrier | regressed — reverted |
+
+The decisive insight (Round 13): decode has `seq_q = 1` with Q replicated, so
+rotating the multi-MB KV shard around the ring is backwards — each rank
+computes its local partial and a 33 KB all-gather merges them. Decode went
+from network-bandwidth-floored (hundreds of ms/token) to all-gather-latency-
+bound (~0.6 ms/token at cp8). Prefill (Round 14) genuinely must rotate KV, so
+its lever is fewer bytes (FP16, ~2×). Both kernels themselves were left
+unchanged — the multi-node bottleneck was never the kernel.
+
+---
+
+## Round 16 — INT8 KV transit for the prefill ring
+
+Profile: `results/ncu/2026-05-29_09-45/`, `results/nsys/2026-05-29_09-45/`
+(Round 14 state = baseline; Round 15 reverted so this is the current code).
+Re-profile written by this round.
+
+### Bottlenecks identified
+
+- **Prefill comm is still the dominant multi-node cost.** At cp8 across
+  2 nodes, ring-overlap-zigzag `SendRecv` is **2130 ms (90.9 %)** vs 212 ms
+  kernel — bandwidth-bound on the FP16 KV payload. Decode is solved
+  (latency-floored, Round 13); prefill must rotate all KV, so the only lever
+  left is fewer bytes per element. Hypothesis: INT8 transit (1 byte vs FP16's
+  2) roughly halves the payload again → ~2× more, ~4× vs the original FP32.
+- **The project's KV is bounded in [-1, 1)** (`gen_elem`,
+  `XorShift32::next_uniform`), so a fixed symmetric scale of 127 maps the
+  range with no clipping — no per-tensor max-abs reduction needed.
+
+### Changes
+
+- **INT8 transit replaces FP16 in the prefill ring** (`src/ring_loop.cu`,
+  `run_ring_blocking` + `run_ring_overlap`). Same forward-as-is structure as
+  Round 14 (narrow once, forward received int8, widen before the kernel) but
+  with `signed char` buffers and `ncclInt8`. The kernel still reads FP32.
+- **`launch_float_to_int8` / `launch_int8_to_float`**
+  (`src/attention_step_fp16.cu`, declared in `src/attention.hpp`). Fixed
+  symmetric scale 127, `__float2int_rn` + clamp to [-127, 127].
+- **`DeviceTensor<signed char>`** instantiated (`src/device_tensor.cu`).
+- Risk noted up front: INT8's ~3.9e-3 per-element quant error is ~16× FP16's,
+  so the seq=128 `ring_smoke` fp32 verify (tol=1e-3, weakest averaging) is the
+  gate. If it fails, the change is reverted/gated — INT8 is only viable where
+  softmax averaging over enough keys pulls the output error back under 1e-3.
+
+### Practice — faster but breaches tolerance [REVERTED]
+
+Re-profile `2026-05-29_10-09`; correctness `validate_prefill.sbatch` job 88462.
+
+**Comm (cp8, 2 nodes), FP16 (R14) → INT8:**
+
+| mode                  | FP16 (`09-45`) | INT8 (`10-09`) | speedup | vs FP32 (R14 base) |
+|---                    |---             |---             |---      |---                 |
+| ring-blocking         | 2480 ms        | **1290 ms**    | 1.92×   | 3.58×              |
+| ring-overlap-zigzag   | 2130 ms        | 1509 ms        | 1.41×*  | 2.88×              |
+
+\* overlap INT8 run had high variance (one 114 ms straggler step); median
+per-step 75.5 → 49.5 ms = 1.53×. So INT8 does cut the payload roughly as
+expected (~1.5-1.9× over FP16).
+
+**Correctness — FAILS the gate:** `ring_smoke_ring-blocking` and
+`ring_smoke_ring-overlap` (fp32 `--verify`, seq=128, tol=1e-3) both report
+**max_err = 1.40e-03 > 1e-3 → FAIL**. (The `_fp16` variants still pass — they
+use the separate full-FP16 compute path at tol=5e-2.) INT8's coarse
+quantization (~3.9e-3/element vs FP16's ~2.4e-4) pushes the decode/prefill
+output past the project's 1e-3 bar at the short smoke sequence, exactly the
+predicted failure mode.
+
+### Reverted
+
+`src/ring_loop.cu` restored to the Round 14 FP16 transit (8 `ncclHalf`, 0
+`ncclInt8`; `ring_smoke` green again). The INT8 convert kernels
+(`launch_float_to_int8` / `launch_int8_to_float`) and `DeviceTensor<signed
+char>` are kept as a documented, available capability — not wired into the
+ring. Takeaway for the writeup: **FP16 is the precision floor that stays
+within tolerance on this fabric; INT8 buys another ~1.5-1.9× comm but costs
+~16× the per-element error, exceeding 1e-3 at realistic sequence lengths.**
+A per-(b,h)-row scale or a relaxed-tolerance regime (long-context, where
+softmax averaging is stronger) would be needed to make INT8 viable; out of
+scope here.
+
+---
+
+## Round 17 — decode reads the KV cache in place (no per-token pack)
+
+Profile: `results/ncu/2026-05-29_09-45/`, `results/nsys/2026-05-29_09-45/`
+(current state = Round 14 prefill + Round 13 decode). Re-profile written by
+this round.
+
+### Bottlenecks identified
+
+- **Decode re-packs the whole local KV cache every token.** Round 13 left
+  decode all-gather-latency-bound at cp8 (~0.46 ms comm of 0.625 ms total).
+  The largest *addressable* non-comm item is `pack_local_cache`: a
+  `cudaMemcpy2DAsync` that de-strides the cache (`S_max` stride → contiguous
+  `Sk`) into fresh `K_local`/`V_local` buffers **every token**. At cp8
+  prompt=16384 that is ~16 MB D2D + two ~8 MB `DeviceTensor` allocs per token
+  — nsys shows ~100 µs/token of D2D (~16 % of the 0.625 ms token). The decode
+  kernel only needs the cache's row stride, not a contiguous copy.
+
+### Changes
+
+- **Decode kernel reads the cache in place** (`src/attention_decode.cu`).
+  Added a `kv_stride` parameter to `attention_decode_split_kernel`: the
+  per-head base becomes `(b·kv_H+h_kv)·kv_stride·D` instead of `…·Sk·D`. `Sk`
+  still bounds the row iteration (only the populated rows are read); `kv_stride`
+  only spaces the heads. Threaded `kv_row_stride` through `launch_decode_typed`
+  / `launch_attention_decode_step` (default 0 ⇒ contiguous `seq_k`, so the
+  prefill dispatch in `attention_step.cu` is unchanged).
+- **`run_ring_decode_step` drops the pack** (`src/ring_decode.cu`). It now
+  calls `launch_attention_decode_step(q, cache.k_data(), cache.v_data(), …,
+  kv_row_stride = cache.s_max())` directly — no `pack_local_cache`, no
+  `K_local`/`V_local` allocation/copy. `pack_local_cache` removed (dead).
+- **Bit-exact**: same data, same kernel math — only the K/V addressing
+  changed. `test_ring_decode` should stay at ~1e-7.
+
+### Practice — pack eliminated (`2026-05-29_10-20`)
+
+Decode D2D memcpy (the de-stride pack), cp8 rank 0, nsys:
+
+| | Round 13 (`09-36`) | Round 17 (`10-20`) |
+|---|---|---|
+| Device-to-Device total | 500 µs (33 ops) | **164 µs (23 ops)** |
+
+The 16 MB/token de-stride copies are gone; the residual D2D is just the
+3 tiny `send_partial` packs. The split kernel is unchanged (47 µs).
+
+End-to-end (`round15_check.sbatch` job 88465), prompt=16384 D=128 H=8,
+16 tokens:
+
+| config | Round 13 total | Round 17 total | Δ |
+|---     |---             |---             |---|
+| cp4 (1 node)  | 0.232 ms | **0.128 ms** | **1.81× faster** |
+| cp8 (2 nodes) | 0.625 ms | 0.663 ms     | flat (within all-gather jitter) |
+
+- **cp4: 1.81×.** Intra-node the all-gather is fast and low-jitter, so the
+  ~0.10 ms pack removal shows directly (0.232 − 0.128 = 0.104 ms ≈ the pack).
+- **cp8: flat.** The pack (~0.1 ms) is removed, but the inter-node all-gather
+  dominates and its run-to-run jitter (profiled 0.39–3.29 ms) is larger than
+  0.1 ms, so the saving is in the noise on the end-to-end number — though the
+  D2D-elimination is real and visible in the trace. The win is unambiguous
+  wherever decode is not all-gather-jitter-bound (cp1/cp2/cp4, and cp8 once on
+  a lower-latency fabric).
+- **Correctness**: all 5 decode CTests pass; the change is bit-exact (same
+  kernel arithmetic, only the K/V row stride differs), so `test_ring_decode`
+  stays at ~1e-7.
+
+### What this doesn't fix
+
+- **cp8 decode is still inter-node all-gather-latency/jitter-bound** (~0.5 ms,
+  high variance on ~1 GbE). The pack removal helps every other configuration
+  and removes a per-token 16 MB D2D + two allocations, but cannot beat the
+  network round-trip that dominates cp8.

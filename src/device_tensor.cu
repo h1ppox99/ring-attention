@@ -70,5 +70,6 @@ template class DeviceTensor<float>;
 template class DeviceTensor<int>;
 template class DeviceTensor<unsigned int>;
 template class DeviceTensor<__half>;
+template class DeviceTensor<signed char>;
 
 }  // namespace ring_attention

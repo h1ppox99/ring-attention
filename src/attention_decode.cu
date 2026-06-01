@@ -74,7 +74,7 @@ template <int D>
 __global__ void attention_decode_split_kernel(
     const float* __restrict__ Q, const float* __restrict__ K, const float* __restrict__ V,
     float* __restrict__ M_partial, float* __restrict__ L_partial, float* __restrict__ O_partial,
-    int H, int kv_H, int Sk, float scale, bool causal, int q_offset, int k_offset) {
+    int H, int kv_H, int Sk, int kv_stride, float scale, bool causal, int q_offset, int k_offset) {
   static_assert(D % 32 == 0, "D must be a multiple of warp size (32).");
   constexpr int VPL = D / 32;
 
@@ -88,7 +88,10 @@ __global__ void attention_decode_split_kernel(
   const int h_kv = h % kv_H;
 
   const long head_q = ((long)b * H + h) * D;
-  const long head_k = ((long)b * kv_H + h_kv) * Sk * D;
+  // kv_stride is the per-head row stride of the K/V layout: Sk for a contiguous
+  // packed tile, or the cache's S_max when reading the KV cache in place
+  // (Round 17 — skips the per-token de-stride copy).
+  const long head_k = ((long)b * kv_H + h_kv) * (long)kv_stride * D;
   const long partial_row = ((long)split_id * B + b) * H + h;
   const long partial_head = partial_row * D;
 
@@ -276,8 +279,11 @@ __global__ void attention_decode_reduce_kernel(const float* __restrict__ M_parti
 template <int D>
 void launch_decode_typed(const float* q, const float* k, const float* v, float* out, float* m,
                          float* l, const AttentionShape& shape, int q_offset, int k_offset,
-                         bool causal, cudaStream_t stream) {
+                         bool causal, int kv_row_stride, cudaStream_t stream) {
   const int kv_H = (shape.kv_heads > 0) ? shape.kv_heads : shape.heads;
+  // 0 ⇒ contiguous (stride == row count); else the caller's row stride (e.g.
+  // the KV cache's S_max so the kernel can read the cache in place).
+  const int kv_stride = (kv_row_stride > 0) ? kv_row_stride : shape.seq_k;
   const float scale = 1.0f / std::sqrt(static_cast<float>(D));
   const int B = shape.batch;
   const int H = shape.heads;
@@ -296,9 +302,9 @@ void launch_decode_typed(const float* q, const float* k, const float* v, float* 
   // Compute: split-K kernel.
   const dim3 grid_split(K_SPLIT, H, B);
   const dim3 block_split(128);  // 4 warps × 32 lanes.
-  attention_decode_split_kernel<D>
-      <<<grid_split, block_split, 0, stream>>>(q, k, v, M_partial, L_partial, O_partial, H, kv_H,
-                                               shape.seq_k, scale, causal, q_offset, k_offset);
+  attention_decode_split_kernel<D><<<grid_split, block_split, 0, stream>>>(
+      q, k, v, M_partial, L_partial, O_partial, H, kv_H, shape.seq_k, kv_stride, scale, causal,
+      q_offset, k_offset);
   cudaCheck(cudaGetLastError());
 
   // Reduce: fold K_SPLIT partials into persistent state.
@@ -313,19 +319,24 @@ void launch_decode_typed(const float* q, const float* k, const float* v, float* 
 
 void launch_attention_decode_step(const float* q, const float* k, const float* v, float* out,
                                   float* m, float* l, const AttentionShape& shape, int q_offset,
-                                  int k_offset, bool causal, cudaStream_t stream) {
+                                  int k_offset, bool causal, cudaStream_t stream,
+                                  int kv_row_stride) {
   switch (shape.head_dim) {
     case 32:
-      launch_decode_typed<32>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_decode_typed<32>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, kv_row_stride,
+                              stream);
       break;
     case 64:
-      launch_decode_typed<64>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_decode_typed<64>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, kv_row_stride,
+                              stream);
       break;
     case 128:
-      launch_decode_typed<128>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_decode_typed<128>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, kv_row_stride,
+                               stream);
       break;
     case 256:
-      launch_decode_typed<256>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_decode_typed<256>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, kv_row_stride,
+                               stream);
       break;
     default:
       fprintf(stderr,
