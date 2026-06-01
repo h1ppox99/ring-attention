@@ -124,15 +124,13 @@ void launch_attention_step_fp16(const __half* q, const __half* k, const __half* 
 void launch_float_to_half(const float* src, __half* dst, std::size_t n, cudaStream_t stream = 0);
 
 /// Element-wise FP16 → FP32 cast on the device. Inverse of
-/// `launch_float_to_half`; used by the ring-decode loop to widen an FP16 KV
-/// chunk received over NCCL back to FP32 before the (FP32) decode kernel reads
-/// it.
+/// `launch_float_to_half`; used to widen FP16 transit buffers back to FP32
+/// before FP32 kernels read them.
 void launch_half_to_float(const __half* src, float* dst, std::size_t n, cudaStream_t stream = 0);
 
-/// Element-wise FP32 ↔ INT8 casts with a fixed symmetric scale of 127. Used by
-/// the prefill ring for INT8 KV transit (half the bytes of FP16). Valid for
-/// inputs in [-1, 1) (the project's synthetic data range); out-of-range values
-/// are clamped.
+/// Element-wise FP32 ↔ INT8 casts with a fixed symmetric scale of 127.
+/// Kept for experimentation with quantized KV transit. Valid for inputs in
+/// [-1, 1) (the project's synthetic data range); out-of-range values are clamped.
 void launch_float_to_int8(const float* src, signed char* dst, std::size_t n,
                           cudaStream_t stream = 0);
 void launch_int8_to_float(const signed char* src, float* dst, std::size_t n,
