@@ -8,15 +8,18 @@ points to where the reference code lives, and describes what would need to chang
 Run these once and save the results as your reference:
 
   # 1. Full correctness gate
-  bash scripts/slurm/gpu_tests.sbatch          # or sbatch it
+  bash scripts/coverage.sh                     # ctest + coverage
+  sbatch scripts/slurm/validate.sbatch         # multi-rank verify matrix
 
   # 2. Single-kernel baseline
   ./build/release/apps/bench_attention/bench_attention --bh 1 8 >
    results/bench_baseline.csv
 
-  # 3. Ring pipeline baseline
-  sbatch scripts/slurm/bench_ring.sbatch       # saves
+  # 3. Ring pipeline baseline (strong + weak scaling, up to 4 nodes)
+  sbatch scripts/slurm/strong_scaling.sbatch   # saves
   results/bench_ring.csv
+  sbatch scripts/slurm/weak_scaling.sbatch     # saves
+  results/bench_weak.csv
 
   # 4. Kernel counters baseline
   sbatch scripts/slurm/profile.sbatch          # saves .nsys-rep

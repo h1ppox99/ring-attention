@@ -67,6 +67,11 @@ fi
       --sort uncovered-number \
       --print-summary
 
+# ── Stamp the report with when it was generated. gcovr overwrites the file on
+# each run, so we prepend the timestamp after gcovr has written it.
+STAMP="Coverage report generated: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+printf '%s\n\n%s' "${STAMP}" "$(cat "${TXT_REPORT}")" > "${TXT_REPORT}"
+
 echo ""
 echo "Coverage report written to ${TXT_REPORT}"
 
