@@ -31,6 +31,13 @@ class RingPartition {
   /// (rank - s + cp_size) % cp_size.
   int k_offset_for_step(int step, int sg = 0) const;
 
+  /// Global token position of the first key row of the shard owned by `source_rank`,
+  /// sub-group `sg`. The source-indexed primitive behind `k_offset_for_step`
+  /// (which is `k_offset_for_source((rank - step + cp_size) % cp_size, sg)`). The
+  /// hierarchical (2D) ring drives K offsets directly off the held shard's source
+  /// rank, which is not a single-step function of this rank, so it calls this.
+  int k_offset_for_source(int source_rank, int sg = 0) const;
+
   /// Number of local tokens per sub-group. Same for all sub-groups.
   int local_chunk_len(int sg = 0) const;
 

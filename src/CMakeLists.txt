@@ -14,6 +14,7 @@ add_library(ring_attention STATIC
   attention_step_fp16.cu
   attention_decode.cu
   ring_partition.cpp
+  ring2d_schedule.cpp
   ring_loop.cu
   ring_loop_fp16.cu
   kv_cache.cu

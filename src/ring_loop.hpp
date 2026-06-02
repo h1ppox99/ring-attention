@@ -13,7 +13,7 @@
 
 namespace ring_attention {
 
-enum class RingMode { AllGather, RingBlocking, RingOverlap };
+enum class RingMode { AllGather, RingBlocking, RingOverlap, Ring2D };
 
 /// Compute / transport dtype. FP16 routes through the wmma-based kernel and
 /// sends K/V over MPI as half-precision; FP32 is the original path.

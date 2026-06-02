@@ -809,6 +809,8 @@ RingResult run_ring_attention_fp16(const RingConfig& cfg) {
       return run_ring_blocking_fp16(cfg);
     case RingMode::RingOverlap:
       return run_ring_overlap_fp16(cfg);
+    case RingMode::Ring2D:
+      mpi_die("--mode=ring-2d has no fp16 path yet (use --dtype fp32)");
   }
   mpi_die("unreachable");
 }

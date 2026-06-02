@@ -180,6 +180,33 @@ void test_zigzag_step0_own() {
   printf("test_zigzag_step0_own OK\n");
 }
 
+/// k_offset_for_source is the source-indexed sibling of k_offset_for_step:
+/// for every (step, sub-group) the source rank held at that step is
+/// (rank - step + cp_size) % cp_size, and feeding it to k_offset_for_source
+/// must reproduce k_offset_for_step exactly. Covers both partition modes.
+/// This is the primitive the hierarchical (2D) ring uses, where the held
+/// shard's source is not a simple function of a single step counter.
+void test_k_offset_for_source_matches_step() {
+  for (auto mode : {RingPartition::Mode::Contiguous, RingPartition::Mode::Zigzag}) {
+    for (int cp_size : {1, 2, 3, 4}) {
+      const int seq = cp_size * 2 * 8;  // divisible by 2*cp_size for zigzag
+      const int nsg = (mode == RingPartition::Mode::Zigzag) ? 2 : 1;
+      for (int r = 0; r < cp_size; ++r) {
+        RingPartition p(cp_size, r, seq, mode);
+        for (int step = 0; step < cp_size; ++step) {
+          const int source = (r - step + cp_size) % cp_size;
+          for (int sg = 0; sg < nsg; ++sg) {
+            char m[80];
+            std::snprintf(m, sizeof(m), "k_offset_for_source r=%d step=%d sg=%d", r, step, sg);
+            check(p.k_offset_for_source(source, sg) == p.k_offset_for_step(step, sg), m);
+          }
+        }
+      }
+    }
+  }
+  printf("test_k_offset_for_source_matches_step OK\n");
+}
+
 /// Zigzag: the union of sub-groups across all ranks covers every chunk exactly
 /// once — no overlaps, no gaps. This is the partition correctness property.
 void test_zigzag_partition_cover() {
@@ -212,6 +239,7 @@ int main() {
   test_getters();
   test_zigzag_offsets_4ranks();
   test_zigzag_step0_own();
+  test_k_offset_for_source_matches_step();
   test_zigzag_partition_cover();
   printf("All ring_partition tests passed.\n");
   return 0;

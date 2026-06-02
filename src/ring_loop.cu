@@ -17,6 +17,7 @@
 #include "cpu_attention.hpp"
 #include "device_tensor.hpp"
 #include "nccl_utils.hpp"
+#include "ring2d_schedule.hpp"
 #include "ring_gen.hpp"
 #include "ring_loop.hpp"
 #include "ring_partition.hpp"
@@ -836,6 +837,7 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
         std::swap(K_cur, K_recv);
         std::swap(V_cur, V_recv);
 #ifdef RING_USE_NCCL
+        // The FP16 transit buffers only exist on the NCCL path.
         std::swap(K_h_cur, K_h_recv);
         std::swap(V_h_cur, V_h_recv);
 #endif
@@ -955,6 +957,457 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
   return res;
 }
 
+// ---------------------------------------------------------------------------
+// Hierarchical (2D) ring (`--mode=ring-2d`)
+// ---------------------------------------------------------------------------
+
+/// Two-tier ring that keeps the heavy K/V rotation on the fast intra-node ring
+/// and crosses the slow inter-node uplink only N-1 times per shard, cutting the
+/// round count from the flat ring's P-1 to P-G (see docs/hierarchical_ring.md).
+///
+/// Topology: P GPUs as N nodes × G GPUs/node. Two communicators are derived from
+/// MPI_COMM_WORLD: `intra_comm` (MPI_COMM_TYPE_SHARED — the G GPUs sharing a
+/// node) and `inter_comm` (split by local index — the N nodes at a fixed local
+/// slot). Block rank layout is assumed and validated (global rank == n*G + g).
+///
+/// Schedule (Ring2DSchedule): for macro-step m and inner round i, this GPU holds
+/// the shard of source rank `source(m,i)`; its K offset comes from
+/// RingPartition::k_offset_for_source. Online softmax is order-independent, so
+/// the accumulated output is identical to the flat ring.
+///
+/// Overlap with one extra buffer: at each macro-step the GPU's i=0 "seed" shard
+/// is staged to a pinned host buffer and shipped on `inter_comm` (Isend/Irecv)
+/// while the inner loop computes and rotates the band on `intra_comm`. Three
+/// device K/V pairs cycle: `compute` (current inner round), `intra` (inner
+/// ping-pong receive), `inter` (the macro-spanning inter-node receive — the
+/// "extra" buffer over a flat ring's two). Inter-node bytes live in host memory
+/// during flight, so no fourth device buffer is needed.
+///
+/// This first cut host-stages both tiers over MPI (D2H -> MPI -> H2D), matching
+/// the doc's cost model; intra-node could later use NCCL/CUDA-aware MPI. Timing
+/// follows the other modes: comm_ms = staging + posts + intra Sendrecv, wait_ms
+/// = inter MPI_Waitall, comp_ms = per-step kernel events, total_ms = wall clock.
+ring_attention::RingResult run_ring_2d(const ring_attention::RingConfig& cfg) {
+  using namespace ring_attention;
+
+  const int B = cfg.batch, H = cfg.heads, D = cfg.head_dim;
+  const int kv_H = (cfg.kv_heads > 0) ? cfg.kv_heads : cfg.heads;
+  const int S = cfg.seq, P = cfg.cp_size, R = cfg.rank;
+
+  // --- Derive the 2D topology from MPI_COMM_WORLD -----------------------------
+  // intra_comm: the GPUs sharing a node (key=R keeps them ordered by world rank,
+  // so the intra rank g == R - n*G under a block layout).
+  MPI_Comm intra_comm, inter_comm;
+  MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, R, MPI_INFO_NULL, &intra_comm);
+  int g = 0, G = 0;
+  MPI_Comm_rank(intra_comm, &g);
+  MPI_Comm_size(intra_comm, &G);
+  // inter_comm: one ring per local slot g, across nodes; ordered by world rank so
+  // the inter rank == node index n.
+  MPI_Comm_split(MPI_COMM_WORLD, g, R, &inter_comm);
+  int n = 0, N = 0;
+  MPI_Comm_rank(inter_comm, &n);
+  MPI_Comm_size(inter_comm, &N);
+
+  if (N * G != P || R != n * G + g) {
+    MPI_Comm_free(&intra_comm);
+    MPI_Comm_free(&inter_comm);
+    mpi_die(
+        "ring-2d requires a uniform, block-distributed layout (equal GPUs per node, "
+        "node-contiguous ranks). Launch with a fixed --ntasks-per-node so that "
+        "world rank == node*G + local.");
+  }
+
+  const RingPartition::Mode pmode =
+      cfg.zigzag ? RingPartition::Mode::Zigzag : RingPartition::Mode::Contiguous;
+  RingPartition part(P, R, S, pmode);
+  Ring2DSchedule sched(N, G, n, g);
+  const int nsg = part.num_sub_groups();
+  const int Sl = part.local_chunk_len();
+  const int Sl_local = Sl * nsg;
+  const std::size_t q_sg_elem = static_cast<std::size_t>(B) * H * Sl * D;
+  const std::size_t q_local_elem = static_cast<std::size_t>(nsg) * q_sg_elem;
+  const std::size_t kv_sg_elem = static_cast<std::size_t>(B) * kv_H * Sl * D;
+  const std::size_t kv_local_elem = static_cast<std::size_t>(nsg) * kv_sg_elem;
+  const std::size_t m_sg = static_cast<std::size_t>(B) * H * Sl;
+  const std::size_t m_count = static_cast<std::size_t>(nsg) * m_sg;
+  const std::size_t kv_bytes = kv_local_elem * sizeof(float);
+
+  // Intra/inter ring neighbors as ranks within each communicator.
+  const int intra_next = (g + 1) % G, intra_prev = (g - 1 + G) % G;
+  const int inter_next = (n + 1) % N, inter_prev = (n - 1 + N) % N;
+
+  auto fill_q_into = [&](std::vector<float>& buf, int tid, std::size_t off, int gss) {
+    for (int b = 0; b < B; ++b)
+      for (int h = 0; h < H; ++h)
+        for (int s = 0; s < Sl; ++s)
+          for (int d = 0; d < D; ++d)
+            buf[off + (static_cast<std::size_t>(b * H + h) * Sl + s) * D + d] =
+                gen_elem(cfg.seed, tid, b, h, gss + s, d);
+  };
+  auto fill_kv_into = [&](std::vector<float>& buf, int tid, std::size_t off, int gss) {
+    for (int b = 0; b < B; ++b)
+      for (int h = 0; h < kv_H; ++h)
+        for (int s = 0; s < Sl; ++s)
+          for (int d = 0; d < D; ++d)
+            buf[off + (static_cast<std::size_t>(b * kv_H + h) * Sl + s) * D + d] =
+                gen_elem(cfg.seed, tid, b, h, gss + s, d);
+  };
+
+  // Own (seed) Q/K/V — step 0's K/V is this rank's own shard, like the flat ring.
+  std::vector<float> q_h(q_local_elem), k_h_init(kv_local_elem), v_h_init(kv_local_elem);
+  for (int sg = 0; sg < nsg; ++sg) {
+    fill_q_into(q_h, 0, sg * q_sg_elem, part.q_offset(sg));
+    fill_kv_into(k_h_init, 1, sg * kv_sg_elem, part.k_offset_for_source(R, sg));
+    fill_kv_into(v_h_init, 2, sg * kv_sg_elem, part.k_offset_for_source(R, sg));
+  }
+
+  DeviceTensor<float> q_d(q_local_elem);
+  q_d.copy_from_host(q_h);
+  DeviceTensor<float> out_d(q_local_elem), m_d(m_count), l_d(m_count);
+
+  const AttentionShape init_shape{B, H, Sl_local, S, D};
+  AttentionShape sg_shape{B, H, Sl, Sl, D};
+  sg_shape.kv_heads = kv_H;
+
+#ifdef RING_USE_NCCL
+  // GPU-direct NCCL on BOTH tiers, FP16 transit (half the inter-node bytes,
+  // matching the flat ring). Per K and per V: one FP32 buffer the kernel reads
+  // (widened each round) plus four FP16 buffers — current shard, intra-recv,
+  // inter-send (a frozen copy of the macro's seed), and inter-recv. The FP16
+  // representation propagates around both rings; we narrow the own shard once
+  // and widen to FP32 for each kernel call.
+  const std::size_t kv_half_bytes = kv_local_elem * sizeof(__half);
+  ncclComm_t nccl_intra = nccl_init_from_comm(intra_comm);
+  ncclComm_t nccl_inter = nccl_init_from_comm(inter_comm);
+
+  DeviceTensor<float> Kf(kv_local_elem), Vf(kv_local_elem);
+  DeviceTensor<__half> Kh_cur(kv_local_elem), Kh_intra(kv_local_elem), Kh_is(kv_local_elem),
+      Kh_ir(kv_local_elem);
+  DeviceTensor<__half> Vh_cur(kv_local_elem), Vh_intra(kv_local_elem), Vh_is(kv_local_elem),
+      Vh_ir(kv_local_elem);
+
+  // stream_compute runs the kernels + the fast intra-node rotation; stream_inter
+  // carries the slow inter-node transfer so it overlaps the whole inner loop.
+  cudaStream_t stream_compute = nullptr, stream_inter = nullptr;
+  cudaStreamCreate(&stream_compute);
+  cudaStreamCreate(&stream_inter);
+  cudaEvent_t ev_seed;
+  cudaEventCreate(&ev_seed);
+
+  auto one_pass = [&]() -> std::tuple<double, double, double> {
+    __half *kh_cur = Kh_cur.data(), *vh_cur = Vh_cur.data();
+    __half *kh_intra = Kh_intra.data(), *vh_intra = Vh_intra.data();
+    __half *kh_ir = Kh_ir.data(), *vh_ir = Vh_ir.data();
+
+    // Seed: own FP32 shard -> Kf -> narrow to the FP16 working buffer.
+    cudaMemcpyAsync(Kf.data(), k_h_init.data(), kv_bytes, cudaMemcpyHostToDevice, stream_compute);
+    cudaMemcpyAsync(Vf.data(), v_h_init.data(), kv_bytes, cudaMemcpyHostToDevice, stream_compute);
+    launch_float_to_half(Kf.data(), kh_cur, kv_local_elem, stream_compute);
+    launch_float_to_half(Vf.data(), vh_cur, kv_local_elem, stream_compute);
+
+    launch_attention_init(out_d.data(), m_d.data(), l_d.data(), init_shape, m_count,
+                          stream_compute);
+
+    double comm_acc = 0.0, comp_acc = 0.0, wait_acc = 0.0;
+    cudaEvent_t ev0, ev1, evc0, evc1;
+    cudaEventCreate(&ev0);
+    cudaEventCreate(&ev1);
+    cudaEventCreate(&evc0);
+    cudaEventCreate(&evc1);
+
+    for (int m = 0; m < N; ++m) {
+      // (A) Inter-node transfer of this macro's seed. Freeze the seed on
+      //     stream_compute (ordered before the inner loop mutates kh_cur), then
+      //     gate stream_inter on it and fire the NCCL send/recv there so it
+      //     overlaps the inner loop below.
+      if (m < N - 1) {
+        cudaMemcpyAsync(Kh_is.data(), kh_cur, kv_half_bytes, cudaMemcpyDeviceToDevice,
+                        stream_compute);
+        cudaMemcpyAsync(Vh_is.data(), vh_cur, kv_half_bytes, cudaMemcpyDeviceToDevice,
+                        stream_compute);
+        cudaEventRecord(ev_seed, stream_compute);
+        cudaStreamWaitEvent(stream_inter, ev_seed, 0);
+        cudaEventRecord(evc0, stream_inter);
+        NCCL_CHECK(ncclGroupStart());
+        NCCL_CHECK(
+            ncclSend(Kh_is.data(), kv_local_elem, ncclHalf, inter_next, nccl_inter, stream_inter));
+        NCCL_CHECK(ncclRecv(kh_ir, kv_local_elem, ncclHalf, inter_prev, nccl_inter, stream_inter));
+        NCCL_CHECK(
+            ncclSend(Vh_is.data(), kv_local_elem, ncclHalf, inter_next, nccl_inter, stream_inter));
+        NCCL_CHECK(ncclRecv(vh_ir, kv_local_elem, ncclHalf, inter_prev, nccl_inter, stream_inter));
+        NCCL_CHECK(ncclGroupEnd());
+        cudaEventRecord(evc1, stream_inter);
+      }
+
+      // (B) Inner loop — compute against the band, rotating it intra-node.
+      for (int i = 0; i < G; ++i) {
+        const int source = sched.source(m, i);
+        // Widen the current FP16 shard for the kernel.
+        launch_half_to_float(kh_cur, Kf.data(), kv_local_elem, stream_compute);
+        launch_half_to_float(vh_cur, Vf.data(), kv_local_elem, stream_compute);
+        cudaEventRecord(ev0, stream_compute);
+        for (int sg_q = 0; sg_q < nsg; ++sg_q) {
+          for (int sg_k = 0; sg_k < nsg; ++sg_k) {
+            const int q_off_sg = part.q_offset(sg_q);
+            const int k_off_sg = part.k_offset_for_source(source, sg_k);
+            if (cfg.causal && k_off_sg > q_off_sg + Sl - 1) continue;
+            launch_attention_step(q_d.data() + sg_q * q_sg_elem, Kf.data() + sg_k * kv_sg_elem,
+                                  Vf.data() + sg_k * kv_sg_elem, out_d.data() + sg_q * q_sg_elem,
+                                  m_d.data() + sg_q * m_sg, l_d.data() + sg_q * m_sg, sg_shape,
+                                  q_off_sg, k_off_sg, cfg.causal, stream_compute);
+          }
+        }
+        cudaEventRecord(ev1, stream_compute);
+        cudaEventSynchronize(ev1);
+        float comp_ms = 0.f;
+        cudaEventElapsedTime(&comp_ms, ev0, ev1);
+        comp_acc += comp_ms;
+
+        // Intra-node rotation on stream_compute (fast tier). Reads kh_cur (the
+        // kernel read the widened Kf, so kh_cur is free) into kh_intra.
+        if (i < G - 1) {
+          NCCL_CHECK(ncclGroupStart());
+          NCCL_CHECK(
+              ncclSend(kh_cur, kv_local_elem, ncclHalf, intra_next, nccl_intra, stream_compute));
+          NCCL_CHECK(
+              ncclRecv(kh_intra, kv_local_elem, ncclHalf, intra_prev, nccl_intra, stream_compute));
+          NCCL_CHECK(
+              ncclSend(vh_cur, kv_local_elem, ncclHalf, intra_next, nccl_intra, stream_compute));
+          NCCL_CHECK(
+              ncclRecv(vh_intra, kv_local_elem, ncclHalf, intra_prev, nccl_intra, stream_compute));
+          NCCL_CHECK(ncclGroupEnd());
+          std::swap(kh_cur, kh_intra);
+          std::swap(vh_cur, vh_intra);
+        }
+      }
+
+      // (C) Macro boundary — drain the inter-node transfer (overlapped above)
+      //     and promote the received band to the compute buffer (next seed).
+      if (m < N - 1) {
+        cudaStreamSynchronize(stream_inter);
+        cudaStreamSynchronize(stream_compute);
+        float inter_ms = 0.f;
+        cudaEventElapsedTime(&inter_ms, evc0, evc1);
+        comm_acc += inter_ms;
+        std::swap(kh_cur, kh_ir);
+        std::swap(vh_cur, vh_ir);
+      }
+    }
+
+    cudaStreamSynchronize(stream_compute);
+    for (int sg = 0; sg < nsg; ++sg)
+      launch_attention_finalize(out_d.data() + sg * q_sg_elem, l_d.data() + sg * m_sg, sg_shape,
+                                stream_compute);
+    cudaStreamSynchronize(stream_compute);
+    cudaEventDestroy(ev0);
+    cudaEventDestroy(ev1);
+    cudaEventDestroy(evc0);
+    cudaEventDestroy(evc1);
+    return {comm_acc, comp_acc, wait_acc};
+  };
+#else
+  // Three K/V pairs: compute / intra-recv / inter-recv.
+  DeviceTensor<float> K_a(kv_local_elem), K_b(kv_local_elem), K_c(kv_local_elem);
+  DeviceTensor<float> V_a(kv_local_elem), V_b(kv_local_elem), V_c(kv_local_elem);
+
+  // Pinned host staging: intra (per inner round) + inter (per macro-step).
+  float *K_intra_s = nullptr, *V_intra_s = nullptr, *K_intra_r = nullptr, *V_intra_r = nullptr;
+  float *K_inter_s = nullptr, *V_inter_s = nullptr, *K_inter_r = nullptr, *V_inter_r = nullptr;
+  cudaHostAlloc(&K_intra_s, kv_bytes, cudaHostAllocDefault);
+  cudaHostAlloc(&V_intra_s, kv_bytes, cudaHostAllocDefault);
+  cudaHostAlloc(&K_intra_r, kv_bytes, cudaHostAllocDefault);
+  cudaHostAlloc(&V_intra_r, kv_bytes, cudaHostAllocDefault);
+  cudaHostAlloc(&K_inter_s, kv_bytes, cudaHostAllocDefault);
+  cudaHostAlloc(&V_inter_s, kv_bytes, cudaHostAllocDefault);
+  cudaHostAlloc(&K_inter_r, kv_bytes, cudaHostAllocDefault);
+  cudaHostAlloc(&V_inter_r, kv_bytes, cudaHostAllocDefault);
+
+  const int n_elem = mpi_int_count(kv_local_elem, "run_ring_2d/MPI");
+
+  auto one_pass = [&]() -> std::tuple<double, double, double> {
+    float* K_cur = K_a.data();
+    float* V_cur = V_a.data();
+    float* K_intra = K_b.data();
+    float* V_intra = V_b.data();
+    float* K_inter = K_c.data();
+    float* V_inter = V_c.data();
+    // Seed the compute buffer with this rank's own shard.
+    cudaMemcpy(K_cur, k_h_init.data(), kv_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(V_cur, v_h_init.data(), kv_bytes, cudaMemcpyHostToDevice);
+
+    launch_attention_init(out_d.data(), m_d.data(), l_d.data(), init_shape, m_count);
+
+    double comm_acc = 0.0, comp_acc = 0.0, wait_acc = 0.0;
+    cudaEvent_t ev0, ev1;
+    cudaEventCreate(&ev0);
+    cudaEventCreate(&ev1);
+
+    for (int m = 0; m < N; ++m) {
+      // (A) Launch the inter-node transfer of this macro's seed shard. It rides
+      //     in host memory for the whole inner loop, so K_cur is free to rotate.
+      MPI_Request inter_reqs[4];
+      int n_inter = 0;
+      if (m < N - 1) {
+        const double t0 = MPI_Wtime();
+        cudaMemcpy(K_inter_s, K_cur, kv_bytes, cudaMemcpyDeviceToHost);
+        cudaMemcpy(V_inter_s, V_cur, kv_bytes, cudaMemcpyDeviceToHost);
+        MPI_Isend(K_inter_s, n_elem, MPI_FLOAT, inter_next, 0, inter_comm, &inter_reqs[n_inter++]);
+        MPI_Irecv(K_inter_r, n_elem, MPI_FLOAT, inter_prev, 0, inter_comm, &inter_reqs[n_inter++]);
+        MPI_Isend(V_inter_s, n_elem, MPI_FLOAT, inter_next, 1, inter_comm, &inter_reqs[n_inter++]);
+        MPI_Irecv(V_inter_r, n_elem, MPI_FLOAT, inter_prev, 1, inter_comm, &inter_reqs[n_inter++]);
+        comm_acc += (MPI_Wtime() - t0) * 1e3;
+      }
+
+      // (B) Inner loop — compute against the band, rotating it intra-node.
+      for (int i = 0; i < G; ++i) {
+        const int source = sched.source(m, i);
+        cudaEventRecord(ev0);
+        for (int sg_q = 0; sg_q < nsg; ++sg_q) {
+          for (int sg_k = 0; sg_k < nsg; ++sg_k) {
+            const int q_off_sg = part.q_offset(sg_q);
+            const int k_off_sg = part.k_offset_for_source(source, sg_k);
+            if (cfg.causal && k_off_sg > q_off_sg + Sl - 1) continue;
+            launch_attention_step(q_d.data() + sg_q * q_sg_elem, K_cur + sg_k * kv_sg_elem,
+                                  V_cur + sg_k * kv_sg_elem, out_d.data() + sg_q * q_sg_elem,
+                                  m_d.data() + sg_q * m_sg, l_d.data() + sg_q * m_sg, sg_shape,
+                                  q_off_sg, k_off_sg, cfg.causal);
+          }
+        }
+        cudaEventRecord(ev1);
+        cudaEventSynchronize(ev1);
+        float comp_ms = 0.f;
+        cudaEventElapsedTime(&comp_ms, ev0, ev1);
+        comp_acc += comp_ms;
+
+        // Intra-node rotation: pass the band one hop forward (recv predecessor's).
+        if (i < G - 1) {
+          const double t0 = MPI_Wtime();
+          cudaMemcpy(K_intra_s, K_cur, kv_bytes, cudaMemcpyDeviceToHost);
+          cudaMemcpy(V_intra_s, V_cur, kv_bytes, cudaMemcpyDeviceToHost);
+          MPI_Sendrecv(K_intra_s, n_elem, MPI_FLOAT, intra_next, 0, K_intra_r, n_elem, MPI_FLOAT,
+                       intra_prev, 0, intra_comm, MPI_STATUS_IGNORE);
+          MPI_Sendrecv(V_intra_s, n_elem, MPI_FLOAT, intra_next, 1, V_intra_r, n_elem, MPI_FLOAT,
+                       intra_prev, 1, intra_comm, MPI_STATUS_IGNORE);
+          cudaMemcpy(K_intra, K_intra_r, kv_bytes, cudaMemcpyHostToDevice);
+          cudaMemcpy(V_intra, V_intra_r, kv_bytes, cudaMemcpyHostToDevice);
+          comm_acc += (MPI_Wtime() - t0) * 1e3;
+          std::swap(K_cur, K_intra);
+          std::swap(V_cur, V_intra);
+        }
+      }
+
+      // (C) Macro boundary — collect the inter-node band and promote it to the
+      //     compute buffer (the seed for the next macro-step).
+      if (m < N - 1) {
+        const double t0 = MPI_Wtime();
+        MPI_Waitall(n_inter, inter_reqs, MPI_STATUSES_IGNORE);
+        wait_acc += (MPI_Wtime() - t0) * 1e3;
+        cudaMemcpy(K_inter, K_inter_r, kv_bytes, cudaMemcpyHostToDevice);
+        cudaMemcpy(V_inter, V_inter_r, kv_bytes, cudaMemcpyHostToDevice);
+        std::swap(K_cur, K_inter);
+        std::swap(V_cur, V_inter);
+      }
+    }
+
+    for (int sg = 0; sg < nsg; ++sg)
+      launch_attention_finalize(out_d.data() + sg * q_sg_elem, l_d.data() + sg * m_sg, sg_shape);
+    cudaDeviceSynchronize();
+    cudaEventDestroy(ev0);
+    cudaEventDestroy(ev1);
+    return {comm_acc, comp_acc, wait_acc};
+  };
+#endif
+
+  one_pass();  // warmup
+
+  double sum_comm = 0.0, sum_comp = 0.0, sum_wait = 0.0;
+  MPI_Barrier(MPI_COMM_WORLD);
+  const double t_start = MPI_Wtime();
+  for (int i = 0; i < cfg.iters; ++i) {
+    const auto [c, p_, w] = one_pass();
+    sum_comm += c;
+    sum_comp += p_;
+    sum_wait += w;
+  }
+  MPI_Barrier(MPI_COMM_WORLD);
+  const double t_end = MPI_Wtime();
+
+  RingResult res;
+  res.comm_ms = sum_comm / cfg.iters;
+  res.comp_ms = sum_comp / cfg.iters;
+  res.wait_ms = sum_wait / cfg.iters;
+  res.total_ms = (t_end - t_start) * 1e3 / cfg.iters;
+
+  const double local_t[4] = {res.comm_ms, res.comp_ms, res.wait_ms, res.total_ms};
+  double global_t[4] = {};
+  MPI_Reduce(local_t, global_t, 4, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+  if (R == 0) {
+    res.comm_ms = global_t[0];
+    res.comp_ms = global_t[1];
+    res.wait_ms = global_t[2];
+    res.total_ms = global_t[3];
+  }
+
+  float max_err = -1.f;
+  if (cfg.verify) {
+    const std::size_t q_full_elem = static_cast<std::size_t>(B) * H * S * D;
+    const std::size_t kv_full_elem = static_cast<std::size_t>(B) * kv_H * S * D;
+    std::vector<float> full_q(q_full_elem), full_k(kv_full_elem), full_v(kv_full_elem);
+    fill_host_tensor(full_q, cfg.seed, 0, B, H, S, D, 0);
+    fill_host_tensor(full_k, cfg.seed, 1, B, kv_H, S, D, 0);
+    fill_host_tensor(full_v, cfg.seed, 2, B, kv_H, S, D, 0);
+
+    AttentionShape ref_shape{B, H, S, S, D};
+    ref_shape.kv_heads = kv_H;
+    std::vector<float> cpu_out(q_full_elem);
+    cpu_attention(full_q.data(), full_k.data(), full_v.data(), cpu_out.data(), ref_shape,
+                  cfg.causal);
+
+    one_pass();
+    std::vector<float> dev_out_h(q_local_elem);
+    out_d.copy_to_host(dev_out_h);
+
+    max_err = 0.f;
+    for (int sg = 0; sg < nsg; ++sg) {
+      const int q_off_sg = part.q_offset(sg);
+      for (int b = 0; b < B; ++b)
+        for (int h = 0; h < H; ++h) {
+          const float* cpu_slice =
+              cpu_out.data() + (static_cast<std::size_t>(b * H + h) * S + q_off_sg) * D;
+          const float* dev_slice =
+              dev_out_h.data() + sg * q_sg_elem + static_cast<std::size_t>(b * H + h) * Sl * D;
+          for (int e = 0; e < Sl * D; ++e)
+            max_err = std::max(max_err, std::abs(cpu_slice[e] - dev_slice[e]));
+        }
+    }
+    float global_max;
+    MPI_Reduce(&max_err, &global_max, 1, MPI_FLOAT, MPI_MAX, 0, MPI_COMM_WORLD);
+    max_err = (R == 0) ? global_max : -1.f;
+  }
+  res.max_err = max_err;
+
+#ifdef RING_USE_NCCL
+  ncclCommDestroy(nccl_intra);
+  ncclCommDestroy(nccl_inter);
+  cudaEventDestroy(ev_seed);
+  cudaStreamDestroy(stream_compute);
+  cudaStreamDestroy(stream_inter);
+#else
+  cudaFreeHost(K_intra_s);
+  cudaFreeHost(V_intra_s);
+  cudaFreeHost(K_intra_r);
+  cudaFreeHost(V_intra_r);
+  cudaFreeHost(K_inter_s);
+  cudaFreeHost(V_inter_s);
+  cudaFreeHost(K_inter_r);
+  cudaFreeHost(V_inter_r);
+#endif
+  MPI_Comm_free(&intra_comm);
+  MPI_Comm_free(&inter_comm);
+  return res;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -967,8 +1420,10 @@ RingMode mode_from_string(const std::string& s) {
   if (s == "allgather") return RingMode::AllGather;
   if (s == "ring-blocking") return RingMode::RingBlocking;
   if (s == "ring-overlap") return RingMode::RingOverlap;
-  char msg[128];
-  std::snprintf(msg, sizeof(msg), "Unknown --mode=%s (valid: allgather ring-blocking ring-overlap)",
+  if (s == "ring-2d") return RingMode::Ring2D;
+  char msg[160];
+  std::snprintf(msg, sizeof(msg),
+                "Unknown --mode=%s (valid: allgather ring-blocking ring-overlap ring-2d)",
                 s.c_str());
   mpi_die(msg);
 }
@@ -995,6 +1450,8 @@ RingResult run_ring_attention(const RingConfig& cfg) {
       return run_ring_blocking(cfg);
     case RingMode::RingOverlap:
       return run_ring_overlap(cfg);
+    case RingMode::Ring2D:
+      return run_ring_2d(cfg);
   }
   mpi_die("unreachable");
 }

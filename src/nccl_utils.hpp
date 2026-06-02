@@ -36,6 +36,22 @@ inline ncclComm_t nccl_init(int rank, int size) {
   return comm;
 }
 
+/// Bootstrap an NCCL communicator spanning an arbitrary MPI sub-communicator
+/// (e.g. the per-node intra ring or the per-slot inter-node ring of the 2D
+/// schedule). The unique ID is broadcast within `mpi_comm` so each sub-ring
+/// rendezvous independently. Destroy with ncclCommDestroy.
+inline ncclComm_t nccl_init_from_comm(MPI_Comm mpi_comm) {
+  int rank = 0, size = 0;
+  MPI_Comm_rank(mpi_comm, &rank);
+  MPI_Comm_size(mpi_comm, &size);
+  ncclUniqueId id;
+  if (rank == 0) NCCL_CHECK(ncclGetUniqueId(&id));
+  MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, mpi_comm);
+  ncclComm_t comm;
+  NCCL_CHECK(ncclCommInitRank(&comm, size, id, rank));
+  return comm;
+}
+
 }  // namespace ring_attention
 
 #endif  // RING_USE_NCCL
