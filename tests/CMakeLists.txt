@@ -87,6 +87,10 @@ add_executable(test_ring_partition test_ring_partition.cpp)
 target_link_libraries(test_ring_partition PRIVATE ring_attention)
 add_test(NAME ring_partition COMMAND test_ring_partition)
 
+add_executable(test_ring2d_schedule test_ring2d_schedule.cpp)
+target_link_libraries(test_ring2d_schedule PRIVATE ring_attention)
+add_test(NAME ring2d_schedule COMMAND test_ring2d_schedule)
+
 add_executable(test_gen_elem test_gen_elem.cpp)
 target_link_libraries(test_gen_elem PRIVATE ring_attention)
 add_test(NAME gen_elem COMMAND test_gen_elem)
@@ -101,7 +105,7 @@ if(MPIRUN_EXECUTABLE)
   # Per-mode zigzag flag: allgather rejects --zigzag (it materializes the
   # full K/V, so token reordering is meaningless), the ring modes require it
   # to be the load-balanced configuration we actually ship.
-  foreach(_mode allgather ring-blocking ring-overlap)
+  foreach(_mode allgather ring-blocking ring-overlap ring-2d)
     if(_mode STREQUAL "allgather")
       set(_zigzag_flag "--zigzag" "0")
     else()
@@ -119,13 +123,37 @@ if(MPIRUN_EXECUTABLE)
     # FP16 / Tensor-Core path. Same smoke matrix, --dtype fp16. Tolerance
     # for the --verify check is the CLI's job; we just confirm the run
     # reaches "verify ... PASS" with the relaxed FP16 threshold.
-    add_test(
-      NAME ring_smoke_${_mode}_fp16
-      COMMAND ${MPIRUN_EXECUTABLE} -n 2 $<TARGET_FILE:ring_attention_cli>
-              --seq 128 --heads 2 --head_dim 32 --iters 1
-              --causal 1 ${_zigzag_flag} --mode ${_mode} --dtype fp16 --verify)
-    set_tests_properties(ring_smoke_${_mode}_fp16 PROPERTIES
-      PASS_REGULAR_EXPRESSION "verify[^\n]*PASS"
-      LABELS "mpi;gpu")
+    # ring-2d has no fp16 path yet, so skip its fp16 variant.
+    if(NOT _mode STREQUAL "ring-2d")
+      add_test(
+        NAME ring_smoke_${_mode}_fp16
+        COMMAND ${MPIRUN_EXECUTABLE} -n 2 $<TARGET_FILE:ring_attention_cli>
+                --seq 128 --heads 2 --head_dim 32 --iters 1
+                --causal 1 ${_zigzag_flag} --mode ${_mode} --dtype fp16 --verify)
+      set_tests_properties(ring_smoke_${_mode}_fp16 PROPERTIES
+        PASS_REGULAR_EXPRESSION "verify[^\n]*PASS"
+        LABELS "mpi;gpu")
+    endif()
   endforeach()
+
+  # ring-2d, contiguous partition (nsg=1) — covers the non-zigzag sub-group path.
+  add_test(
+    NAME ring_smoke_ring-2d_contiguous
+    COMMAND ${MPIRUN_EXECUTABLE} -n 2 $<TARGET_FILE:ring_attention_cli>
+            --seq 128 --heads 2 --head_dim 32 --iters 1
+            --causal 1 --zigzag 0 --mode ring-2d --verify)
+  set_tests_properties(ring_smoke_ring-2d_contiguous PROPERTIES
+    PASS_REGULAR_EXPRESSION "verify[^\n]*PASS"
+    LABELS "mpi;gpu")
+
+  # ring-2d on 4 ranks — a longer intra-node inner loop (G up to 4 on one node).
+  # Needs 4 GPUs, like ring_decode_smoke_cp4.
+  add_test(
+    NAME ring_smoke_ring-2d_cp4
+    COMMAND ${MPIRUN_EXECUTABLE} -n 4 $<TARGET_FILE:ring_attention_cli>
+            --seq 128 --heads 2 --head_dim 32 --iters 1
+            --causal 1 --zigzag 1 --mode ring-2d --verify)
+  set_tests_properties(ring_smoke_ring-2d_cp4 PROPERTIES
+    PASS_REGULAR_EXPRESSION "verify[^\n]*PASS"
+    LABELS "mpi;gpu")
 endif()

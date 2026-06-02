@@ -43,9 +43,15 @@ int RingPartition::q_offset(int sg) const {
 int RingPartition::k_offset_for_step(int step, int sg) const {
   // At step s this rank holds K/V that originated from rank (rank - s + cp_size) % cp_size.
   const int source = (rank_ - step % cp_size_ + cp_size_) % cp_size_;
-  if (mode_ == Mode::Contiguous) return source * (seq_ / cp_size_);
+  return k_offset_for_source(source, sg);
+}
+
+int RingPartition::k_offset_for_source(int source_rank, int sg) const {
+  if (mode_ == Mode::Contiguous) return source_rank * (seq_ / cp_size_);
+  // Zigzag: source's low chunk sits at slot `source_rank`; its high (mirror)
+  // chunk at slot (2*cp_size - 1 - source_rank). Same mapping q_offset uses.
   const int chunk = seq_ / (2 * cp_size_);
-  return (sg == 0 ? source : (2 * cp_size_ - 1 - source)) * chunk;
+  return (sg == 0 ? source_rank : (2 * cp_size_ - 1 - source_rank)) * chunk;
 }
 
 int RingPartition::local_chunk_len(int /*sg*/) const {
