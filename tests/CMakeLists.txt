@@ -134,6 +134,19 @@ if(MPIRUN_EXECUTABLE)
         PASS_REGULAR_EXPRESSION "verify[^\n]*PASS"
         LABELS "mpi;gpu")
     endif()
+
+    # Striped partition smoke: allgather rejects --striped (same reason as
+    # zigzag); the ring modes use --striped 1 (seq=128 divisible by cp_size=2).
+    if(NOT _mode STREQUAL "allgather")
+      add_test(
+        NAME ring_smoke_${_mode}_striped
+        COMMAND ${MPIRUN_EXECUTABLE} -n 2 $<TARGET_FILE:ring_attention_cli>
+                --seq 128 --heads 2 --head_dim 32 --iters 1
+                --causal 1 --striped 1 --mode ${_mode} --verify)
+      set_tests_properties(ring_smoke_${_mode}_striped PROPERTIES
+        PASS_REGULAR_EXPRESSION "verify[^\n]*PASS"
+        LABELS "mpi;gpu")
+    endif()
   endforeach()
 
   # ring-2d, contiguous partition (nsg=1) — covers the non-zigzag sub-group path.
