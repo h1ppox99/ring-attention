@@ -835,8 +835,10 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
         //     is still in flight on stream_copy and is gated by comm_done.
         std::swap(K_cur, K_recv);
         std::swap(V_cur, V_recv);
+#ifdef RING_USE_NCCL
         std::swap(K_h_cur, K_h_recv);
         std::swap(V_h_cur, V_h_recv);
+#endif
       }
     }
 
