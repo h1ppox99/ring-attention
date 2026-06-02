@@ -36,7 +36,7 @@ GPUS_PER_NODE = 4
 
 def load_csv(path: Path) -> pd.DataFrame:
     """Load the sweep CSV, dropping any non-data banner lines."""
-    df = pd.read_csv(path)
+    df = pd.read_csv(path, on_bad_lines="skip")
     numeric = ["cp_size", "seq", "head_dim", "total_ms"]
     df[numeric] = df[numeric].apply(pd.to_numeric, errors="coerce")
     df = df.dropna(subset=numeric).reset_index(drop=True)
