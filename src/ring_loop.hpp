@@ -45,7 +45,7 @@ struct RingConfig {
   int head_dim;
   int kv_heads{0};  ///< KV head count for GQA/MQA; 0 means same as heads (MHA).
   bool causal;
-  bool zigzag;
+  int zigzag_n{0};  ///< 0 = disabled; N >= 2 = N-way zigzag (sub-groups per rank).
   bool verify;
   bool csv;
   RingMode mode;

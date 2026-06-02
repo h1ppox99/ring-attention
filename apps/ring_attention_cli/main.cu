@@ -67,7 +67,7 @@ struct Config {
   int head_dim = 64;
   int kv_heads = 0;  // 0 = MHA; set for GQA/MQA
   bool causal = false;
-  bool zigzag = false;
+  int zigzag_n = 0;  // 0 = disabled; N >= 2 = N-way zigzag
   // Default to the only mode worth running in production. The other two are
   // kept as baselines for the KERNEL_OPTIMIZATIONS.md comparison story; explicit
   // opt-in via --mode is required to select them.
@@ -103,9 +103,15 @@ Config parse_args(int argc, char** argv) {
       cfg.kv_heads = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--causal") && nxt)
       cfg.causal = std::atoi(argv[++i]) != 0;
-    else if (!std::strcmp(argv[i], "--zigzag") && nxt)
-      cfg.zigzag = std::atoi(argv[++i]) != 0;
-    else if (!std::strcmp(argv[i], "--mode") && nxt)
+    else if (!std::strcmp(argv[i], "--zigzag-n") && nxt)
+      cfg.zigzag_n = std::atoi(argv[++i]);
+    else if (!std::strcmp(argv[i], "--zigzag")) {
+      // Backward compat: --zigzag [0|1] or standalone --zigzag (→ 2-way).
+      if (nxt && (argv[i + 1][0] == '0' || argv[i + 1][0] == '1') && argv[i + 1][1] == '\0')
+        cfg.zigzag_n = (std::atoi(argv[++i]) != 0) ? 2 : 0;
+      else
+        cfg.zigzag_n = 2;
+    } else if (!std::strcmp(argv[i], "--mode") && nxt)
       cfg.mode = argv[++i];
     else if (!std::strcmp(argv[i], "--dtype") && nxt)
       cfg.dtype = argv[++i];
@@ -291,10 +297,10 @@ int main(int argc, char** argv) {
     if (rank == 0) fprintf(stderr, "ERROR: seq=%d not divisible by cp_size=%d\n", cfg.seq, cp_size);
     MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
   }
-  if (cfg.zigzag && cfg.seq % (2 * cp_size) != 0) {
+  if (cfg.zigzag_n > 0 && cfg.seq % (cfg.zigzag_n * cp_size) != 0) {
     if (rank == 0)
-      fprintf(stderr, "ERROR: zigzag requires seq=%d divisible by 2*cp_size=%d\n", cfg.seq,
-              2 * cp_size);
+      fprintf(stderr, "ERROR: --zigzag-n %d requires seq=%d divisible by %d*cp_size=%d\n",
+              cfg.zigzag_n, cfg.seq, cfg.zigzag_n, cfg.zigzag_n * cp_size);
     MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
   }
 
@@ -319,10 +325,9 @@ int main(int argc, char** argv) {
   MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
   printf(
       "rank %d/%d  local_rank %d  gpu %d  %-24s  local_shape=(B=%d H=%d Sq=%d D=%d)  "
-      "mode=%-14s  dtype=%-4s  causal=%d  zigzag=%d\n",
+      "mode=%-14s  dtype=%-4s  causal=%d  zigzag_n=%d\n",
       rank, cp_size, local_rank, device, prop.name, cfg.batch, cfg.heads, local_seq, cfg.head_dim,
-      cfg.mode.c_str(), cfg.dtype.c_str(), static_cast<int>(cfg.causal),
-      static_cast<int>(cfg.zigzag));
+      cfg.mode.c_str(), cfg.dtype.c_str(), static_cast<int>(cfg.causal), cfg.zigzag_n);
   fflush(stdout);
 
   // Run the attention (all modes dispatch through run_ring_attention).
@@ -335,7 +340,7 @@ int main(int argc, char** argv) {
   rcfg.head_dim = cfg.head_dim;
   rcfg.kv_heads = cfg.kv_heads;
   rcfg.causal = cfg.causal;
-  rcfg.zigzag = cfg.zigzag;
+  rcfg.zigzag_n = cfg.zigzag_n;
   rcfg.verify = cfg.verify;
   rcfg.csv = cfg.csv;
   rcfg.mode = ring_attention::mode_from_string(cfg.mode);
@@ -360,14 +365,14 @@ int main(int argc, char** argv) {
     // runs: `--csv` only.
     if (cfg.csv_header) {
       printf(
-          "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag,"
+          "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag_n,"
           "iters,comm_ms,comp_ms,wait_ms,total_ms,max_err\n");
     }
     if (cfg.csv) {
       printf("%s,%d,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.2e\n", cfg.mode.c_str(), cp_size,
              cfg.batch, cfg.heads, cfg.seq, cfg.head_dim, static_cast<int>(cfg.causal),
-             static_cast<int>(cfg.zigzag), cfg.iters, res.comm_ms, res.comp_ms, res.wait_ms,
-             res.total_ms, res.max_err);
+             cfg.zigzag_n, cfg.iters, res.comm_ms, res.comp_ms, res.wait_ms, res.total_ms,
+             res.max_err);
     }
   }
 
