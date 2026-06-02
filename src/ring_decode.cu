@@ -12,6 +12,8 @@
 ///     cached positions are admissible (online-softmax accumulates them
 ///     unmasked).
 
+#include <cuda_fp16.h>
+#include <math_constants.h>
 #include <mpi.h>
 
 #include <algorithm>
@@ -36,21 +38,46 @@ namespace ring_attention {
 
 namespace {
 
-/// Pack the populated `Sk` rows of the cache into a contiguous
-/// `(B, kv_H, Sk, D)` tile on the same stream.
-void pack_local_cache(const DeviceKVCache<float>& cache, float* k_dst, float* v_dst, int Sk,
-                      cudaStream_t stream) {
-  const int B = cache.batch();
-  const int kv_H = cache.kv_heads();
-  const int D = cache.head_dim();
-  const int S_max = cache.s_max();
-  const std::size_t width = static_cast<std::size_t>(Sk) * D * sizeof(float);
-  const std::size_t spitch = static_cast<std::size_t>(S_max) * D * sizeof(float);
-  const std::size_t height = static_cast<std::size_t>(B) * kv_H;
-  cudaCheck(cudaMemcpy2DAsync(k_dst, width, cache.k_data(), spitch, width, height,
-                              cudaMemcpyDeviceToDevice, stream));
-  cudaCheck(cudaMemcpy2DAsync(v_dst, width, cache.v_data(), spitch, width, height,
-                              cudaMemcpyDeviceToDevice, stream));
+/// Merge `cp_size` per-rank online-softmax partials into the global
+/// (O, m, l) using the FlashAttention partial-merge recurrence.
+///
+/// `gathered` is the all-gathered partial buffer, laid out as `cp_size`
+/// contiguous blocks of `B*H*(D+2)` floats: `[O (B*H*D) | m (B*H) | l (B*H)]`.
+/// O_r is the *unnormalized* weighted sum on rank r; m_r/l_r its running max
+/// and denominator. Output: `out` ← global unnormalized O, `m_out` ← global
+/// max, `l_out` ← global denominator (the caller then divides via
+/// `launch_attention_finalize`). One block per (b,h) row, `D` threads.
+__global__ void decode_partial_merge_kernel(const float* __restrict__ gathered,
+                                            float* __restrict__ out, float* __restrict__ m_out,
+                                            float* __restrict__ l_out, int cp_size, int BH, int D) {
+  const int bh = blockIdx.x;
+  const int d = threadIdx.x;
+  if (bh >= BH || d >= D) return;
+
+  const long block = (long)BH * D + 2 * BH;  // floats per rank
+  const long o_base = (long)bh * D + d;
+  const int m_off = BH * D + bh;
+  const int l_off = BH * D + BH + bh;
+
+  // Global max over ranks (every thread recomputes — cheap, cp_size is small).
+  float m_max = -CUDART_INF_F;
+  for (int r = 0; r < cp_size; ++r) {
+    const float m_r = gathered[(long)r * block + m_off];
+    m_max = fmaxf(m_max, m_r);
+  }
+
+  float o_acc = 0.f, l_acc = 0.f;
+  for (int r = 0; r < cp_size; ++r) {
+    const float m_r = gathered[(long)r * block + m_off];
+    const float scale = (m_r == -CUDART_INF_F) ? 0.f : __expf(m_r - m_max);
+    o_acc += scale * gathered[(long)r * block + o_base];
+    if (d == 0) l_acc += scale * gathered[(long)r * block + l_off];
+  }
+  out[(long)bh * D + d] = o_acc;
+  if (d == 0) {
+    m_out[bh] = m_max;
+    l_out[bh] = l_acc;
+  }
 }
 
 }  // namespace
@@ -97,28 +124,30 @@ RingResult run_ring_decode_step(const RingDecodeConfig& cfg, const float* q, con
     MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
   }
 
-  // 2. Allocate transit buffers sized for the largest chunk across ranks.
-  const int max_chunk = *std::max_element(current_len_per_rank.begin(), current_len_per_rank.end());
-  const std::size_t transit_elem = static_cast<std::size_t>(B) * kv_H * max_chunk * D;
-  DeviceTensor<float> K_a(transit_elem), K_b(transit_elem);
-  DeviceTensor<float> V_a(transit_elem), V_b(transit_elem);
-  float* K_cur = K_a.data();
-  float* V_cur = V_a.data();
-  float* K_recv = K_b.data();
-  float* V_recv = V_b.data();
+  // 2. Compute this rank's local partial, then merge partials across ranks.
+  //    Q is a single token replicated on every rank and the KV is sharded, so
+  //    instead of rotating the (large) KV around the ring we keep KV resident
+  //    and compute attention(q, local_shard) -> partial (O, m, l) locally. The
+  //    partials are then all-gathered (a few KB) and merged with the
+  //    FlashAttention recurrence. Online softmax is associative, so this is
+  //    bit-for-bit the sequential ring's accumulation but moves ~B*H*(D+2)
+  //    floats per rank instead of the whole KV shard each step — at cp_size=8
+  //    that is ~33 KB total vs. tens of MB.  See KERNEL_OPTIMIZATIONS.md
+  //    Round 13.
+  const int local_len = current_len_per_rank[rank];
 
-  // 3. Pack local cache into K_cur/V_cur.
-  pack_local_cache(cache, K_cur, V_cur, current_len_per_rank[rank], 0);
-
-  // 4. Init online-softmax state for one query row.
-  AttentionShape init_sh{B, H, 1, current_len_per_rank[rank], D};
+  // Online-softmax state for one query row.
+  AttentionShape init_sh{B, H, 1, local_len, D};
   init_sh.kv_heads = kv_H;
   const std::size_t m_count = static_cast<std::size_t>(B) * H;
   DeviceTensor<float> m_d(m_count), l_d(m_count);
   launch_attention_init(out, m_d.data(), l_d.data(), init_sh, m_count, 0);
 
-  const int next_rank = (rank + 1) % cp_size;
-  const int prev_rank = (rank + cp_size - 1) % cp_size;
+  // Partial layout for the all-gather: [O (B*H*D) | m (B*H) | l (B*H)].
+  const int BH = B * H;
+  const std::size_t partial_elem = static_cast<std::size_t>(BH) * D + 2 * BH;
+  DeviceTensor<float> send_partial(partial_elem);
+  DeviceTensor<float> recv_partials(partial_elem * cp_size);
 
   cudaEvent_t ev_comm_start, ev_comm_end, ev_comp_start, ev_comp_end;
   cudaEventCreate(&ev_comm_start);
@@ -126,59 +155,49 @@ RingResult run_ring_decode_step(const RingDecodeConfig& cfg, const float* q, con
   cudaEventCreate(&ev_comp_start);
   cudaEventCreate(&ev_comp_end);
 
+  // Leading barrier aligns the ranks before the collective all-gather. It is
+  // not pure overhead: without it, inter-token rank skew falls into the timed
+  // all-gather and *raises* the measured per-token latency (Round 15 tried
+  // removing it and regressed cp4 0.232 -> 0.388 ms — see
+  // KERNEL_OPTIMIZATIONS.md).
   MPI_Barrier(MPI_COMM_WORLD);
   const double t_start = MPI_Wtime();
-  double comm_acc = 0.0, comp_acc = 0.0;
 
-  // 5. Ring loop: cp_size steps. At step s, K_cur holds the chunk originating
-  //    from rank `o = (rank - s + cp_size) % cp_size`. We send K_cur to next
-  //    (which will use it at step s+1) and receive K_recv from prev (the chunk
-  //    we'll use at step s+1).
-  for (int step = 0; step < cp_size; ++step) {
-    const int origin = (rank - step + cp_size) % cp_size;
-    const int chunk_len = current_len_per_rank[origin];
+  // 3. Local partial: attention(q, local KV shard). The decode kernel reads the
+  //    KV cache *in place* (per-head row stride = cache.s_max()), so there is
+  //    no per-token de-stride pack copy (Round 17). Leaves (out, m_d, l_d) as
+  //    the *unnormalized* online-softmax partial (no finalize yet).
+  AttentionShape step_sh{B, H, 1, local_len, D};
+  step_sh.kv_heads = kv_H;
+  cudaEventRecord(ev_comp_start, 0);
+  launch_attention_decode_step(q, cache.k_data(), cache.v_data(), out, m_d.data(), l_d.data(),
+                               step_sh, /*q_offset=*/0, /*k_offset=*/0, /*causal=*/false,
+                               /*stream=*/0, /*kv_row_stride=*/cache.s_max());
+  cudaEventRecord(ev_comp_end, 0);
 
-    // 5a. Comm: send K_cur, recv into K_recv (skip on last step).
-    if (step < cp_size - 1) {
-      const int next_origin = (rank - step - 1 + cp_size) % cp_size;
-      const int recv_chunk_len = current_len_per_rank[next_origin];
-      const std::size_t send_count = static_cast<std::size_t>(B) * kv_H * chunk_len * D;
-      const std::size_t recv_count = static_cast<std::size_t>(B) * kv_H * recv_chunk_len * D;
+  // 4. Pack the partial contiguously and all-gather it across the ring.
+  cudaCheck(cudaMemcpyAsync(send_partial.data(), out, (std::size_t)BH * D * sizeof(float),
+                            cudaMemcpyDeviceToDevice, 0));
+  cudaCheck(cudaMemcpyAsync(send_partial.data() + (std::size_t)BH * D, m_d.data(),
+                            (std::size_t)BH * sizeof(float), cudaMemcpyDeviceToDevice, 0));
+  cudaCheck(cudaMemcpyAsync(send_partial.data() + (std::size_t)BH * D + BH, l_d.data(),
+                            (std::size_t)BH * sizeof(float), cudaMemcpyDeviceToDevice, 0));
 
-      cudaEventRecord(ev_comm_start, 0);
-      ncclGroupStart();
-      NCCL_CHECK(ncclSend(K_cur, send_count, ncclFloat, next_rank, cfg.nccl_comm, 0));
-      NCCL_CHECK(ncclRecv(K_recv, recv_count, ncclFloat, prev_rank, cfg.nccl_comm, 0));
-      NCCL_CHECK(ncclSend(V_cur, send_count, ncclFloat, next_rank, cfg.nccl_comm, 0));
-      NCCL_CHECK(ncclRecv(V_recv, recv_count, ncclFloat, prev_rank, cfg.nccl_comm, 0));
-      NCCL_CHECK(ncclGroupEnd());
-      cudaEventRecord(ev_comm_end, 0);
-    }
+  cudaEventRecord(ev_comm_start, 0);
+  NCCL_CHECK(ncclAllGather(send_partial.data(), recv_partials.data(), partial_elem, ncclFloat,
+                           cfg.nccl_comm, 0));
+  cudaEventRecord(ev_comm_end, 0);
 
-    // 5b. Compute: launch_attention_step over the current chunk.
-    AttentionShape step_sh{B, H, 1, chunk_len, D};
-    step_sh.kv_heads = kv_H;
-    cudaEventRecord(ev_comp_start, 0);
-    launch_attention_step(q, K_cur, V_cur, out, m_d.data(), l_d.data(), step_sh,
-                          /*q_offset=*/0, /*k_offset=*/0, /*causal=*/false, 0);
-    cudaEventRecord(ev_comp_end, 0);
-    cudaEventSynchronize(ev_comp_end);
-
-    float comp_ms = 0.f;
-    cudaEventElapsedTime(&comp_ms, ev_comp_start, ev_comp_end);
-    comp_acc += comp_ms;
-    if (step < cp_size - 1) {
-      float comm_ms = 0.f;
-      cudaEventElapsedTime(&comm_ms, ev_comm_start, ev_comm_end);
-      comm_acc += comm_ms;
-    }
-
-    // 5c. Promote received → current for next step.
-    std::swap(K_cur, K_recv);
-    std::swap(V_cur, V_recv);
+  // 5. Merge the cp_size partials -> global (O, m, l), then finalize (O / l).
+  {
+    const dim3 grid(BH);
+    const dim3 block(D);
+    // clang-format off
+    decode_partial_merge_kernel<<<grid, block, 0, 0>>>(recv_partials.data(), out, m_d.data(),
+                                                       l_d.data(), cp_size, BH, D);
+    // clang-format on
+    cudaCheck(cudaGetLastError());
   }
-
-  // 6. Finalize: divide out by accumulated softmax denominator.
   AttentionShape final_sh{B, H, 1, 1, D};
   final_sh.kv_heads = kv_H;
   launch_attention_finalize(out, l_d.data(), final_sh, 0);
@@ -187,14 +206,18 @@ RingResult run_ring_decode_step(const RingDecodeConfig& cfg, const float* q, con
   MPI_Barrier(MPI_COMM_WORLD);
   const double t_end = MPI_Wtime();
 
+  float comp_ms = 0.f, comm_ms = 0.f;
+  cudaEventElapsedTime(&comp_ms, ev_comp_start, ev_comp_end);
+  cudaEventElapsedTime(&comm_ms, ev_comm_start, ev_comm_end);
+
   cudaEventDestroy(ev_comm_start);
   cudaEventDestroy(ev_comm_end);
   cudaEventDestroy(ev_comp_start);
   cudaEventDestroy(ev_comp_end);
 
   RingResult res;
-  res.comm_ms = comm_acc;
-  res.comp_ms = comp_acc;
+  res.comm_ms = comm_ms;
+  res.comp_ms = comp_ms;
   res.wait_ms = 0.0;
   res.total_ms = (t_end - t_start) * 1e3;
   res.max_err = -1.f;
