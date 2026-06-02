@@ -106,12 +106,17 @@ __global__ void finalize_kernel(float* O, const float* L, int H, int Sq, int D) 
 ///                  with the local `j` index to recover `j_global` for the
 ///                  causal predicate. Lets the ring pass non-contiguous chunks
 ///                  (e.g. zig-zag) without changing the kernel.
+/// @param pos_stride Spacing between consecutive local rows in global-position
+///                  space. 1 for contiguous/zigzag (each chunk is a contiguous
+///                  run); cp_size for striped (row i sits at offset+i*cp_size).
+///                  Global positions are `q_offset + i_local*pos_stride` (query)
+///                  and `k_offset + j*pos_stride` (key).
 template <int BR, int BC, int D>
 __global__ void attention_step_kernel(const float* __restrict__ Q, const float* __restrict__ K,
                                       const float* __restrict__ V, float* __restrict__ O,
                                       float* __restrict__ M, float* __restrict__ L, int H, int kv_H,
                                       int Sq, int Sk, float scale, bool causal, int q_offset,
-                                      int k_offset) {
+                                      int k_offset, int pos_stride) {
   static_assert(D % 4 == 0, "D must be a multiple of 4 for float4 K/V loads.");
   static_assert((BC * D) % (BR * 4) == 0,
                 "Cooperative float4 K/V load assumes BC*D/4 divides evenly across BR threads.");
@@ -157,7 +162,7 @@ __global__ void attention_step_kernel(const float* __restrict__ Q, const float* 
     for (int d = 0; d < D; ++d) O_i[d] = 0.0f;
   }
 
-  const int i_global = q_offset + i_local;
+  const int i_global = q_offset + i_local * pos_stride;
   const int num_k_tiles = (Sk + BC - 1) / BC;
 
   // Each float4 iteration moves 4 contiguous floats of K (and V) from global
@@ -220,7 +225,7 @@ __global__ void attention_step_kernel(const float* __restrict__ Q, const float* 
 #pragma unroll
     for (int j = 0; j < BC; ++j) {
       const int j_local_in_chunk = j_base + j;
-      const int j_global = k_offset + j_local_in_chunk;
+      const int j_global = k_offset + j_local_in_chunk * pos_stride;
       const bool visible = (j_local_in_chunk < Sk) && (!causal || (j_global <= i_global));
       if (visible) {
         s[j] *= scale;
@@ -279,14 +284,14 @@ __global__ void attention_step_kernel(const float* __restrict__ Q, const float* 
 template <int BR, int BC, int D>
 void launch_step_typed(const float* q, const float* k, const float* v, float* out, float* m,
                        float* l, const AttentionShape& shape, int q_offset, int k_offset,
-                       bool causal, cudaStream_t stream) {
+                       int pos_stride, bool causal, cudaStream_t stream) {
   const dim3 grid(ceil_div(shape.seq_q, BR), shape.heads, shape.batch);
   const dim3 block(BR);
   const int kv_H = (shape.kv_heads > 0) ? shape.kv_heads : shape.heads;
   const float scale = 1.0f / std::sqrt(static_cast<float>(D));
-  attention_step_kernel<BR, BC, D><<<grid, block, 0, stream>>>(q, k, v, out, m, l, shape.heads,
-                                                               kv_H, shape.seq_q, shape.seq_k,
-                                                               scale, causal, q_offset, k_offset);
+  attention_step_kernel<BR, BC, D>
+      <<<grid, block, 0, stream>>>(q, k, v, out, m, l, shape.heads, kv_H, shape.seq_q, shape.seq_k,
+                                   scale, causal, q_offset, k_offset, pos_stride);
   cudaCheck(cudaGetLastError());
 }
 
@@ -304,9 +309,10 @@ void launch_attention_init(float* out, float* m, float* l, const AttentionShape&
 
 void launch_attention_step(const float* q, const float* k, const float* v, float* out, float* m,
                            float* l, const AttentionShape& shape, int q_offset, int k_offset,
-                           bool causal, cudaStream_t stream) {
+                           bool causal, cudaStream_t stream, int pos_stride) {
   // Decode regime: one query row, fall through to the warp-cooperative kernel
-  // (see attention_decode.cu / KERNEL_OPTIMIZATIONS.md Round 5).
+  // (see attention_decode.cu / KERNEL_OPTIMIZATIONS.md Round 5). Decode is never
+  // strided (single query), so pos_stride does not apply there.
   if (shape.seq_q == 1) {
     launch_attention_decode_step(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
     return;
@@ -318,16 +324,20 @@ void launch_attention_step(const float* q, const float* k, const float* v, float
   // would multiply local-memory traffic across more threads.
   switch (shape.head_dim) {
     case 32:
-      launch_step_typed<128, 64, 32>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_step_typed<128, 64, 32>(q, k, v, out, m, l, shape, q_offset, k_offset, pos_stride,
+                                     causal, stream);
       break;
     case 64:
-      launch_step_typed<64, 32, 64>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_step_typed<64, 32, 64>(q, k, v, out, m, l, shape, q_offset, k_offset, pos_stride,
+                                    causal, stream);
       break;
     case 128:
-      launch_step_typed<64, 16, 128>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_step_typed<64, 16, 128>(q, k, v, out, m, l, shape, q_offset, k_offset, pos_stride,
+                                     causal, stream);
       break;
     case 256:
-      launch_step_typed<16, 8, 256>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_step_typed<16, 8, 256>(q, k, v, out, m, l, shape, q_offset, k_offset, pos_stride,
+                                    causal, stream);
       break;
     default:
       fprintf(stderr, "attention_step: unsupported head_dim=%d (supported: 32, 64, 128, 256)\n",

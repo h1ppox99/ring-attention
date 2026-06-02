@@ -41,6 +41,41 @@ def zigzag_indices(seq_len: int, cp_size: int) -> torch.Tensor:
     return torch.stack([lows, highs], dim=-1).reshape(cp_size, -1)
 
 
+def striped_indices(seq_len: int, cp_size: int) -> torch.Tensor:
+    """Token indices owned by each rank under striped assignment.
+
+    Token ``i`` is assigned to rank ``i % cp_size``, so rank ``r`` owns the
+    arithmetic progression ``r, r + cp_size, r + 2*cp_size, …``. Like zig-zag
+    this balances per-rank work under a causal mask, but with a single
+    contiguous-in-local-memory shard whose *global* positions are strided.
+
+    Parameters
+    ----------
+    seq_len : int
+        Total sequence length; must be divisible by ``cp_size``.
+    cp_size : int
+        Number of ranks in the ring.
+
+    Returns
+    -------
+    torch.Tensor
+        ``LongTensor`` of shape ``(cp_size, seq_len // cp_size)`` where row ``r``
+        lists the original token positions assigned to rank ``r``, i.e.
+        ``indices[r, j] = r + j * cp_size``.
+
+    Raises
+    ------
+    ValueError
+        If ``seq_len`` is not divisible by ``cp_size``.
+    """
+    if seq_len % cp_size != 0:
+        raise ValueError(f"seq_len={seq_len} must be divisible by cp_size={cp_size}")
+    shard_len = seq_len // cp_size
+    ranks = torch.arange(cp_size).unsqueeze(1)  # (cp_size, 1)
+    cols = torch.arange(shard_len).unsqueeze(0)  # (1, shard_len)
+    return ranks + cols * cp_size  # (cp_size, shard_len)
+
+
 def partition(x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
     """Gather tensor slices along the sequence dim per rank.
 

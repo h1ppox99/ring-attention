@@ -70,7 +70,8 @@ mpirun -n 2 ./build/release/apps/ring_attention_cli/ring_attention_cli \
 
 **Flags**:
 - `--causal 1` — apply lower-triangular mask.
-- `--zigzag 1` — interleave token assignment so each rank gets balanced work under a causal mask (requires `seq` divisible by `2 * cp_size`).
+- `--zigzag 1` — interleave token assignment (two contiguous sub-groups per rank) so each rank gets balanced work under a causal mask (requires `seq` divisible by `2 * cp_size`).
+- `--striped 1` — striped token assignment: token `i` goes to rank `i % cp_size`, so each rank owns positions `r, r+cp_size, r+2*cp_size, …`. Like `--zigzag` it balances causal-mask work, but as a single strided shard and with a near-uniform per-ring-step mask (requires `seq` divisible by `cp_size`). Mutually exclusive with `--zigzag`; not supported with `--mode allgather`.
 - `--dtype {fp32,fp16}` — select compute/input precision. Use `fp16` to exercise the Tensor-Core path (half-precision K/V on the wire and in the kernel, fp32 online-softmax accumulators); `fp32` for the full-precision baseline. Default is `fp32`.
 - `--verify` — re-run a CPU reference pass and report max absolute error.
 - `--csv` — emit one CSV result line; pair with `--csv-header` on the first invocation when appending many runs to a file.

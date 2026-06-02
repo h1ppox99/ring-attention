@@ -226,6 +226,68 @@ void test_zigzag_partition_cover() {
   printf("test_zigzag_partition_cover OK\n");
 }
 
+/// Striped mode: single sub-group, q_offset == rank, k_offset == source rank,
+/// and position_stride == cp_size (local row i sits at global rank + i*cp_size).
+void test_striped_offsets_4ranks() {
+  const int cp_size = 4, seq = 32;  // chunk = seq/cp_size = 8 local rows per rank
+  for (int r = 0; r < cp_size; ++r) {
+    RingPartition p(cp_size, r, seq, RingPartition::Mode::Striped);
+    check(p.num_sub_groups() == 1, "striped: 1 sub-group");
+    check(p.local_chunk_len() == seq / cp_size, "striped: chunk = seq/cp_size");
+    check(p.position_stride() == cp_size, "striped: stride = cp_size");
+    check(p.q_offset() == r, "striped q_offset == rank");
+    for (int step = 0; step < cp_size; ++step) {
+      const int src = (r - step + cp_size) % cp_size;
+      char m[80];
+      std::snprintf(m, sizeof(m), "striped r=%d step=%d k_offset == source", r, step);
+      check(p.k_offset_for_step(step) == src, m);
+    }
+  }
+  printf("test_striped_offsets_4ranks OK\n");
+}
+
+/// Striped: at step 0 the held K is the rank's own (k_offset == q_offset).
+void test_striped_step0_own() {
+  for (int cp_size : {1, 2, 4}) {
+    const int seq = cp_size * 32;
+    for (int r = 0; r < cp_size; ++r) {
+      RingPartition p(cp_size, r, seq, RingPartition::Mode::Striped);
+      check(p.k_offset_for_step(0) == p.q_offset(), "striped step 0 == q_offset");
+    }
+  }
+  printf("test_striped_step0_own OK\n");
+}
+
+/// Striped: expanding every rank's affine progression (q_offset + j*stride for
+/// j in [0, chunk)) must cover all seq positions exactly once.
+void test_striped_partition_cover() {
+  const int cp_size = 4, seq = 32;
+  const int chunk = seq / cp_size;
+  std::set<int> seen;
+  for (int r = 0; r < cp_size; ++r) {
+    RingPartition p(cp_size, r, seq, RingPartition::Mode::Striped);
+    const int base = p.q_offset();
+    const int stride = p.position_stride();
+    for (int j = 0; j < chunk; ++j) {
+      const int pos = base + j * stride;
+      check(seen.count(pos) == 0, "striped: no duplicate position");
+      check(pos >= 0 && pos < seq, "striped: position in range");
+      seen.insert(pos);
+    }
+  }
+  check(static_cast<int>(seen.size()) == seq, "striped: all positions covered");
+  printf("test_striped_partition_cover OK\n");
+}
+
+/// Contiguous and Zigzag both have position_stride == 1 (contiguous runs).
+void test_position_stride_default() {
+  RingPartition c(4, 0, 32, RingPartition::Mode::Contiguous);
+  check(c.position_stride() == 1, "contiguous stride == 1");
+  RingPartition z(4, 0, 32, RingPartition::Mode::Zigzag);
+  check(z.position_stride() == 1, "zigzag stride == 1");
+  printf("test_position_stride_default OK\n");
+}
+
 }  // namespace
 
 int main() {
@@ -241,6 +303,10 @@ int main() {
   test_zigzag_step0_own();
   test_k_offset_for_source_matches_step();
   test_zigzag_partition_cover();
+  test_striped_offsets_4ranks();
+  test_striped_step0_own();
+  test_striped_partition_cover();
+  test_position_stride_default();
   printf("All ring_partition tests passed.\n");
   return 0;
 }

@@ -19,7 +19,7 @@ import torch
 from torch.nn.functional import scaled_dot_product_attention
 
 from ring_attention_ref.oracle import full_attention
-from ring_attention_ref.zigzag import partition, zigzag_indices
+from ring_attention_ref.zigzag import partition, striped_indices, zigzag_indices
 
 
 @dataclass
@@ -79,6 +79,7 @@ def prefill(
     cp_size: int,
     causal: bool,
     zig_zag: bool,
+    striped: bool = False,
     s_max: int | None = None,
 ) -> tuple[torch.Tensor, KVCache]:
     """Run full prefill and return per-rank output shards plus populated cache.
@@ -95,6 +96,9 @@ def prefill(
     zig_zag : bool
         Use zig-zag token assignment for load balance; otherwise contiguous
         blocks.
+    striped : bool, optional
+        Use striped token assignment (token ``i`` -> rank ``i % cp_size``).
+        Mutually exclusive with ``zig_zag``. Defaults to ``False``.
     s_max : int, optional
         Cache capacity per rank. Defaults to ``seq // cp_size`` (no decode
         headroom); pass a larger value to leave room for decoded tokens.
@@ -122,6 +126,8 @@ def prefill(
         )
     if seq % cp_size != 0:
         raise ValueError(f"seq_len={seq} must be divisible by cp_size={cp_size}")
+    if zig_zag and striped:
+        raise ValueError("zig_zag and striped are mutually exclusive (pick one scheme)")
     s_r = seq // cp_size
     if s_max is None:
         s_max = s_r
@@ -129,8 +135,11 @@ def prefill(
         raise ValueError(f"s_max={s_max} must be >= seq/cp_size={s_r}")
 
     full_out = full_attention(q, k, v, causal=causal)
-    if zig_zag:
-        idx = zigzag_indices(seq, cp_size=cp_size)
+    if zig_zag or striped:
+        if zig_zag:
+            idx = zigzag_indices(seq, cp_size=cp_size)
+        else:
+            idx = striped_indices(seq, cp_size=cp_size)
         out_shards = partition(full_out, idx)
         k_shards = partition(k, idx)
         v_shards = partition(v, idx)

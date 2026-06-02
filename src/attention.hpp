@@ -77,17 +77,21 @@ void launch_attention_init(float* out, float* m, float* l, const AttentionShape&
 /// the persistent `(out, m, l)` state in place using the FlashAttention online
 /// softmax recurrence. `shape.seq_k` describes the chunk only.
 ///
-/// Global token positions are `(q_offset + i)` for queries and
-/// `(k_offset + j)` for keys; causal masking visibility is
-/// `k_offset + j <= q_offset + i`.
+/// Global token positions are `(q_offset + i*pos_stride)` for queries and
+/// `(k_offset + j*pos_stride)` for keys; causal masking visibility is
+/// `k_offset + j*pos_stride <= q_offset + i*pos_stride`. `pos_stride` defaults
+/// to 1 (contiguous / zig-zag chunks, where consecutive local rows are
+/// consecutive global positions); pass `cp_size` for striped partitioning,
+/// where rank r owns global positions r, r+cp_size, r+2*cp_size, …
 ///
 /// When `shape.seq_q == 1` this dispatches automatically to the
 /// `launch_attention_decode_step` kernel, which is structurally different
 /// (one warp per (B,H) row, lane-split D, no shared memory) — see
-/// `src/attention_decode.cu` and KERNEL_OPTIMIZATIONS.md Round 5.
+/// `src/attention_decode.cu` and KERNEL_OPTIMIZATIONS.md Round 5. Decode is a
+/// single query row, so `pos_stride` does not apply there.
 void launch_attention_step(const float* q, const float* k, const float* v, float* out, float* m,
                            float* l, const AttentionShape& shape, int q_offset, int k_offset,
-                           bool causal, cudaStream_t stream = 0);
+                           bool causal, cudaStream_t stream = 0, int pos_stride = 1);
 
 /// Decode-specialized step kernel — `seq_q = 1`, one warp per `(batch, head)`.
 /// Same `(M, L, O)` persistent-state semantics as `launch_attention_step` so
@@ -117,7 +121,8 @@ void launch_attention_finalize(float* out, const float* l, const AttentionShape&
 /// Supported `head_dim`: 32, 64, 128. Requires sm_70+.
 void launch_attention_step_fp16(const __half* q, const __half* k, const __half* v, float* out,
                                 float* m, float* l, const AttentionShape& shape, int q_offset,
-                                int k_offset, bool causal, cudaStream_t stream = 0);
+                                int k_offset, bool causal, cudaStream_t stream = 0,
+                                int pos_stride = 1);
 
 /// Element-wise FP32 → FP16 cast on the device. Used to stage Q (and K/V in
 /// tests) into the FP16 path without a CPU round-trip.

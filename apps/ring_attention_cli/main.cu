@@ -68,6 +68,7 @@ struct Config {
   int kv_heads = 0;  // 0 = MHA; set for GQA/MQA
   bool causal = false;
   bool zigzag = false;
+  bool striped = false;  // striped partitioning (token i -> rank i%cp); excl. with zigzag
   // Default to the only mode worth running in production. The other two are
   // kept as baselines for the KERNEL_OPTIMIZATIONS.md comparison story; explicit
   // opt-in via --mode is required to select them.
@@ -105,6 +106,8 @@ Config parse_args(int argc, char** argv) {
       cfg.causal = std::atoi(argv[++i]) != 0;
     else if (!std::strcmp(argv[i], "--zigzag") && nxt)
       cfg.zigzag = std::atoi(argv[++i]) != 0;
+    else if (!std::strcmp(argv[i], "--striped") && nxt)
+      cfg.striped = std::atoi(argv[++i]) != 0;
     else if (!std::strcmp(argv[i], "--mode") && nxt)
       cfg.mode = argv[++i];
     else if (!std::strcmp(argv[i], "--dtype") && nxt)
@@ -297,6 +300,13 @@ int main(int argc, char** argv) {
               2 * cp_size);
     MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
   }
+  if (cfg.zigzag && cfg.striped) {
+    if (rank == 0)
+      fprintf(stderr, "ERROR: --zigzag and --striped are mutually exclusive (pick one)\n");
+    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+  }
+  // Striped only needs seq divisible by cp_size (checked above) — token i goes
+  // to rank i%cp_size, so each rank owns exactly seq/cp_size tokens.
 
   // Decode mode short-circuits prefill: it runs its own synthetic benchmark
   // against a pre-populated cache. Correctness is owned by test_ring_decode;
@@ -319,10 +329,10 @@ int main(int argc, char** argv) {
   MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
   printf(
       "rank %d/%d  local_rank %d  gpu %d  %-24s  local_shape=(B=%d H=%d Sq=%d D=%d)  "
-      "mode=%-14s  dtype=%-4s  causal=%d  zigzag=%d\n",
+      "mode=%-14s  dtype=%-4s  causal=%d  zigzag=%d  striped=%d\n",
       rank, cp_size, local_rank, device, prop.name, cfg.batch, cfg.heads, local_seq, cfg.head_dim,
       cfg.mode.c_str(), cfg.dtype.c_str(), static_cast<int>(cfg.causal),
-      static_cast<int>(cfg.zigzag));
+      static_cast<int>(cfg.zigzag), static_cast<int>(cfg.striped));
   fflush(stdout);
 
   // Run the attention (all modes dispatch through run_ring_attention).
@@ -336,6 +346,7 @@ int main(int argc, char** argv) {
   rcfg.kv_heads = cfg.kv_heads;
   rcfg.causal = cfg.causal;
   rcfg.zigzag = cfg.zigzag;
+  rcfg.striped = cfg.striped;
   rcfg.verify = cfg.verify;
   rcfg.csv = cfg.csv;
   rcfg.mode = ring_attention::mode_from_string(cfg.mode);
@@ -360,14 +371,14 @@ int main(int argc, char** argv) {
     // runs: `--csv` only.
     if (cfg.csv_header) {
       printf(
-          "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag,"
+          "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag,striped,"
           "iters,comm_ms,comp_ms,wait_ms,total_ms,max_err\n");
     }
     if (cfg.csv) {
-      printf("%s,%d,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.2e\n", cfg.mode.c_str(), cp_size,
+      printf("%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.2e\n", cfg.mode.c_str(), cp_size,
              cfg.batch, cfg.heads, cfg.seq, cfg.head_dim, static_cast<int>(cfg.causal),
-             static_cast<int>(cfg.zigzag), cfg.iters, res.comm_ms, res.comp_ms, res.wait_ms,
-             res.total_ms, res.max_err);
+             static_cast<int>(cfg.zigzag), static_cast<int>(cfg.striped), cfg.iters, res.comm_ms,
+             res.comp_ms, res.wait_ms, res.total_ms, res.max_err);
     }
   }
 

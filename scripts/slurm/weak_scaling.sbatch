@@ -24,7 +24,7 @@
 # cp_size values larger than the allocation (nodes*4) are skipped.
 #
 # Output: results/bench_weak.csv  (same schema as bench_ring.csv)
-#   columns: mode,cp_size,batch,heads,seq,head_dim,causal,zigzag,iters,
+#   columns: mode,cp_size,batch,heads,seq,head_dim,causal,zigzag,striped,iters,
 #            comm_ms,comp_ms,wait_ms,total_ms,max_err
 
 set -euo pipefail
@@ -50,7 +50,7 @@ echo "nodes=${NNODES}  max cp_size=${MAX_CP}  nodelist=${SLURM_JOB_NODELIST:-?}"
 PER_RANK=4096
 ITERS=20
 
-echo "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag,iters,comm_ms,comp_ms,wait_ms,total_ms,max_err" \
+echo "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag,striped,iters,comm_ms,comp_ms,wait_ms,total_ms,max_err" \
   > "${CSV}"
 
 # Production config: ring-overlap, causal, zigzag.
