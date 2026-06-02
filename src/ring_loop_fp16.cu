@@ -241,10 +241,12 @@ ring_attention::RingResult run_ring_blocking_fp16(const ring_attention::RingConf
   const int kv_H = (cfg.kv_heads > 0) ? cfg.kv_heads : cfg.heads;
   const int S = cfg.seq, P = cfg.cp_size, R = cfg.rank;
 
-  const RingPartition::Mode mode =
-      cfg.zigzag_n > 0 ? RingPartition::Mode::Zigzag : RingPartition::Mode::Contiguous;
+  const RingPartition::Mode mode = cfg.striped       ? RingPartition::Mode::Striped
+                                   : cfg.zigzag_n > 0 ? RingPartition::Mode::Zigzag
+                                                      : RingPartition::Mode::Contiguous;
   const int n_splits = zigzag_sub_groups(cfg.zigzag_n);
   RingPartition part(P, R, S, mode, n_splits);
+  const int stride = part.position_stride();  // 1 (contiguous/zigzag) or cp_size (striped)
   const int nsg = part.num_sub_groups();
   const int Sl = part.local_chunk_len();
   const int Sl_local = Sl * nsg;
@@ -266,7 +268,7 @@ ring_attention::RingResult run_ring_blocking_fp16(const ring_attention::RingConf
         for (int s = 0; s < Sl; ++s)
           for (int d = 0; d < D; ++d)
             buf[off + (static_cast<std::size_t>(b * H + h) * Sl + s) * D + d] =
-                gen_elem(cfg.seed, tid, b, h, gss + s, d);
+                gen_elem(cfg.seed, tid, b, h, gss + s * stride, d);
   };
 
   auto fill_kv_into = [&](std::vector<float>& buf, int tid, std::size_t off, int gss) {
@@ -275,7 +277,7 @@ ring_attention::RingResult run_ring_blocking_fp16(const ring_attention::RingConf
         for (int s = 0; s < Sl; ++s)
           for (int d = 0; d < D; ++d)
             buf[off + (static_cast<std::size_t>(b * kv_H + h) * Sl + s) * D + d] =
-                gen_elem(cfg.seed, tid, b, h, gss + s, d);
+                gen_elem(cfg.seed, tid, b, h, gss + s * stride, d);
   };
 
   std::vector<float> q_h(q_local_elem), k_h_init(kv_local_elem), v_h_init(kv_local_elem);
@@ -372,11 +374,14 @@ ring_attention::RingResult run_ring_blocking_fp16(const ring_attention::RingConf
         for (int sg_k = 0; sg_k < nsg; ++sg_k) {
           const int q_off_sg = part.q_offset(sg_q);
           const int k_off_sg = part.k_offset_for_step(step, sg_k);
-          if (cfg.causal && k_off_sg > q_off_sg + Sl - 1) continue;
+          // See ring_loop.cu: the last local row is at q_off_sg + (Sl-1)*stride,
+          // so the full-block prune bound scales with stride (striped blocks
+          // interleave and are almost never fully maskable).
+          if (cfg.causal && k_off_sg > q_off_sg + (Sl - 1) * stride) continue;
           launch_attention_step_fp16(q_d.data() + sg_q * q_sg_elem, K_cur + sg_k * kv_sg_elem,
                                      V_cur + sg_k * kv_sg_elem, out_d.data() + sg_q * q_sg_elem,
                                      m_d.data() + sg_q * m_sg, l_d.data() + sg_q * m_sg, sg_shape,
-                                     q_off_sg, k_off_sg, cfg.causal);
+                                     q_off_sg, k_off_sg, cfg.causal, /*stream=*/0, stride);
         }
       }
       cudaEventRecord(ev1);
@@ -479,12 +484,17 @@ ring_attention::RingResult run_ring_blocking_fp16(const ring_attention::RingConf
       const int q_off_sg = part.q_offset(sg);
       for (int b = 0; b < B; ++b)
         for (int h = 0; h < H; ++h) {
-          const float* cpu_slice =
-              cpu_out.data() + (static_cast<std::size_t>(b * H + h) * S + q_off_sg) * D;
+          const float* cpu_head = cpu_out.data() + static_cast<std::size_t>(b * H + h) * S * D;
           const float* dev_slice =
               dev_out_h.data() + sg * q_sg_elem + static_cast<std::size_t>(b * H + h) * Sl * D;
-          for (int e = 0; e < Sl * D; ++e)
-            max_err = std::max(max_err, std::abs(cpu_slice[e] - dev_slice[e]));
+          // Local row s maps to global row q_off_sg + s*stride (stride=1 for
+          // contiguous/zigzag, cp_size for striped).
+          for (int s = 0; s < Sl; ++s) {
+            const float* cpu_row = cpu_head + static_cast<std::size_t>(q_off_sg + s * stride) * D;
+            const float* dev_row = dev_slice + static_cast<std::size_t>(s) * D;
+            for (int d = 0; d < D; ++d)
+              max_err = std::max(max_err, std::abs(cpu_row[d] - dev_row[d]));
+          }
         }
     }
 
@@ -516,10 +526,12 @@ ring_attention::RingResult run_ring_overlap_fp16(const ring_attention::RingConfi
   const int kv_H = (cfg.kv_heads > 0) ? cfg.kv_heads : cfg.heads;
   const int S = cfg.seq, P = cfg.cp_size, R = cfg.rank;
 
-  const RingPartition::Mode mode =
-      cfg.zigzag_n > 0 ? RingPartition::Mode::Zigzag : RingPartition::Mode::Contiguous;
+  const RingPartition::Mode mode = cfg.striped       ? RingPartition::Mode::Striped
+                                   : cfg.zigzag_n > 0 ? RingPartition::Mode::Zigzag
+                                                      : RingPartition::Mode::Contiguous;
   const int n_splits = zigzag_sub_groups(cfg.zigzag_n);
   RingPartition part(P, R, S, mode, n_splits);
+  const int stride = part.position_stride();  // 1 (contiguous/zigzag) or cp_size (striped)
   const int nsg = part.num_sub_groups();
   const int Sl = part.local_chunk_len();
   const int Sl_local = Sl * nsg;
@@ -540,7 +552,7 @@ ring_attention::RingResult run_ring_overlap_fp16(const ring_attention::RingConfi
         for (int s = 0; s < Sl; ++s)
           for (int d = 0; d < D; ++d)
             buf[off + (static_cast<std::size_t>(b * H + h) * Sl + s) * D + d] =
-                gen_elem(cfg.seed, tid, b, h, gss + s, d);
+                gen_elem(cfg.seed, tid, b, h, gss + s * stride, d);
   };
 
   auto fill_kv_into = [&](std::vector<float>& buf, int tid, std::size_t off, int gss) {
@@ -549,7 +561,7 @@ ring_attention::RingResult run_ring_overlap_fp16(const ring_attention::RingConfi
         for (int s = 0; s < Sl; ++s)
           for (int d = 0; d < D; ++d)
             buf[off + (static_cast<std::size_t>(b * kv_H + h) * Sl + s) * D + d] =
-                gen_elem(cfg.seed, tid, b, h, gss + s, d);
+                gen_elem(cfg.seed, tid, b, h, gss + s * stride, d);
   };
 
   std::vector<float> q_h(q_local_elem), k_h_init(kv_local_elem), v_h_init(kv_local_elem);
@@ -631,11 +643,14 @@ ring_attention::RingResult run_ring_overlap_fp16(const ring_attention::RingConfi
         for (int sg_k = 0; sg_k < nsg; ++sg_k) {
           const int q_off_sg = part.q_offset(sg_q);
           const int k_off_sg = part.k_offset_for_step(step, sg_k);
-          if (cfg.causal && k_off_sg > q_off_sg + Sl - 1) continue;
+          // See ring_loop.cu: the last local row is at q_off_sg + (Sl-1)*stride,
+          // so the full-block prune bound scales with stride (striped blocks
+          // interleave and are almost never fully maskable).
+          if (cfg.causal && k_off_sg > q_off_sg + (Sl - 1) * stride) continue;
           launch_attention_step_fp16(q_d.data() + sg_q * q_sg_elem, K_cur + sg_k * kv_sg_elem,
                                      V_cur + sg_k * kv_sg_elem, out_d.data() + sg_q * q_sg_elem,
                                      m_d.data() + sg_q * m_sg, l_d.data() + sg_q * m_sg, sg_shape,
-                                     q_off_sg, k_off_sg, cfg.causal, stream_compute);
+                                     q_off_sg, k_off_sg, cfg.causal, stream_compute, stride);
         }
       }
       cudaEventRecord(ev_ends[step], stream_compute);
@@ -760,12 +775,17 @@ ring_attention::RingResult run_ring_overlap_fp16(const ring_attention::RingConfi
       const int q_off_sg = part.q_offset(sg);
       for (int b = 0; b < B; ++b)
         for (int h = 0; h < H; ++h) {
-          const float* cpu_slice =
-              cpu_out.data() + (static_cast<std::size_t>(b * H + h) * S + q_off_sg) * D;
+          const float* cpu_head = cpu_out.data() + static_cast<std::size_t>(b * H + h) * S * D;
           const float* dev_slice =
               dev_out_h.data() + sg * q_sg_elem + static_cast<std::size_t>(b * H + h) * Sl * D;
-          for (int e = 0; e < Sl * D; ++e)
-            max_err = std::max(max_err, std::abs(cpu_slice[e] - dev_slice[e]));
+          // Local row s maps to global row q_off_sg + s*stride (stride=1 for
+          // contiguous/zigzag, cp_size for striped).
+          for (int s = 0; s < Sl; ++s) {
+            const float* cpu_row = cpu_head + static_cast<std::size_t>(q_off_sg + s * stride) * D;
+            const float* dev_row = dev_slice + static_cast<std::size_t>(s) * D;
+            for (int d = 0; d < D; ++d)
+              max_err = std::max(max_err, std::abs(cpu_row[d] - dev_row[d]));
+          }
         }
     }
 
@@ -805,6 +825,8 @@ RingResult run_ring_attention_fp16(const RingConfig& cfg) {
   if (cfg.zigzag_n > 0 && cfg.mode == RingMode::AllGather)
     mpi_die(
         "--zigzag-n is not supported with --mode=allgather (use ring-blocking or ring-overlap)");
+  if (cfg.striped && cfg.mode == RingMode::AllGather)
+    mpi_die("--striped is not supported with --mode=allgather (use ring-blocking or ring-overlap)");
   switch (cfg.mode) {
     case RingMode::AllGather:
       return run_allgather_fp16(cfg);

@@ -67,7 +67,8 @@ struct Config {
   int head_dim = 64;
   int kv_heads = 0;  // 0 = MHA; set for GQA/MQA
   bool causal = false;
-  int zigzag_n = 0;  // 0 = disabled; N >= 1 = N zig-zag passes (each pass = 2 sub-groups)
+  int zigzag_n = 0;      // 0 = disabled; N >= 1 = N zig-zag passes (each pass = 2 sub-groups)
+  bool striped = false;  // striped partitioning (token i -> rank i%cp); excl. with zigzag
   // Default to the only mode worth running in production. The other two are
   // kept as baselines for the KERNEL_OPTIMIZATIONS.md comparison story; explicit
   // opt-in via --mode is required to select them.
@@ -105,6 +106,8 @@ Config parse_args(int argc, char** argv) {
       cfg.causal = std::atoi(argv[++i]) != 0;
     else if (!std::strcmp(argv[i], "--zigzag-n") && nxt)
       cfg.zigzag_n = std::atoi(argv[++i]);
+    else if (!std::strcmp(argv[i], "--striped") && nxt)
+      cfg.striped = std::atoi(argv[++i]) != 0;
     else if (!std::strcmp(argv[i], "--zigzag")) {
       // Backward compat: --zigzag [0|1] or standalone --zigzag (→ 1 pass = classic
       // 2-sub-group zig-zag). Note --zigzag-n now counts *passes*, not sub-groups.
@@ -298,11 +301,19 @@ int main(int argc, char** argv) {
     if (rank == 0) fprintf(stderr, "ERROR: seq=%d not divisible by cp_size=%d\n", cfg.seq, cp_size);
     MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
   }
-  // --zigzag-n N now means N *passes* = 2N sub-groups, so the sequence must
-  // split evenly into 2N*cp_size chunks.
-  // TODO(human): if zig-zag is enabled, validate that cfg.seq is divisible by
-  // (2 * cfg.zigzag_n * cp_size); on failure, print a clear error on rank 0 and
-  // MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE).
+  // --striped and --zigzag-n select different, mutually exclusive partitions.
+  if (cfg.zigzag_n > 0 && cfg.striped) {
+    if (rank == 0)
+      fprintf(stderr, "ERROR: --zigzag-n and --striped are mutually exclusive (pick one)\n");
+    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+  }
+  // --zigzag-n N means N *passes* = 2N sub-groups, so the sequence must split
+  // evenly into 2N*cp_size chunks.
+  // TODO(human): if zig-zag is enabled (cfg.zigzag_n > 0), validate that cfg.seq
+  // is divisible by (2 * cfg.zigzag_n * cp_size); on failure, print a clear error
+  // on rank 0 and MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE).
+  // Striped only needs seq divisible by cp_size (checked above) — token i goes
+  // to rank i%cp_size, so each rank owns exactly seq/cp_size tokens.
 
   // Decode mode short-circuits prefill: it runs its own synthetic benchmark
   // against a pre-populated cache. Correctness is owned by test_ring_decode;
@@ -325,9 +336,10 @@ int main(int argc, char** argv) {
   MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
   printf(
       "rank %d/%d  local_rank %d  gpu %d  %-24s  local_shape=(B=%d H=%d Sq=%d D=%d)  "
-      "mode=%-14s  dtype=%-4s  causal=%d  zigzag_n=%d\n",
+      "mode=%-14s  dtype=%-4s  causal=%d  zigzag_n=%d  striped=%d\n",
       rank, cp_size, local_rank, device, prop.name, cfg.batch, cfg.heads, local_seq, cfg.head_dim,
-      cfg.mode.c_str(), cfg.dtype.c_str(), static_cast<int>(cfg.causal), cfg.zigzag_n);
+      cfg.mode.c_str(), cfg.dtype.c_str(), static_cast<int>(cfg.causal), cfg.zigzag_n,
+      static_cast<int>(cfg.striped));
   fflush(stdout);
 
   // Run the attention (all modes dispatch through run_ring_attention).
@@ -341,6 +353,7 @@ int main(int argc, char** argv) {
   rcfg.kv_heads = cfg.kv_heads;
   rcfg.causal = cfg.causal;
   rcfg.zigzag_n = cfg.zigzag_n;
+  rcfg.striped = cfg.striped;
   rcfg.verify = cfg.verify;
   rcfg.csv = cfg.csv;
   rcfg.mode = ring_attention::mode_from_string(cfg.mode);
@@ -365,14 +378,14 @@ int main(int argc, char** argv) {
     // runs: `--csv` only.
     if (cfg.csv_header) {
       printf(
-          "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag_n,"
+          "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag_n,striped,"
           "iters,comm_ms,comp_ms,wait_ms,total_ms,max_err\n");
     }
     if (cfg.csv) {
-      printf("%s,%d,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.2e\n", cfg.mode.c_str(), cp_size,
+      printf("%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.2e\n", cfg.mode.c_str(), cp_size,
              cfg.batch, cfg.heads, cfg.seq, cfg.head_dim, static_cast<int>(cfg.causal),
-             cfg.zigzag_n, cfg.iters, res.comm_ms, res.comp_ms, res.wait_ms, res.total_ms,
-             res.max_err);
+             cfg.zigzag_n, static_cast<int>(cfg.striped), cfg.iters, res.comm_ms, res.comp_ms,
+             res.wait_ms, res.total_ms, res.max_err);
     }
   }
 

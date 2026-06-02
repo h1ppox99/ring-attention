@@ -10,7 +10,13 @@ from __future__ import annotations
 import pytest
 import torch
 
-from ring_attention_ref import full_attention, partition, ring_attention, zigzag_indices
+from ring_attention_ref import (
+    full_attention,
+    partition,
+    ring_attention,
+    striped_indices,
+    zigzag_indices,
+)
 
 
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
@@ -56,6 +62,31 @@ def test_ring_causal_zigzag_matches_full(cp_size: int) -> None:
     expected_shards = partition(expected, idx)
 
     torch.testing.assert_close(ring_out, expected_shards, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+@pytest.mark.parametrize("causal", [False, True])
+def test_ring_striped_matches_full(cp_size: int, causal: bool) -> None:
+    seq = 32
+    q = torch.randn(1, 2, seq, 16)
+    k = torch.randn(1, 2, seq, 16)
+    v = torch.randn(1, 2, seq, 16)
+
+    ring_out = ring_attention(q, k, v, cp_size=cp_size, causal=causal, zig_zag=False, striped=True)
+    expected = full_attention(q, k, v, causal=causal)
+    idx = striped_indices(seq, cp_size=cp_size)
+    expected_shards = partition(expected, idx)
+
+    assert ring_out.shape == (cp_size, 1, 2, seq // cp_size, 16)
+    torch.testing.assert_close(ring_out, expected_shards, atol=1e-5, rtol=1e-5)
+
+
+def test_zigzag_and_striped_mutually_exclusive() -> None:
+    q = torch.randn(1, 2, 16, 16)
+    k = torch.randn(1, 2, 16, 16)
+    v = torch.randn(1, 2, 16, 16)
+    with pytest.raises(ValueError):
+        ring_attention(q, k, v, cp_size=2, causal=False, zig_zag=True, striped=True)
 
 
 def test_invalid_seq_raises() -> None:

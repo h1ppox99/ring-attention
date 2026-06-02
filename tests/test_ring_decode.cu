@@ -145,7 +145,9 @@ int main(int argc, char** argv) {
   cfg.cp_size = cp_size;
   cfg.batch = B;
   cfg.heads = H;
+#ifdef RING_USE_NCCL
   cfg.nccl_comm = comm;
+#endif
 
   // 4. Decode loop.
   float max_err = 0.f;
@@ -191,7 +193,9 @@ int main(int argc, char** argv) {
     }
   }
 
+#ifdef RING_USE_NCCL
   ncclCommDestroy(comm);
+#endif
 
   const float tol = 1e-3f;
   if (rank == 0) {

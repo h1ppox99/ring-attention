@@ -39,7 +39,10 @@ cmake --build build/release -j
 PASS=1
 
 # Helper: run one --verify invocation and print PASS/FAIL.
-# Usage: check_verify <n> <mode> <causal> [--zigzag-n N]
+# Usage: check_verify <n> <mode> <causal> [--zigzag-n N | --striped 1]
+# NOTE: the partition flags take an explicit value (--zigzag-n N / --striped 1);
+# a bare --zigzag is silently dropped by the CLI parser (it consumes the next
+# token as its value), which would quietly run contiguous instead.
 # Shape can be overridden via env vars: SEQ (default 1024), HEAD_DIM (default 64).
 check_verify() {
   local n=$1 mode=$2 causal=$3
@@ -88,15 +91,27 @@ for mode in ring-blocking ring-overlap; do
   done
 done
 
+# Striped variants (seq=1024 divisible by cp_size for cp ∈ {1,2,4}).
+for mode in ring-blocking ring-overlap; do
+  echo ""
+  echo "=== ${mode} --striped --verify ==="
+  for n in 1 2 4; do
+    for causal in 0 1; do
+      check_verify "${n}" "${mode}" "${causal}" --striped 1
+    done
+  done
+done
+
 # Shape sweep on the report hot path (ring-overlap+zigzag+causal). Catches
 # shape-specific bugs (D=128 register spilling, large-seq tiling) the fixed
 # 1024×64 matrix misses. cp_size=2 suffices: shape bugs are kernel-local.
 echo ""
-echo "=== ring-overlap --zigzag-n 1 --verify (shape sweep, cp_size=2, causal=1) ==="
+echo "=== ring-overlap --zigzag-n/--striped --verify (shape sweep, cp_size=2, causal=1) ==="
 for HEAD_DIM in 32 64 128; do
   for SEQ in 512 4096; do
     export SEQ HEAD_DIM
     check_verify 2 ring-overlap 1 --zigzag-n 1
+    check_verify 2 ring-overlap 1 --striped 1
   done
 done
 unset SEQ HEAD_DIM
@@ -112,6 +127,7 @@ if [ "${SLURM_NNODES:-1}" -ge 2 ]; then
   for mode in ring-blocking ring-overlap; do
     for causal in 0 1; do
       check_verify "${N_TOTAL}" "${mode}" "${causal}" --zigzag-n 1
+      check_verify "${N_TOTAL}" "${mode}" "${causal}" --striped 1
     done
   done
   unset SEQ HEAD_DIM

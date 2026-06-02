@@ -25,7 +25,7 @@
 # cp_size values larger than the allocation (nodes*4) are skipped.
 #
 # Output: results/bench_weak.csv  (same schema as bench_ring.csv)
-#   columns: mode,cp_size,batch,heads,seq,head_dim,causal,zigzag_n,iters,
+#   columns: mode,cp_size,batch,heads,seq,head_dim,causal,zigzag_n,striped,iters,
 #            comm_ms,comp_ms,wait_ms,total_ms,max_err
 
 set -euo pipefail
@@ -52,7 +52,7 @@ PER_RANK=4096
 ITERS=20
 ZIGZAG_N="${ZIGZAG_N:-1}"  # number of zig-zag passes; override with: ZIGZAG_N=2 sbatch ...
 
-echo "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag_n,iters,comm_ms,comp_ms,wait_ms,total_ms,max_err" \
+echo "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag_n,striped,iters,comm_ms,comp_ms,wait_ms,total_ms,max_err" \
   > "${CSV}"
 
 # Production config: ring-overlap, causal, zigzag.

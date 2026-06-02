@@ -144,6 +144,7 @@ mpirun -n 2 ./build/release/apps/ring_attention_cli/ring_attention_cli \
 | `--kv_heads K` | `0` = MHA; set `< heads` for GQA/MQA. |
 | `--causal 0/1` | apply the lower-triangular mask. |
 | `--zigzag 0/1` | interleaved token assignment for causal load balance (needs `seq` divisible by `2 * cp_size`). |
+| `--striped 0/1` | striped token assignment: token `i` → rank `i % cp_size`. Balances causal-mask work as a single strided shard with a near-uniform per-ring-step mask (needs `seq` divisible by `cp_size`). Mutually exclusive with `--zigzag`; not supported with `--mode allgather`. |
 | `--dtype fp32\|fp16` | precision. `fp16` exercises the Tensor-Core path (half-precision K/V on the wire, fp32 softmax accumulators). Default `fp32`. |
 | `--iters N` | timed iterations. |
 | `--verify` | re-run a CPU reference and report max absolute error. |

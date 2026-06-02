@@ -46,6 +46,8 @@ struct RingConfig {
   int kv_heads{0};  ///< KV head count for GQA/MQA; 0 means same as heads (MHA).
   bool causal;
   int zigzag_n{0};  ///< 0 = disabled; N >= 1 = N zig-zag passes (each pass = 2 sub-groups).
+  bool striped{false};  ///< Striped partitioning (token i -> rank i%cp). Mutually exclusive
+                        ///< with zigzag (zigzag_n).
   bool verify;
   bool csv;
   RingMode mode;
