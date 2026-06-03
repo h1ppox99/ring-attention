@@ -550,16 +550,24 @@ ring_attention::RingResult run_ring_overlap_fp16(const ring_attention::RingConfi
                 gen_elem(cfg.seed, tid, b, h, gss + s, d);
   };
 
-  std::vector<float> q_h(q_local_elem), k_h_init(kv_local_elem), v_h_init(kv_local_elem);
-  for (int sg = 0; sg < nsg; ++sg) {
-    fill_q_into(q_h, 0, sg * q_sg_elem, part.q_offset(sg));
-    fill_kv_into(k_h_init, 1, sg * kv_sg_elem, part.k_offset_for_step(0, sg));
-    fill_kv_into(v_h_init, 2, sg * kv_sg_elem, part.k_offset_for_step(0, sg));
+  // In mem_probe mode we only test whether the device buffers fit, so skip both
+  // the host allocations and the fills (pure CPU work over S*H*D elements that
+  // would also balloon host RAM at large S).
+  std::vector<float> q_h, k_h_init, v_h_init;
+  if (!cfg.mem_probe) {
+    q_h.resize(q_local_elem);
+    k_h_init.resize(kv_local_elem);
+    v_h_init.resize(kv_local_elem);
+    for (int sg = 0; sg < nsg; ++sg) {
+      fill_q_into(q_h, 0, sg * q_sg_elem, part.q_offset(sg));
+      fill_kv_into(k_h_init, 1, sg * kv_sg_elem, part.k_offset_for_step(0, sg));
+      fill_kv_into(v_h_init, 2, sg * kv_sg_elem, part.k_offset_for_step(0, sg));
+    }
   }
 
   DeviceTensor<float> scratch_f(q_local_elem);
   DeviceTensor<__half> q_d(q_local_elem);
-  upload_as_half(q_h, scratch_f, q_d.data(), q_local_elem);
+  if (!cfg.mem_probe) upload_as_half(q_h, scratch_f, q_d.data(), q_local_elem);
 
   DeviceTensor<__half> K_a(kv_local_elem), K_b(kv_local_elem);
   DeviceTensor<__half> V_a(kv_local_elem), V_b(kv_local_elem);
@@ -592,6 +600,21 @@ ring_attention::RingResult run_ring_overlap_fp16(const ring_attention::RingConfi
     cudaEventCreate(&ev_ends[s]);
     cudaEventCreate(&ev_h2d_starts[s]);
     cudaEventCreate(&ev_h2d_ends[s]);
+  }
+
+  // Memory-capacity probe: every device buffer (q/K_a/K_b/V_a/V_b/out/m/l) and
+  // the NCCL transport are now allocated — an OOM would already have aborted via
+  // cudaCheck. A clean return here means this config fits, without paying the
+  // O(S^2) forward pass. NCCL's lazy per-channel buffers (a few MB) are the only
+  // footprint not yet counted; negligible beside the multi-GB tensors above.
+  if (cfg.mem_probe) {
+    cudaDeviceSynchronize();
+#ifdef RING_USE_NCCL
+    ncclCommDestroy(nccl_comm);
+#endif
+    RingResult probe_res;
+    probe_res.total_ms = -1.0;  // sentinel: probe, not a timed run
+    return probe_res;
   }
 
   // Pinned host fp16 buffers for the initial K/V state. They must be page-locked:

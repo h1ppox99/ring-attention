@@ -77,6 +77,11 @@ struct Config {
   bool verify = false;
   bool csv = false;
   bool csv_header = false;  // emit header row only (paired with --csv or alone)
+  // Memory-capacity probe: allocate all device buffers for this config and exit
+  // without running attention. Clean exit == fits; OOM aborts the process. Lets
+  // the seqlen-capacity sweep find the device-memory limit cheaply instead of
+  // paying the O(S^2) forward pass at every probe. fp16 ring-overlap only.
+  bool mem_probe = false;
   // Decode mode (--run decode): synthetic decode benchmark. The KV cache is
   // pre-filled with random data; correctness is validated by the dedicated
   // test_ring_decode executable, not by this benchmark driver.
@@ -117,6 +122,8 @@ Config parse_args(int argc, char** argv) {
       cfg.csv = true;
     else if (!std::strcmp(argv[i], "--csv-header"))
       cfg.csv_header = true;
+    else if (!std::strcmp(argv[i], "--mem-probe"))
+      cfg.mem_probe = true;
     else if (!std::strcmp(argv[i], "--run") && nxt)
       cfg.run = argv[++i];
     else if (!std::strcmp(argv[i], "--prompt-len") && nxt)
@@ -342,6 +349,7 @@ int main(int argc, char** argv) {
   rcfg.dtype = ring_attention::dtype_from_string(cfg.dtype);
   rcfg.iters = cfg.iters;
   rcfg.seed = 42u;
+  rcfg.mem_probe = cfg.mem_probe;
 
   const ring_attention::RingResult res = ring_attention::run_ring_attention(rcfg);
 

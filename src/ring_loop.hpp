@@ -52,6 +52,13 @@ struct RingConfig {
   int iters;
   uint32_t seed = 42u;
   RingDtype dtype = RingDtype::Float;
+  /// Memory-capacity probe: allocate every device buffer (and NCCL transport)
+  /// for this config, then return WITHOUT running the attention kernels. An
+  /// out-of-memory allocation aborts the process via cudaCheck, so a clean exit
+  /// means the configuration fits in device memory. Used by the seqlen-capacity
+  /// sweep, where running the O(S^2) forward pass at the OOM boundary would cost
+  /// minutes per probe. Currently honored by the fp16 ring-overlap path only.
+  bool mem_probe = false;
 };
 
 /// Run one complete ring-attention forward pass (all modes, all phases).
