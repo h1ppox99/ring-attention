@@ -1022,7 +1022,8 @@ ring_attention::RingResult run_ring_2d(const ring_attention::RingConfig& cfg) {
 
   const RingPartition::Mode pmode =
       (cfg.zigzag_n > 0) ? RingPartition::Mode::Zigzag : RingPartition::Mode::Contiguous;
-  RingPartition part(P, R, S, pmode);
+  const int n_splits = (cfg.zigzag_n > 0) ? cfg.zigzag_n : 2;
+  RingPartition part(P, R, S, pmode, n_splits);
   Ring2DSchedule sched(N, G, n, g);
   const int nsg = part.num_sub_groups();
   const int Sl = part.local_chunk_len();

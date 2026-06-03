@@ -42,17 +42,6 @@ def zigzag_indices(seq_len: int, cp_size: int, n_splits: int = 2) -> torch.Tenso
     chunk_starts = torch.arange(num_chunks) * chunk  # (num_chunks,)
     ranks = torch.arange(cp_size).unsqueeze(1)  # (cp_size, 1)
 
-    # TODO(human): build `parts` — a list of n_splits tensors each of shape
-    # (cp_size, num_chunks), where parts[sg] holds the global token index for
-    # sub-group sg of every rank across every macro-chunk.
-    #
-    # Strategy: pair sub-groups from the outside in so that each rank holds one
-    # "early" (low-index, cheap under causal) and one "late" (high-index,
-    # expensive) chunk per pair. For sub-group index sg:
-    #   k = sg // 2
-    #   even sg -> early group: local offset within macro-chunk = k*cp_size + rank
-    #   odd  sg -> late group:  local offset = (n_splits-1-k)*cp_size + (cp_size-1-rank)
-    # Add chunk_starts (broadcast over ranks) to get global positions.
     parts: list[torch.Tensor] = []
 
     for sg in range(n_splits):
