@@ -43,22 +43,24 @@ MAX_CP=$((NNODES * 4))
 echo "nodes=${NNODES}  max cp_size=${MAX_CP}  nodelist=${SLURM_JOB_NODELIST:-?}"
 
 # Fixed total sequence (strong scaling). 20160 = 2^6·3^2·5·7 is divisible by
-# 2*cp for every cp in the sweep set, so zigzag is valid throughout.
+# 2*ZIGZAG_N*cp for every cp in the sweep set (with ZIGZAG_N=1 by default),
+# so zigzag is valid throughout.
 SEQ=20160
 ITERS=20
+ZIGZAG_N="${ZIGZAG_N:-1}"
 
-echo "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag,iters,comm_ms,comp_ms,wait_ms,total_ms,max_err" \
+echo "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag_n,striped,iters,comm_ms,comp_ms,wait_ms,total_ms,max_err" \
   > "${CSV}"
 
 # Production config: causal + zigzag. ring-2d only accepts uniform layouts.
 bench_one() {
   local mode=$1 cp_size=$2 head_dim=$3
   if [ "${cp_size}" -gt "${MAX_CP}" ]; then return 0; fi
-  if (( SEQ % (2 * cp_size) != 0 )); then return 0; fi
+  if (( SEQ % (2 * ZIGZAG_N * cp_size) != 0 )); then return 0; fi
   echo "  mode=${mode} cp=${cp_size} head_dim=${head_dim} seq=${SEQ}"
   mpirun -n "${cp_size}" "${CLI}" \
     --batch 1 --heads 4 --seq "${SEQ}" --head_dim "${head_dim}" \
-    --causal 1 --zigzag 1 --mode "${mode}" --iters "${ITERS}" --csv 2>/dev/null \
+    --causal 1 --zigzag-n "${ZIGZAG_N}" --mode "${mode}" --iters "${ITERS}" --csv 2>/dev/null \
     | grep "^${mode}," >> "${CSV}" || echo "    (skipped: ${mode} cp=${cp_size} returned no row)"
 }
 

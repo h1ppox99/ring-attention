@@ -24,7 +24,7 @@ ITERS=20
 cmake --preset=release -DCMAKE_CUDA_ARCHITECTURES=75 -DUSE_NCCL=OFF
 cmake --build build/release -j
 
-echo "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag,striped,iters,comm_ms,comp_ms,wait_ms,total_ms,max_err" \
+echo "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag_n,striped,iters,comm_ms,comp_ms,wait_ms,total_ms,max_err" \
   > results/bench_ring_baseline_cmp.csv
 
 for cp_size in 1 2 4; do
@@ -45,7 +45,7 @@ git checkout origin/improve-kernel -- src/attention_step.cu src/flash_attention.
 cmake --preset=release -DCMAKE_CUDA_ARCHITECTURES=75 -DUSE_NCCL=OFF
 cmake --build build/release -j --target ring_attention_cli
 
-echo "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag,striped,iters,comm_ms,comp_ms,wait_ms,total_ms,max_err" \
+echo "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag_n,striped,iters,comm_ms,comp_ms,wait_ms,total_ms,max_err" \
   > "${CSV_OPT}"
 
 for cp_size in 1 2 4; do
