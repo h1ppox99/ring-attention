@@ -265,7 +265,7 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
 
   const RingPartition::Mode mode =
       cfg.zigzag_n > 0 ? RingPartition::Mode::Zigzag : RingPartition::Mode::Contiguous;
-  const int n_splits = (cfg.zigzag_n > 0) ? cfg.zigzag_n : 2;
+  const int n_splits = zigzag_sub_groups(cfg.zigzag_n);
   RingPartition part(P, R, S, mode, n_splits);
   const int nsg = part.num_sub_groups();  // 1 (contiguous) or n_splits (zigzag)
   const int Sl = part.local_chunk_len();  // per-sub-group rows: S/P or S/(n_splits*P)
@@ -616,7 +616,7 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
 
   const RingPartition::Mode mode =
       cfg.zigzag_n > 0 ? RingPartition::Mode::Zigzag : RingPartition::Mode::Contiguous;
-  const int n_splits = (cfg.zigzag_n > 0) ? cfg.zigzag_n : 2;
+  const int n_splits = zigzag_sub_groups(cfg.zigzag_n);
   RingPartition part(P, R, S, mode, n_splits);
   const int nsg = part.num_sub_groups();
   const int Sl = part.local_chunk_len();
@@ -1022,7 +1022,7 @@ ring_attention::RingResult run_ring_2d(const ring_attention::RingConfig& cfg) {
 
   const RingPartition::Mode pmode =
       (cfg.zigzag_n > 0) ? RingPartition::Mode::Zigzag : RingPartition::Mode::Contiguous;
-  const int n_splits = (cfg.zigzag_n > 0) ? cfg.zigzag_n : 2;
+  const int n_splits = zigzag_sub_groups(cfg.zigzag_n);
   RingPartition part(P, R, S, pmode, n_splits);
   Ring2DSchedule sched(N, G, n, g);
   const int nsg = part.num_sub_groups();

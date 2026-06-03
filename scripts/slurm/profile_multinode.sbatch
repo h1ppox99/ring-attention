@@ -112,7 +112,7 @@ run_nsys_prefill() {
 }
 
 run_nsys_prefill "ring-blocking" ""           "ring-blocking"
-run_nsys_prefill "ring-overlap"  "--zigzag-n 2" "ring-overlap-zigzag"
+run_nsys_prefill "ring-overlap"  "--zigzag-n 1" "ring-overlap-zigzag"
 
 # ----------------------------------------------------------------------------
 # Phase 3 — Nsight Compute: decode kernel deep dive (single rank, node-independent)

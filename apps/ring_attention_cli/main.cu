@@ -67,7 +67,7 @@ struct Config {
   int head_dim = 64;
   int kv_heads = 0;  // 0 = MHA; set for GQA/MQA
   bool causal = false;
-  int zigzag_n = 0;  // 0 = disabled; N >= 2 = N-way zigzag
+  int zigzag_n = 0;  // 0 = disabled; N >= 1 = N zig-zag passes (each pass = 2 sub-groups)
   // Default to the only mode worth running in production. The other two are
   // kept as baselines for the KERNEL_OPTIMIZATIONS.md comparison story; explicit
   // opt-in via --mode is required to select them.
@@ -106,11 +106,12 @@ Config parse_args(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--zigzag-n") && nxt)
       cfg.zigzag_n = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--zigzag")) {
-      // Backward compat: --zigzag [0|1] or standalone --zigzag (→ 2-way).
+      // Backward compat: --zigzag [0|1] or standalone --zigzag (→ 1 pass = classic
+      // 2-sub-group zig-zag). Note --zigzag-n now counts *passes*, not sub-groups.
       if (nxt && (argv[i + 1][0] == '0' || argv[i + 1][0] == '1') && argv[i + 1][1] == '\0')
-        cfg.zigzag_n = (std::atoi(argv[++i]) != 0) ? 2 : 0;
+        cfg.zigzag_n = (std::atoi(argv[++i]) != 0) ? 1 : 0;
       else
-        cfg.zigzag_n = 2;
+        cfg.zigzag_n = 1;
     } else if (!std::strcmp(argv[i], "--mode") && nxt)
       cfg.mode = argv[++i];
     else if (!std::strcmp(argv[i], "--dtype") && nxt)
@@ -297,12 +298,11 @@ int main(int argc, char** argv) {
     if (rank == 0) fprintf(stderr, "ERROR: seq=%d not divisible by cp_size=%d\n", cfg.seq, cp_size);
     MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
   }
-  if (cfg.zigzag_n > 0 && cfg.seq % (cfg.zigzag_n * cp_size) != 0) {
-    if (rank == 0)
-      fprintf(stderr, "ERROR: --zigzag-n %d requires seq=%d divisible by %d*cp_size=%d\n",
-              cfg.zigzag_n, cfg.seq, cfg.zigzag_n, cfg.zigzag_n * cp_size);
-    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
-  }
+  // --zigzag-n N now means N *passes* = 2N sub-groups, so the sequence must
+  // split evenly into 2N*cp_size chunks.
+  // TODO(human): if zig-zag is enabled, validate that cfg.seq is divisible by
+  // (2 * cfg.zigzag_n * cp_size); on failure, print a clear error on rank 0 and
+  // MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE).
 
   // Decode mode short-circuits prefill: it runs its own synthetic benchmark
   // against a pre-populated cache. Correctness is owned by test_ring_decode;

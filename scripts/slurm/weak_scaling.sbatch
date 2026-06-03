@@ -15,9 +15,9 @@
 # grows; the rise above flat is communication/overlap overhead.
 #
 # Sweeps every cp_size ∈ 1..16 (up to 4 nodes × 4 GPUs) — seq = PER_RANK*cp is
-# always divisible by ZIGZAG_N*cp (PER_RANK divisible by ZIGZAG_N), so all 16
+# always divisible by 2*ZIGZAG_N*cp (PER_RANK divisible by 2*ZIGZAG_N), so all 16
 # values are valid for zigzag. head_dim is swept over {32, 64, 128, 256}.
-# ZIGZAG_N: number of sub-groups per rank (default 2; set ZIGZAG_N=4 to override).
+# ZIGZAG_N: number of zig-zag passes (default 1; each pass = 2 sub-groups, set 2 to override).
 #   sbatch scripts/slurm/weak_scaling.sbatch              # full 4-node sweep
 #   sbatch --nodes=2 scripts/slurm/weak_scaling.sbatch    # cap at cp8 (2 nodes)
 #   sbatch --nodes=1 scripts/slurm/weak_scaling.sbatch    # single node, cp<=4
@@ -47,10 +47,10 @@ MAX_CP=$((NNODES * 4))
 echo "nodes=${NNODES}  max cp_size=${MAX_CP}  nodelist=${SLURM_JOB_NODELIST:-?}"
 
 # Tokens owned by each rank, held constant across the sweep. Must be divisible
-# by ZIGZAG_N so that seq = PER_RANK*cp_size is divisible by ZIGZAG_N*cp_size.
+# by 2*ZIGZAG_N so that seq = PER_RANK*cp_size is divisible by 2*ZIGZAG_N*cp_size.
 PER_RANK=4096
 ITERS=20
-ZIGZAG_N="${ZIGZAG_N:-2}"  # override with: ZIGZAG_N=4 sbatch ...
+ZIGZAG_N="${ZIGZAG_N:-1}"  # number of zig-zag passes; override with: ZIGZAG_N=2 sbatch ...
 
 echo "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag_n,iters,comm_ms,comp_ms,wait_ms,total_ms,max_err" \
   > "${CSV}"

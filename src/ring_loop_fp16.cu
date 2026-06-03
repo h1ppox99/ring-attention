@@ -243,7 +243,7 @@ ring_attention::RingResult run_ring_blocking_fp16(const ring_attention::RingConf
 
   const RingPartition::Mode mode =
       cfg.zigzag_n > 0 ? RingPartition::Mode::Zigzag : RingPartition::Mode::Contiguous;
-  const int n_splits = (cfg.zigzag_n > 0) ? cfg.zigzag_n : 2;
+  const int n_splits = zigzag_sub_groups(cfg.zigzag_n);
   RingPartition part(P, R, S, mode, n_splits);
   const int nsg = part.num_sub_groups();
   const int Sl = part.local_chunk_len();
@@ -518,7 +518,7 @@ ring_attention::RingResult run_ring_overlap_fp16(const ring_attention::RingConfi
 
   const RingPartition::Mode mode =
       cfg.zigzag_n > 0 ? RingPartition::Mode::Zigzag : RingPartition::Mode::Contiguous;
-  const int n_splits = (cfg.zigzag_n > 0) ? cfg.zigzag_n : 2;
+  const int n_splits = zigzag_sub_groups(cfg.zigzag_n);
   RingPartition part(P, R, S, mode, n_splits);
   const int nsg = part.num_sub_groups();
   const int Sl = part.local_chunk_len();

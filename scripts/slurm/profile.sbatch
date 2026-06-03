@@ -66,7 +66,7 @@ echo "------------------------------------------------------------"
 
 run_nsys() {
   local mode=$1
-  local extra=$2  # "" or "--zigzag-n 2"
+  local extra=$2  # "" or "--zigzag-n 1"
   local tag=$3    # short name for the output file
 
   echo ""
@@ -95,7 +95,7 @@ run_nsys "ring-blocking"  ""             "ring-blocking"
 run_nsys "ring-overlap"   ""             "ring-overlap"
 
 # ring-overlap + zigzag: the "production" configuration
-run_nsys "ring-overlap"   "--zigzag-n 2"   "ring-overlap-zigzag"
+run_nsys "ring-overlap"   "--zigzag-n 1"   "ring-overlap-zigzag"
 
 # ----------------------------------------------------------------------------
 # Phase 2 — Nsight Compute: kernel analysis

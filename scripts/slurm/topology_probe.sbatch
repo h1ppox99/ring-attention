@@ -125,7 +125,7 @@ NCCL_TOPO_DUMP_FILE="${OUT}/nccl_topo.xml" \
   mpirun -n 8 \
     -x NCCL_DEBUG -x NCCL_DEBUG_SUBSYS -x NCCL_TOPO_DUMP_FILE \
     "${CLI}" \
-      --mode ring-overlap --zigzag-n 2 \
+      --mode ring-overlap --zigzag-n 1 \
       --seq 16384 --head_dim 128 \
       --batch 1 --heads 4 --causal 1 \
       --iters 3 \
