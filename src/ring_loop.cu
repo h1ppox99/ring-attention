@@ -263,13 +263,14 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
   const int kv_H = (cfg.kv_heads > 0) ? cfg.kv_heads : cfg.heads;
   const int S = cfg.seq, P = cfg.cp_size, R = cfg.rank;
 
-  const RingPartition::Mode mode = cfg.striped  ? RingPartition::Mode::Striped
-                                   : cfg.zigzag ? RingPartition::Mode::Zigzag
-                                                : RingPartition::Mode::Contiguous;
-  RingPartition part(P, R, S, mode);
+  const RingPartition::Mode mode = cfg.striped        ? RingPartition::Mode::Striped
+                                   : cfg.zigzag_n > 0 ? RingPartition::Mode::Zigzag
+                                                      : RingPartition::Mode::Contiguous;
+  const int n_splits = zigzag_sub_groups(cfg.zigzag_n);
+  RingPartition part(P, R, S, mode, n_splits);
   const int stride = part.position_stride();  // 1 (contiguous/zigzag) or cp_size (striped)
-  const int nsg = part.num_sub_groups();      // 1 (contiguous) or 2 (zigzag)
-  const int Sl = part.local_chunk_len();      // per-sub-group rows: S/P or S/(2P)
+  const int nsg = part.num_sub_groups();      // 1 (contiguous/striped) or n_splits (zigzag)
+  const int Sl = part.local_chunk_len();      // per-sub-group rows: S/P or S/(n_splits*P)
   const int Sl_local = Sl * nsg;              // total local rows per rank = S/P
   const std::size_t q_sg_elem = static_cast<std::size_t>(B) * H * Sl * D;
   const std::size_t q_local_elem = static_cast<std::size_t>(nsg) * q_sg_elem;
@@ -624,10 +625,11 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
   const int kv_H = (cfg.kv_heads > 0) ? cfg.kv_heads : cfg.heads;
   const int S = cfg.seq, P = cfg.cp_size, R = cfg.rank;
 
-  const RingPartition::Mode mode = cfg.striped  ? RingPartition::Mode::Striped
-                                   : cfg.zigzag ? RingPartition::Mode::Zigzag
-                                                : RingPartition::Mode::Contiguous;
-  RingPartition part(P, R, S, mode);
+  const RingPartition::Mode mode = cfg.striped        ? RingPartition::Mode::Striped
+                                   : cfg.zigzag_n > 0 ? RingPartition::Mode::Zigzag
+                                                      : RingPartition::Mode::Contiguous;
+  const int n_splits = zigzag_sub_groups(cfg.zigzag_n);
+  RingPartition part(P, R, S, mode, n_splits);
   const int stride = part.position_stride();  // 1 (contiguous/zigzag) or cp_size (striped)
   const int nsg = part.num_sub_groups();
   const int Sl = part.local_chunk_len();
@@ -1043,8 +1045,9 @@ ring_attention::RingResult run_ring_2d(const ring_attention::RingConfig& cfg) {
   }
 
   const RingPartition::Mode pmode =
-      cfg.zigzag ? RingPartition::Mode::Zigzag : RingPartition::Mode::Contiguous;
-  RingPartition part(P, R, S, pmode);
+      (cfg.zigzag_n > 0) ? RingPartition::Mode::Zigzag : RingPartition::Mode::Contiguous;
+  const int n_splits = zigzag_sub_groups(cfg.zigzag_n);
+  RingPartition part(P, R, S, pmode, n_splits);
   Ring2DSchedule sched(N, G, n, g);
   const int nsg = part.num_sub_groups();
   const int Sl = part.local_chunk_len();
@@ -1464,10 +1467,11 @@ RingDtype dtype_from_string(const std::string& s) {
 RingResult run_ring_attention_fp16(const RingConfig& cfg);
 
 RingResult run_ring_attention(const RingConfig& cfg) {
-  if (cfg.zigzag && cfg.striped)
-    mpi_die("--zigzag and --striped are mutually exclusive (pick one partition scheme)");
-  if (cfg.zigzag && cfg.mode == RingMode::AllGather)
-    mpi_die("--zigzag is not supported with --mode=allgather (use ring-blocking or ring-overlap)");
+  if (cfg.zigzag_n > 0 && cfg.striped)
+    mpi_die("--zigzag-n and --striped are mutually exclusive (pick one partition scheme)");
+  if (cfg.zigzag_n > 0 && cfg.mode == RingMode::AllGather)
+    mpi_die(
+        "--zigzag-n is not supported with --mode=allgather (use ring-blocking or ring-overlap)");
   if (cfg.striped && cfg.mode == RingMode::AllGather)
     mpi_die("--striped is not supported with --mode=allgather (use ring-blocking or ring-overlap)");
   if (cfg.dtype == RingDtype::Half) return run_ring_attention_fp16(cfg);

@@ -23,6 +23,7 @@ def ring_attention(
     cp_size: int,
     causal: bool,
     zig_zag: bool,
+    n_splits: int = 2,
     striped: bool = False,
 ) -> torch.Tensor:
     """Full attention output, partitioned into per-rank shards.
@@ -37,6 +38,8 @@ def ring_attention(
         Apply causal masking when ``True``.
     zig_zag : bool
         Use zig-zag token assignment for load balance; otherwise contiguous blocks.
+    n_splits : int
+        Number of sub-groups per rank when ``zig_zag=True``. Default is 2.
     striped : bool, optional
         Use striped token assignment (token ``i`` -> rank ``i % cp_size``).
         Mutually exclusive with ``zig_zag``. Defaults to ``False``.
@@ -61,7 +64,7 @@ def ring_attention(
     out = full_attention(q, k, v, causal=causal)
 
     if zig_zag:
-        return partition(out, zigzag_indices(seq, cp_size=cp_size))
+        return partition(out, zigzag_indices(seq, cp_size=cp_size, n_splits=n_splits))
     if striped:
         return partition(out, striped_indices(seq, cp_size=cp_size))
     return out.reshape(*out.shape[:-2], cp_size, seq // cp_size, out.shape[-1]).movedim(-3, 0)

@@ -39,10 +39,7 @@ cmake --build build/release -j
 PASS=1
 
 # Helper: run one --verify invocation and print PASS/FAIL.
-# Usage: check_verify <n> <mode> <causal> [--zigzag 1 | --striped 1]
-# NOTE: the partition flags take an explicit value (--zigzag 1 / --striped 1);
-# a bare --zigzag is silently dropped by the CLI parser (it consumes the next
-# token as its value), which would quietly run contiguous instead.
+# Usage: check_verify <n> <mode> <causal> [--zigzag-n N | --striped 1]
 # Shape can be overridden via env vars: SEQ (default 1024), HEAD_DIM (default 64).
 check_verify() {
   local n=$1 mode=$2 causal=$3
@@ -83,10 +80,10 @@ done
 # Zigzag variants (seq=1024 divisible by 2*cp_size for cp ∈ {1,2,4}).
 for mode in ring-blocking ring-overlap; do
   echo ""
-  echo "=== ${mode} --zigzag --verify ==="
+  echo "=== ${mode} --zigzag-n 1 --verify ==="
   for n in 1 2 4; do
     for causal in 0 1; do
-      check_verify "${n}" "${mode}" "${causal}" --zigzag 1
+      check_verify "${n}" "${mode}" "${causal}" --zigzag-n 1
     done
   done
 done
@@ -106,11 +103,11 @@ done
 # shape-specific bugs (D=128 register spilling, large-seq tiling) the fixed
 # 1024×64 matrix misses. cp_size=2 suffices: shape bugs are kernel-local.
 echo ""
-echo "=== ring-overlap --zigzag/--striped --verify (shape sweep, cp_size=2, causal=1) ==="
+echo "=== ring-overlap --zigzag-n/--striped --verify (shape sweep, cp_size=2, causal=1) ==="
 for HEAD_DIM in 32 64 128; do
   for SEQ in 512 4096; do
     export SEQ HEAD_DIM
-    check_verify 2 ring-overlap 1 --zigzag 1
+    check_verify 2 ring-overlap 1 --zigzag-n 1
     check_verify 2 ring-overlap 1 --striped 1
   done
 done
@@ -122,11 +119,11 @@ if [ "${SLURM_NNODES:-1}" -ge 2 ]; then
   N_TOTAL=$((SLURM_NNODES * 4))
   echo ""
   echo "=== multi-node verify (nodes=${SLURM_NNODES}, n=${N_TOTAL}) ==="
-  export SEQ=$((512 * N_TOTAL))  # divisible by 2*cp_size for zigzag
+  export SEQ=$((512 * N_TOTAL))  # divisible by 2*cp_size for --zigzag-n 1
   export HEAD_DIM=64
   for mode in ring-blocking ring-overlap; do
     for causal in 0 1; do
-      check_verify "${N_TOTAL}" "${mode}" "${causal}" --zigzag 1
+      check_verify "${N_TOTAL}" "${mode}" "${causal}" --zigzag-n 1
       check_verify "${N_TOTAL}" "${mode}" "${causal}" --striped 1
     done
   done
@@ -153,7 +150,7 @@ for seq in 128 256 1024 4096; do
   for mode in ring-blocking ring-overlap; do
     echo -n "seq=${seq} ${mode}: "
     mpirun -n 2 ${CLI} --seq ${seq} --heads 4 --head_dim 128 --iters 1 \
-      --causal 1 --zigzag 1 --mode ${mode} --verify 2>/dev/null | grep -i verify || echo "(no verify line)"
+      --causal 1 --zigzag-n 1 --mode ${mode} --verify 2>/dev/null | grep -i verify || echo "(no verify line)"
   done
 done
 

@@ -241,10 +241,11 @@ ring_attention::RingResult run_ring_blocking_fp16(const ring_attention::RingConf
   const int kv_H = (cfg.kv_heads > 0) ? cfg.kv_heads : cfg.heads;
   const int S = cfg.seq, P = cfg.cp_size, R = cfg.rank;
 
-  const RingPartition::Mode mode = cfg.striped  ? RingPartition::Mode::Striped
-                                   : cfg.zigzag ? RingPartition::Mode::Zigzag
-                                                : RingPartition::Mode::Contiguous;
-  RingPartition part(P, R, S, mode);
+  const RingPartition::Mode mode = cfg.striped        ? RingPartition::Mode::Striped
+                                   : cfg.zigzag_n > 0 ? RingPartition::Mode::Zigzag
+                                                      : RingPartition::Mode::Contiguous;
+  const int n_splits = zigzag_sub_groups(cfg.zigzag_n);
+  RingPartition part(P, R, S, mode, n_splits);
   const int stride = part.position_stride();  // 1 (contiguous/zigzag) or cp_size (striped)
   const int nsg = part.num_sub_groups();
   const int Sl = part.local_chunk_len();
@@ -525,10 +526,11 @@ ring_attention::RingResult run_ring_overlap_fp16(const ring_attention::RingConfi
   const int kv_H = (cfg.kv_heads > 0) ? cfg.kv_heads : cfg.heads;
   const int S = cfg.seq, P = cfg.cp_size, R = cfg.rank;
 
-  const RingPartition::Mode mode = cfg.striped  ? RingPartition::Mode::Striped
-                                   : cfg.zigzag ? RingPartition::Mode::Zigzag
-                                                : RingPartition::Mode::Contiguous;
-  RingPartition part(P, R, S, mode);
+  const RingPartition::Mode mode = cfg.striped        ? RingPartition::Mode::Striped
+                                   : cfg.zigzag_n > 0 ? RingPartition::Mode::Zigzag
+                                                      : RingPartition::Mode::Contiguous;
+  const int n_splits = zigzag_sub_groups(cfg.zigzag_n);
+  RingPartition part(P, R, S, mode, n_splits);
   const int stride = part.position_stride();  // 1 (contiguous/zigzag) or cp_size (striped)
   const int nsg = part.num_sub_groups();
   const int Sl = part.local_chunk_len();
@@ -820,8 +822,11 @@ ring_attention::RingResult run_ring_overlap_fp16(const ring_attention::RingConfi
 namespace ring_attention {
 
 RingResult run_ring_attention_fp16(const RingConfig& cfg) {
-  if (cfg.zigzag && cfg.mode == RingMode::AllGather)
-    mpi_die("--zigzag is not supported with --mode=allgather (use ring-blocking or ring-overlap)");
+  if (cfg.zigzag_n > 0 && cfg.striped)
+    mpi_die("--zigzag-n and --striped are mutually exclusive (pick one partition scheme)");
+  if (cfg.zigzag_n > 0 && cfg.mode == RingMode::AllGather)
+    mpi_die(
+        "--zigzag-n is not supported with --mode=allgather (use ring-blocking or ring-overlap)");
   if (cfg.striped && cfg.mode == RingMode::AllGather)
     mpi_die("--striped is not supported with --mode=allgather (use ring-blocking or ring-overlap)");
   switch (cfg.mode) {

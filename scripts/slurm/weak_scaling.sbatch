@@ -15,8 +15,9 @@
 # grows; the rise above flat is communication/overlap overhead.
 #
 # Sweeps every cp_size ∈ 1..16 (up to 4 nodes × 4 GPUs) — seq = PER_RANK*cp is
-# always divisible by 2*cp (PER_RANK even), so all 16 values are valid for
-# zigzag. head_dim is swept over {32, 64, 128, 256}.
+# always divisible by 2*ZIGZAG_N*cp (PER_RANK divisible by 2*ZIGZAG_N), so all 16
+# values are valid for zigzag. head_dim is swept over {32, 64, 128, 256}.
+# ZIGZAG_N: number of zig-zag passes (default 1; each pass = 2 sub-groups, set 2 to override).
 #   sbatch scripts/slurm/weak_scaling.sbatch              # full 4-node sweep
 #   sbatch --nodes=2 scripts/slurm/weak_scaling.sbatch    # cap at cp8 (2 nodes)
 #   sbatch --nodes=1 scripts/slurm/weak_scaling.sbatch    # single node, cp<=4
@@ -24,7 +25,7 @@
 # cp_size values larger than the allocation (nodes*4) are skipped.
 #
 # Output: results/bench_weak.csv  (same schema as bench_ring.csv)
-#   columns: mode,cp_size,batch,heads,seq,head_dim,causal,zigzag,striped,iters,
+#   columns: mode,cp_size,batch,heads,seq,head_dim,causal,zigzag_n,striped,iters,
 #            comm_ms,comp_ms,wait_ms,total_ms,max_err
 
 set -euo pipefail
@@ -45,12 +46,13 @@ NNODES="${SLURM_NNODES:-1}"
 MAX_CP=$((NNODES * 4))
 echo "nodes=${NNODES}  max cp_size=${MAX_CP}  nodelist=${SLURM_JOB_NODELIST:-?}"
 
-# Tokens owned by each rank, held constant across the sweep. Even, so that
-# seq = PER_RANK*cp_size is divisible by 2*cp_size for zigzag at every cp_size.
+# Tokens owned by each rank, held constant across the sweep. Must be divisible
+# by 2*ZIGZAG_N so that seq = PER_RANK*cp_size is divisible by 2*ZIGZAG_N*cp_size.
 PER_RANK=4096
 ITERS=20
+ZIGZAG_N="${ZIGZAG_N:-1}"  # number of zig-zag passes; override with: ZIGZAG_N=2 sbatch ...
 
-echo "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag,striped,iters,comm_ms,comp_ms,wait_ms,total_ms,max_err" \
+echo "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag_n,striped,iters,comm_ms,comp_ms,wait_ms,total_ms,max_err" \
   > "${CSV}"
 
 # Production config: ring-overlap, causal, zigzag.
@@ -58,14 +60,14 @@ bench_one() {
   local cp_size=$1 head_dim=$2
   if [ "${cp_size}" -gt "${MAX_CP}" ]; then return 0; fi
   local seq=$((PER_RANK * cp_size))  # fixed work per rank
-  echo "cp_size=${cp_size}  seq=${seq} (per_rank=${PER_RANK})  head_dim=${head_dim}  (ring-overlap causal zigzag)"
+  echo "cp_size=${cp_size}  seq=${seq} (per_rank=${PER_RANK})  head_dim=${head_dim}  (ring-overlap causal zigzag_n=${ZIGZAG_N})"
   mpirun -n "${cp_size}" "${CLI}" \
     --batch 1 --heads 4 \
     --seq "${seq}" \
     --head_dim "${head_dim}" \
     --causal 1 \
     --mode ring-overlap \
-    --zigzag 1 \
+    --zigzag-n "${ZIGZAG_N}" \
     --iters "${ITERS}" \
     --csv 2>/dev/null \
     | grep "^ring-overlap," \

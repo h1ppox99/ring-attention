@@ -20,10 +20,12 @@ class RingPartition {
 
   /// @param cp_size  Total ranks in the ring.
   /// @param rank     This rank's index, in [0, cp_size).
-  /// @param seq      Global sequence length; must be divisible by cp_size (and by 2*cp_size
-  ///                 for Zigzag mode).
+  /// @param seq      Global sequence length; must be divisible by cp_size (and by
+  ///                 n_splits*cp_size for Zigzag mode).
   /// @param mode     Token assignment scheme.
-  RingPartition(int cp_size, int rank, int seq, Mode mode = Mode::Contiguous);
+  /// @param n_splits Number of sub-groups per rank in Zigzag mode (>= 2). Ignored in
+  ///                 Contiguous mode. Default is 2 (classic early+late pair).
+  RingPartition(int cp_size, int rank, int seq, Mode mode = Mode::Contiguous, int n_splits = 2);
 
   /// Global token position of the first query row in sub-group `sg`.
   /// Contiguous: sg is ignored (there is one sub-group). Zigzag: sg=0 = low, sg=1 = high.
@@ -52,7 +54,7 @@ class RingPartition {
   int next_rank() const;  ///< Rank this rank sends K/V to: (rank + 1) % cp_size.
   int prev_rank() const;  ///< Rank this rank receives K/V from: (rank - 1 + cp_size) % cp_size.
 
-  /// Number of sub-groups per rank: 1 for Contiguous, 2 for Zigzag, 1 for Striped.
+  /// Number of sub-groups per rank: 1 for Contiguous, n_splits for Zigzag, 1 for Striped.
   int num_sub_groups() const;
 
   /// Spacing (in global token positions) between consecutive local rows.
@@ -65,9 +67,10 @@ class RingPartition {
   int rank() const { return rank_; }
   int seq() const { return seq_; }
   Mode mode() const { return mode_; }
+  int n_splits() const { return n_splits_; }
 
  private:
-  int cp_size_, rank_, seq_;
+  int cp_size_, rank_, seq_, n_splits_;
   Mode mode_;
 };
 

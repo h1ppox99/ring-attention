@@ -6,12 +6,15 @@
 ///   Contiguous : rank r owns the contiguous block [r*chunk, (r+1)*chunk),
 ///                where chunk = seq / cp_size.
 ///
-///   Zigzag (coarse) : the sequence is split into 2*cp_size chunks of size
-///                seq/(2*cp_size); rank r owns chunks r and (2*cp_size-1-r).
-///                The two chunks live in distinct *sub-groups* — both are
-///                contiguous in global coords, but at very different
-///                positions (one in the early half, one in the late half).
-///                Under causal masking this evens out the per-rank workload.
+///   Zigzag (coarse) : the sequence is split into n_splits*cp_size chunks of
+///                size seq/(n_splits*cp_size); rank r owns n_splits chunks.
+///                Sub-groups are paired inward — (0, n-1), (1, n-2), … — so
+///                each rank holds one early (cheap under causal) and one late
+///                (expensive) chunk per pair, balancing per-rank workload.
+///
+///                Offset formula for sub-group sg, letting k = sg / 2:
+///                  even sg: (k * cp_size + rank) * chunk
+///                  odd  sg: ((n_splits-1-k) * cp_size + (cp_size-1-rank)) * chunk
 ///
 ///   Striped : rank r owns tokens {r, r+cp_size, r+2*cp_size, ...}, i.e. token
 ///                i is assigned to rank (i % cp_size). A single sub-group, but
@@ -22,12 +25,12 @@
 ///                (see `position_stride`). Like Zigzag it balances causal load,
 ///                and additionally makes the per-ring-step mask near-uniform.
 ///
-/// Note: Zigzag here is "coarse" (2 contiguous sub-groups). The Python
+/// Note: Zigzag here is "coarse" (contiguous sub-groups). The Python
 /// reference's `zigzag_indices` uses the finer scheme where each rank owns
-/// 2 positions in each macro-chunk of size 2*cp_size. Both balance load
-/// equally well; coarse is what fits the single-`q_offset`-per-call kernel
-/// API without scatter/gather. Striped achieves the fine-grained interleave
-/// via the stride instead of via scatter/gather.
+/// n_splits positions in each macro-chunk of size n_splits*cp_size. Both
+/// balance load equally well; coarse fits the single-`q_offset`-per-call
+/// kernel API without scatter/gather. Striped achieves the fine-grained
+/// interleave via the stride instead of via scatter/gather.
 
 #include "ring_partition.hpp"
 
@@ -35,12 +38,15 @@
 
 namespace ring_attention {
 
-RingPartition::RingPartition(int cp_size, int rank, int seq, Mode mode)
-    : cp_size_(cp_size), rank_(rank), seq_(seq), mode_(mode) {
+RingPartition::RingPartition(int cp_size, int rank, int seq, Mode mode, int n_splits)
+    : cp_size_(cp_size), rank_(rank), seq_(seq), n_splits_(n_splits), mode_(mode) {
   assert(cp_size > 0);
   assert(rank >= 0 && rank < cp_size);
   assert(seq % cp_size == 0);
-  if (mode == Mode::Zigzag) assert(seq % (2 * cp_size) == 0);
+  if (mode == Mode::Zigzag) {
+    assert(n_splits >= 2);
+    assert(seq % (n_splits * cp_size) == 0);
+  }
 }
 
 int RingPartition::q_offset(int sg) const {
@@ -48,9 +54,12 @@ int RingPartition::q_offset(int sg) const {
   // Striped: one sub-group; local row i is at global position rank_ + i*cp_size
   // (see position_stride). The base offset is therefore just the rank.
   if (mode_ == Mode::Striped) return rank_;
-  // Zigzag: sub-group 0 is the "early" chunk; sub-group 1 is its mirror.
-  const int chunk = seq_ / (2 * cp_size_);
-  return (sg == 0 ? rank_ : (2 * cp_size_ - 1 - rank_)) * chunk;
+  // Zigzag: sub-group sg is paired inward (k = sg/2); even sg = early chunk,
+  // odd sg = its mirror in the late half.
+  const int chunk = seq_ / (n_splits_ * cp_size_);
+  const int k = sg / 2;
+  if (sg % 2 == 0) return (k * cp_size_ + rank_) * chunk;
+  return ((n_splits_ - 1 - k) * cp_size_ + (cp_size_ - 1 - rank_)) * chunk;
 }
 
 int RingPartition::k_offset_for_step(int step, int sg) const {
@@ -61,24 +70,25 @@ int RingPartition::k_offset_for_step(int step, int sg) const {
 
 int RingPartition::k_offset_for_source(int source_rank, int sg) const {
   if (mode_ == Mode::Contiguous) return source_rank * (seq_ / cp_size_);
-  // Zigzag: source's low chunk sits at slot `source_rank`; its high (mirror)
-  // chunk at slot (2*cp_size - 1 - source_rank). Same mapping q_offset uses.
+  // Zigzag: source's chunks are paired inward, same mapping q_offset uses.
   // Striped: the held chunk's local row j is at global position source + j*cp_size.
   if (mode_ == Mode::Striped) return source_rank;
-  const int chunk = seq_ / (2 * cp_size_);
-  return (sg == 0 ? source_rank : (2 * cp_size_ - 1 - source_rank)) * chunk;
+  const int chunk = seq_ / (n_splits_ * cp_size_);
+  const int k = sg / 2;
+  if (sg % 2 == 0) return (k * cp_size_ + source_rank) * chunk;
+  return ((n_splits_ - 1 - k) * cp_size_ + (cp_size_ - 1 - source_rank)) * chunk;
 }
 
 int RingPartition::local_chunk_len(int /*sg*/) const {
-  // Sub-groups always have equal length: contiguous and striped own one group
-  // of seq/cp_size; zigzag owns two groups of seq/(2*cp_size) each.
-  return (mode_ == Mode::Zigzag) ? seq_ / (2 * cp_size_) : seq_ / cp_size_;
+  // Contiguous and striped own one group of seq/cp_size; zigzag owns n_splits
+  // groups of seq/(n_splits*cp_size) each.
+  return (mode_ == Mode::Zigzag) ? seq_ / (n_splits_ * cp_size_) : seq_ / cp_size_;
 }
 
 int RingPartition::next_rank() const { return (rank_ + 1) % cp_size_; }
 int RingPartition::prev_rank() const { return (rank_ - 1 + cp_size_) % cp_size_; }
 
-int RingPartition::num_sub_groups() const { return (mode_ == Mode::Zigzag) ? 2 : 1; }
+int RingPartition::num_sub_groups() const { return (mode_ == Mode::Zigzag) ? n_splits_ : 1; }
 
 int RingPartition::position_stride() const {
   // Global position of local row i in a sub-group is: offset + i * stride.
