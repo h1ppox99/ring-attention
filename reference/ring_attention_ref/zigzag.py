@@ -1,6 +1,7 @@
 """Zig-zag token partitioning for causal ring attention load balance.
 
-Rank i owns positions (i, 2*cp_size - 1 - i) within each chunk of length 2*cp_size.
+Rank i owns n_splits positions within each macro-chunk of length n_splits*cp_size.
+Sub-groups are paired inward: (0, n-1), (1, n-2), ... to balance early/late work.
 """
 
 from __future__ import annotations
@@ -8,15 +9,20 @@ from __future__ import annotations
 import torch
 
 
-def zigzag_indices(seq_len: int, cp_size: int) -> torch.Tensor:
+def zigzag_indices(seq_len: int, cp_size: int, n_splits: int = 2) -> torch.Tensor:
     """Token indices owned by each rank under zig-zag assignment.
 
     Parameters
     ----------
     seq_len : int
-        Total sequence length; must be divisible by ``2 * cp_size``.
+        Total sequence length; must be divisible by ``n_splits * cp_size``.
     cp_size : int
         Number of ranks in the ring.
+    n_splits : int
+        Number of sub-groups per rank (>= 2). Each rank owns ``n_splits``
+        evenly-spaced chunks of the sequence, paired symmetrically so that
+        early (cheap under causal) and late (expensive) chunks balance out.
+        Default is 2 for backward compatibility.
 
     Returns
     -------
@@ -27,18 +33,26 @@ def zigzag_indices(seq_len: int, cp_size: int) -> torch.Tensor:
     Raises
     ------
     ValueError
-        If ``seq_len`` is not divisible by ``2 * cp_size``.
+        If ``seq_len`` is not divisible by ``n_splits * cp_size``.
     """
-    chunk = 2 * cp_size
+    chunk = n_splits * cp_size
     if seq_len % chunk != 0:
-        raise ValueError(f"seq_len={seq_len} must be divisible by 2*cp_size={chunk}")
+        raise ValueError(f"seq_len={seq_len} must be divisible by n_splits*cp_size={chunk}")
     num_chunks = seq_len // chunk
     chunk_starts = torch.arange(num_chunks) * chunk  # (num_chunks,)
     ranks = torch.arange(cp_size).unsqueeze(1)  # (cp_size, 1)
-    # Per chunk, each rank owns the (i)-th and (2*cp_size - 1 - i)-th positions.
-    lows = chunk_starts.unsqueeze(0) + ranks  # (cp_size, num_chunks)
-    highs = chunk_starts.unsqueeze(0) + (chunk - 1 - ranks)  # (cp_size, num_chunks)
-    return torch.stack([lows, highs], dim=-1).reshape(cp_size, -1)
+
+    parts: list[torch.Tensor] = []
+
+    for sg in range(n_splits):
+        k = sg // 2
+        if sg % 2 == 0:
+            local_offset = k * cp_size + ranks
+        else:
+            local_offset = (n_splits - 1 - k) * cp_size + (cp_size - 1 - ranks)
+        parts.append(chunk_starts.unsqueeze(0) + local_offset)
+
+    return torch.stack(parts, dim=-1).reshape(cp_size, -1)
 
 
 def partition(x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:

@@ -39,7 +39,7 @@ def load_csv(path: Path) -> pd.DataFrame:
     and drop any row that failed to parse (NaN in the keys we plot on).
     """
     df = pd.read_csv(path)
-    numeric = ["cp_size", "batch", "heads", "seq", "head_dim", "causal", "zigzag", "total_ms"]
+    numeric = ["cp_size", "batch", "heads", "seq", "head_dim", "causal", "zigzag_n", "total_ms"]
     df[numeric] = df[numeric].apply(pd.to_numeric, errors="coerce")
     df = df.dropna(subset=["cp_size", "seq", "head_dim", "total_ms"]).reset_index(drop=True)
     return df

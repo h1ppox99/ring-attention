@@ -45,7 +45,7 @@ struct RingConfig {
   int head_dim;
   int kv_heads{0};  ///< KV head count for GQA/MQA; 0 means same as heads (MHA).
   bool causal;
-  bool zigzag;
+  int zigzag_n{0};  ///< 0 = disabled; N >= 1 = N zig-zag passes (each pass = 2 sub-groups).
   bool verify;
   bool csv;
   RingMode mode;
@@ -53,6 +53,12 @@ struct RingConfig {
   uint32_t seed = 42u;
   RingDtype dtype = RingDtype::Float;
 };
+
+/// Sub-group count for a zig-zag config. Each "pass" is one outward→inward
+/// sweep owning 2 sub-groups (an early + a late chunk), so N passes = 2N
+/// sub-groups. Returns a valid (>=2) count even when zig-zag is disabled, so
+/// callers can build a RingPartition unconditionally — Contiguous mode ignores it.
+inline int zigzag_sub_groups(int zigzag_n) { return zigzag_n > 0 ? 2 * zigzag_n : 2; }
 
 /// Run one complete ring-attention forward pass (all modes, all phases).
 ///
