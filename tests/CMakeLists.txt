@@ -83,6 +83,11 @@ add_executable(test_attention_step_fp16 test_attention_step_fp16.cu)
 target_link_libraries(test_attention_step_fp16 PRIVATE ring_attention)
 add_test(NAME attention_step_fp16 COMMAND test_attention_step_fp16)
 
+add_executable(test_attention_step_segmented test_attention_step_segmented.cu)
+target_link_libraries(test_attention_step_segmented PRIVATE ring_attention)
+add_test(NAME attention_step_segmented COMMAND test_attention_step_segmented)
+set_tests_properties(attention_step_segmented PROPERTIES LABELS gpu)
+
 add_executable(test_ring_partition test_ring_partition.cpp)
 target_link_libraries(test_ring_partition PRIVATE ring_attention)
 add_test(NAME ring_partition COMMAND test_ring_partition)

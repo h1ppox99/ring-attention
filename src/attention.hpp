@@ -93,6 +93,31 @@ void launch_attention_step(const float* q, const float* k, const float* v, float
                            float* l, const AttentionShape& shape, int q_offset, int k_offset,
                            bool causal, cudaStream_t stream = 0, int pos_stride = 1);
 
+/// Piecewise-affine position map for the segmented attention step.
+///
+/// The local shard is `n_seg` equal-length contiguous segments; local row `i`
+/// sits at global position `base[i / seg_len] + (i % seg_len)` (stride 1 *within*
+/// a segment, arbitrary jump *between* segments). This is exactly a fine zig-zag
+/// assignment expressed as one shard instead of `n_seg` separate sub-groups.
+struct SegMap {
+  static constexpr int kMaxSeg = 16;  ///< up to 8 zig-zag passes (2N sub-groups).
+  int n_seg{1};                       ///< number of segments; seq == n_seg * seg_len.
+  int seg_len{0};                     ///< rows per segment (equal across segments).
+  int base[kMaxSeg]{};                ///< global position of each segment's first row.
+};
+
+/// Single-launch segmented attention step (FP32). Same online-softmax
+/// `(O, m, l)` persistent-state semantics as `launch_attention_step`, but query
+/// and key global positions come from a piecewise-affine `SegMap` instead of an
+/// affine `(offset, stride)`. This lets a fine zig-zag assignment run in ONE
+/// kernel launch over the whole local shard, rather than the `n_seg^2` affine
+/// calls the sub-group loop in `ring_loop.cu` issues. Supported `head_dim`:
+/// 32, 64, 128, 256.
+void launch_attention_step_segmented(const float* q, const float* k, const float* v, float* out,
+                                     float* m, float* l, const AttentionShape& shape,
+                                     const SegMap& qmap, const SegMap& kmap, bool causal,
+                                     cudaStream_t stream = 0);
+
 /// Decode-specialized step kernel — `seq_q = 1`, one warp per `(batch, head)`.
 /// Same `(M, L, O)` persistent-state semantics as `launch_attention_step` so
 /// the ring decode loop can call it once per ring step. Supports
