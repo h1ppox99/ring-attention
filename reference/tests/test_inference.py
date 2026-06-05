@@ -58,6 +58,24 @@ def test_prefill_output_matches_ring_attention_zigzag(cp_size: int, causal: bool
     torch.testing.assert_close(out_shards, expected, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+@pytest.mark.parametrize("causal", [False, True])
+def test_prefill_output_matches_ring_attention_striped(cp_size: int, causal: bool) -> None:
+    """Striped partitioning: prefill output shards must equal ring_attention."""
+    q, k, v = _make_qkv(seq=32)
+
+    out_shards, _ = prefill(q, k, v, cp_size=cp_size, causal=causal, zig_zag=False, striped=True)
+    expected = ring_attention(q, k, v, cp_size=cp_size, causal=causal, zig_zag=False, striped=True)
+
+    torch.testing.assert_close(out_shards, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_prefill_zigzag_and_striped_mutually_exclusive() -> None:
+    q, k, v = _make_qkv(seq=32)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        prefill(q, k, v, cp_size=2, causal=False, zig_zag=True, striped=True)
+
+
 # ---- Phase 1: cache shape and state after prefill ----------------------------
 
 
