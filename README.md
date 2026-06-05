@@ -77,8 +77,8 @@ pre-commit install --install-hooks
 source scripts/env/activate.sh
 ```
 
-> [!warning] Cluster note
-> Development targets the Stanford HPCC `gpu-turing` partition
+> [!WARNING]
+> **Cluster note.** Development targets the Stanford HPCC `gpu-turing` partition
 > (Turing / `sm_75`, NVHPC 24.1 → nvcc 12.3, Open MPI 4.1.7, NCCL). The login node has no
 > GPU — always run GPU work under `salloc`/`sbatch`.
 
