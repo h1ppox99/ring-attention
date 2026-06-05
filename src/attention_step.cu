@@ -106,12 +106,17 @@ __global__ void finalize_kernel(float* O, const float* L, int H, int Sq, int D) 
 ///                  with the local `j` index to recover `j_global` for the
 ///                  causal predicate. Lets the ring pass non-contiguous chunks
 ///                  (e.g. zig-zag) without changing the kernel.
+/// @param pos_stride Spacing between consecutive local rows in global-position
+///                  space. 1 for contiguous/zigzag (each chunk is a contiguous
+///                  run); cp_size for striped (row i sits at offset+i*cp_size).
+///                  Global positions are `q_offset + i_local*pos_stride` (query)
+///                  and `k_offset + j*pos_stride` (key).
 template <int BR, int BC, int D>
 __global__ void attention_step_kernel(const float* __restrict__ Q, const float* __restrict__ K,
                                       const float* __restrict__ V, float* __restrict__ O,
                                       float* __restrict__ M, float* __restrict__ L, int H, int kv_H,
                                       int Sq, int Sk, float scale, bool causal, int q_offset,
-                                      int k_offset) {
+                                      int k_offset, int pos_stride) {
   static_assert(D % 4 == 0, "D must be a multiple of 4 for float4 K/V loads.");
   static_assert((BC * D) % (BR * 4) == 0,
                 "Cooperative float4 K/V load assumes BC*D/4 divides evenly across BR threads.");
@@ -157,7 +162,7 @@ __global__ void attention_step_kernel(const float* __restrict__ Q, const float* 
     for (int d = 0; d < D; ++d) O_i[d] = 0.0f;
   }
 
-  const int i_global = q_offset + i_local;
+  const int i_global = q_offset + i_local * pos_stride;
   const int num_k_tiles = (Sk + BC - 1) / BC;
 
   // Each float4 iteration moves 4 contiguous floats of K (and V) from global
@@ -220,7 +225,7 @@ __global__ void attention_step_kernel(const float* __restrict__ Q, const float* 
 #pragma unroll
     for (int j = 0; j < BC; ++j) {
       const int j_local_in_chunk = j_base + j;
-      const int j_global = k_offset + j_local_in_chunk;
+      const int j_global = k_offset + j_local_in_chunk * pos_stride;
       const bool visible = (j_local_in_chunk < Sk) && (!causal || (j_global <= i_global));
       if (visible) {
         s[j] *= scale;
@@ -279,14 +284,192 @@ __global__ void attention_step_kernel(const float* __restrict__ Q, const float* 
 template <int BR, int BC, int D>
 void launch_step_typed(const float* q, const float* k, const float* v, float* out, float* m,
                        float* l, const AttentionShape& shape, int q_offset, int k_offset,
-                       bool causal, cudaStream_t stream) {
+                       int pos_stride, bool causal, cudaStream_t stream) {
   const dim3 grid(ceil_div(shape.seq_q, BR), shape.heads, shape.batch);
   const dim3 block(BR);
   const int kv_H = (shape.kv_heads > 0) ? shape.kv_heads : shape.heads;
   const float scale = 1.0f / std::sqrt(static_cast<float>(D));
-  attention_step_kernel<BR, BC, D><<<grid, block, 0, stream>>>(q, k, v, out, m, l, shape.heads,
-                                                               kv_H, shape.seq_q, shape.seq_k,
-                                                               scale, causal, q_offset, k_offset);
+  attention_step_kernel<BR, BC, D>
+      <<<grid, block, 0, stream>>>(q, k, v, out, m, l, shape.heads, kv_H, shape.seq_q, shape.seq_k,
+                                   scale, causal, q_offset, k_offset, pos_stride);
+  cudaCheck(cudaGetLastError());
+}
+
+/// Segmented step. Identical online-softmax recurrence to
+/// `attention_step_kernel`, except global token positions are recovered from a
+/// piecewise-affine `SegMap` (one shard of `n_seg` contiguous sub-blocks at
+/// scattered global offsets) rather than a single affine `(offset, stride)`.
+/// The only differences vs. the affine kernel are the two `*_global` lines —
+/// everything else (tiling, register Q, float4 loads) is byte-for-byte the same,
+/// so a timing delta isolates exactly the cost of the segment lookup.
+template <int BR, int BC, int D>
+__global__ void attention_step_segmented_kernel(const float* __restrict__ Q,
+                                                const float* __restrict__ K,
+                                                const float* __restrict__ V, float* __restrict__ O,
+                                                float* __restrict__ M, float* __restrict__ L, int H,
+                                                int kv_H, int Sq, int Sk, float scale, bool causal,
+                                                SegMap qmap, SegMap kmap) {
+  static_assert(D % 4 == 0, "D must be a multiple of 4 for float4 K/V loads.");
+  static_assert((BC * D) % (BR * 4) == 0,
+                "Cooperative float4 K/V load assumes BC*D/4 divides evenly across BR threads.");
+
+  const int tid = threadIdx.x;
+  const int q_tile = blockIdx.x;
+  const int h = blockIdx.y;
+  const int b = blockIdx.z;
+
+  const int i_local = q_tile * BR + tid;
+  const bool active = (i_local < Sq);
+
+  const long head_q = ((long)b * H + h) * Sq * D;
+  const long head_k = ((long)b * kv_H + (h % kv_H)) * Sk * D;
+  const long row_idx = ((long)b * H + h) * Sq + i_local;
+
+  __shared__ float K_tile[BC * D];
+  __shared__ float V_tile[BC * D];
+
+  float Q_reg[D];
+  if (active) {
+    const float* q_src = Q + head_q + (long)i_local * D;
+#pragma unroll
+    for (int d = 0; d < D; ++d) Q_reg[d] = q_src[d];
+  } else {
+#pragma unroll
+    for (int d = 0; d < D; ++d) Q_reg[d] = 0.0f;
+  }
+
+  float m_i = active ? M[row_idx] : -INFINITY;
+  float l_i = active ? L[row_idx] : 0.0f;
+  float O_i[D];
+  if (active) {
+    const float* o_src = O + head_q + (long)i_local * D;
+#pragma unroll
+    for (int d = 0; d < D; ++d) O_i[d] = o_src[d];
+  } else {
+#pragma unroll
+    for (int d = 0; d < D; ++d) O_i[d] = 0.0f;
+  }
+
+  // Piecewise-affine query position — segment lookup instead of an
+  // affine stride. seg = i_local / seg_len; position = base[seg] + (i_local % seg_len).
+  const int q_seg = i_local / qmap.seg_len;
+  const int i_global = qmap.base[q_seg] + (i_local - q_seg * qmap.seg_len);
+  const int num_k_tiles = (Sk + BC - 1) / BC;
+
+  constexpr int kTileVec4 = (BC * D) / 4;
+
+  for (int kt = 0; kt < num_k_tiles; ++kt) {
+    __syncthreads();
+    const int j_base = kt * BC;
+
+    for (int idx4 = tid; idx4 < kTileVec4; idx4 += BR) {
+      const int idx = idx4 * 4;
+      const int j_local = idx / D;
+      const int d = idx - j_local * D;
+      const int j_local_in_chunk = j_base + j_local;
+      float4 k4;
+      float4 v4;
+      if (j_local_in_chunk < Sk) {
+        k4 = *reinterpret_cast<const float4*>(K + head_k + (long)j_local_in_chunk * D + d);
+        v4 = *reinterpret_cast<const float4*>(V + head_k + (long)j_local_in_chunk * D + d);
+      } else {
+        k4 = float4{0.0f, 0.0f, 0.0f, 0.0f};
+        v4 = float4{0.0f, 0.0f, 0.0f, 0.0f};
+      }
+      *reinterpret_cast<float4*>(K_tile + idx) = k4;
+      *reinterpret_cast<float4*>(V_tile + idx) = v4;
+    }
+    __syncthreads();
+
+    if (!active) continue;
+
+    float s[BC];
+#pragma unroll
+    for (int j = 0; j < BC; ++j) s[j] = 0.0f;
+
+#pragma unroll
+    for (int d4 = 0; d4 < D / 4; ++d4) {
+      const float q0 = Q_reg[d4 * 4 + 0];
+      const float q1 = Q_reg[d4 * 4 + 1];
+      const float q2 = Q_reg[d4 * 4 + 2];
+      const float q3 = Q_reg[d4 * 4 + 3];
+#pragma unroll
+      for (int j = 0; j < BC; ++j) {
+        const float4 k4 = *reinterpret_cast<const float4*>(&K_tile[j * D + d4 * 4]);
+        s[j] += q0 * k4.x + q1 * k4.y + q2 * k4.z + q3 * k4.w;
+      }
+    }
+
+    float m_new = m_i;
+#pragma unroll
+    for (int j = 0; j < BC; ++j) {
+      const int j_local_in_chunk = j_base + j;
+      // Piecewise-affine key position (segment lookup in the hot loop).
+      const int k_seg = j_local_in_chunk / kmap.seg_len;
+      const int j_global = kmap.base[k_seg] + (j_local_in_chunk - k_seg * kmap.seg_len);
+      const bool visible = (j_local_in_chunk < Sk) && (!causal || (j_global <= i_global));
+      if (visible) {
+        s[j] *= scale;
+        if (s[j] > m_new) m_new = s[j];
+      } else {
+        s[j] = -INFINITY;
+      }
+    }
+
+    if (m_new == -INFINITY) continue;
+
+    const float alpha = expf(m_i - m_new);
+    float row_sum = 0.0f;
+#pragma unroll
+    for (int j = 0; j < BC; ++j) {
+      s[j] = (s[j] == -INFINITY) ? 0.0f : expf(s[j] - m_new);
+      row_sum += s[j];
+    }
+
+#pragma unroll
+    for (int d4 = 0; d4 < D / 4; ++d4) {
+      float4 acc;
+      acc.x = alpha * O_i[d4 * 4 + 0];
+      acc.y = alpha * O_i[d4 * 4 + 1];
+      acc.z = alpha * O_i[d4 * 4 + 2];
+      acc.w = alpha * O_i[d4 * 4 + 3];
+#pragma unroll
+      for (int j = 0; j < BC; ++j) {
+        const float4 v4 = *reinterpret_cast<const float4*>(&V_tile[j * D + d4 * 4]);
+        acc.x += s[j] * v4.x;
+        acc.y += s[j] * v4.y;
+        acc.z += s[j] * v4.z;
+        acc.w += s[j] * v4.w;
+      }
+      O_i[d4 * 4 + 0] = acc.x;
+      O_i[d4 * 4 + 1] = acc.y;
+      O_i[d4 * 4 + 2] = acc.z;
+      O_i[d4 * 4 + 3] = acc.w;
+    }
+    l_i = alpha * l_i + row_sum;
+    m_i = m_new;
+  }
+
+  if (active) {
+    float* o_dst = O + head_q + (long)i_local * D;
+#pragma unroll
+    for (int d = 0; d < D; ++d) o_dst[d] = O_i[d];
+    M[row_idx] = m_i;
+    L[row_idx] = l_i;
+  }
+}
+
+template <int BR, int BC, int D>
+void launch_step_segmented_typed(const float* q, const float* k, const float* v, float* out,
+                                 float* m, float* l, const AttentionShape& shape,
+                                 const SegMap& qmap, const SegMap& kmap, bool causal,
+                                 cudaStream_t stream) {
+  const dim3 grid(ceil_div(shape.seq_q, BR), shape.heads, shape.batch);
+  const dim3 block(BR);
+  const int kv_H = (shape.kv_heads > 0) ? shape.kv_heads : shape.heads;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+  attention_step_segmented_kernel<BR, BC, D><<<grid, block, 0, stream>>>(
+      q, k, v, out, m, l, shape.heads, kv_H, shape.seq_q, shape.seq_k, scale, causal, qmap, kmap);
   cudaCheck(cudaGetLastError());
 }
 
@@ -304,9 +487,10 @@ void launch_attention_init(float* out, float* m, float* l, const AttentionShape&
 
 void launch_attention_step(const float* q, const float* k, const float* v, float* out, float* m,
                            float* l, const AttentionShape& shape, int q_offset, int k_offset,
-                           bool causal, cudaStream_t stream) {
+                           bool causal, cudaStream_t stream, int pos_stride) {
   // Decode regime: one query row, fall through to the warp-cooperative kernel
-  // (see attention_decode.cu / KERNEL_OPTIMIZATIONS.md Round 5).
+  // (see attention_decode.cu / KERNEL_OPTIMIZATIONS.md Round 5). Decode is never
+  // strided (single query), so pos_stride does not apply there.
   if (shape.seq_q == 1) {
     launch_attention_decode_step(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
     return;
@@ -318,19 +502,52 @@ void launch_attention_step(const float* q, const float* k, const float* v, float
   // would multiply local-memory traffic across more threads.
   switch (shape.head_dim) {
     case 32:
-      launch_step_typed<128, 64, 32>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_step_typed<128, 64, 32>(q, k, v, out, m, l, shape, q_offset, k_offset, pos_stride,
+                                     causal, stream);
       break;
     case 64:
-      launch_step_typed<64, 32, 64>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_step_typed<64, 32, 64>(q, k, v, out, m, l, shape, q_offset, k_offset, pos_stride,
+                                    causal, stream);
       break;
     case 128:
-      launch_step_typed<64, 16, 128>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_step_typed<64, 16, 128>(q, k, v, out, m, l, shape, q_offset, k_offset, pos_stride,
+                                     causal, stream);
       break;
     case 256:
-      launch_step_typed<16, 8, 256>(q, k, v, out, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_step_typed<16, 8, 256>(q, k, v, out, m, l, shape, q_offset, k_offset, pos_stride,
+                                    causal, stream);
       break;
     default:
       fprintf(stderr, "attention_step: unsupported head_dim=%d (supported: 32, 64, 128, 256)\n",
+              shape.head_dim);
+      std::abort();
+  }
+}
+
+void launch_attention_step_segmented(const float* q, const float* k, const float* v, float* out,
+                                     float* m, float* l, const AttentionShape& shape,
+                                     const SegMap& qmap, const SegMap& kmap, bool causal,
+                                     cudaStream_t stream) {
+  switch (shape.head_dim) {
+    case 32:
+      launch_step_segmented_typed<128, 64, 32>(q, k, v, out, m, l, shape, qmap, kmap, causal,
+                                               stream);
+      break;
+    case 64:
+      launch_step_segmented_typed<64, 32, 64>(q, k, v, out, m, l, shape, qmap, kmap, causal,
+                                              stream);
+      break;
+    case 128:
+      launch_step_segmented_typed<64, 16, 128>(q, k, v, out, m, l, shape, qmap, kmap, causal,
+                                               stream);
+      break;
+    case 256:
+      launch_step_segmented_typed<16, 8, 256>(q, k, v, out, m, l, shape, qmap, kmap, causal,
+                                              stream);
+      break;
+    default:
+      fprintf(stderr,
+              "attention_step_segmented: unsupported head_dim=%d (supported: 32, 64, 128, 256)\n",
               shape.head_dim);
       std::abort();
   }

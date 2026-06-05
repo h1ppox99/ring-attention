@@ -77,17 +77,46 @@ void launch_attention_init(float* out, float* m, float* l, const AttentionShape&
 /// the persistent `(out, m, l)` state in place using the FlashAttention online
 /// softmax recurrence. `shape.seq_k` describes the chunk only.
 ///
-/// Global token positions are `(q_offset + i)` for queries and
-/// `(k_offset + j)` for keys; causal masking visibility is
-/// `k_offset + j <= q_offset + i`.
+/// Global token positions are `(q_offset + i*pos_stride)` for queries and
+/// `(k_offset + j*pos_stride)` for keys; causal masking visibility is
+/// `k_offset + j*pos_stride <= q_offset + i*pos_stride`. `pos_stride` defaults
+/// to 1 (contiguous / zig-zag chunks, where consecutive local rows are
+/// consecutive global positions); pass `cp_size` for striped partitioning,
+/// where rank r owns global positions r, r+cp_size, r+2*cp_size, …
 ///
 /// When `shape.seq_q == 1` this dispatches automatically to the
 /// `launch_attention_decode_step` kernel, which is structurally different
 /// (one warp per (B,H) row, lane-split D, no shared memory) — see
-/// `src/attention_decode.cu` and KERNEL_OPTIMIZATIONS.md Round 5.
+/// `src/attention_decode.cu` and KERNEL_OPTIMIZATIONS.md Round 5. Decode is a
+/// single query row, so `pos_stride` does not apply there.
 void launch_attention_step(const float* q, const float* k, const float* v, float* out, float* m,
                            float* l, const AttentionShape& shape, int q_offset, int k_offset,
-                           bool causal, cudaStream_t stream = 0);
+                           bool causal, cudaStream_t stream = 0, int pos_stride = 1);
+
+/// Piecewise-affine position map for the segmented attention step.
+///
+/// The local shard is `n_seg` equal-length contiguous segments; local row `i`
+/// sits at global position `base[i / seg_len] + (i % seg_len)` (stride 1 *within*
+/// a segment, arbitrary jump *between* segments). This is exactly a fine zig-zag
+/// assignment expressed as one shard instead of `n_seg` separate sub-groups.
+struct SegMap {
+  static constexpr int kMaxSeg = 16;  ///< up to 8 zig-zag passes (2N sub-groups).
+  int n_seg{1};                       ///< number of segments; seq == n_seg * seg_len.
+  int seg_len{0};                     ///< rows per segment (equal across segments).
+  int base[kMaxSeg]{};                ///< global position of each segment's first row.
+};
+
+/// Single-launch segmented attention step (FP32). Same online-softmax
+/// `(O, m, l)` persistent-state semantics as `launch_attention_step`, but query
+/// and key global positions come from a piecewise-affine `SegMap` instead of an
+/// affine `(offset, stride)`. This lets a fine zig-zag assignment run in ONE
+/// kernel launch over the whole local shard, rather than the `n_seg^2` affine
+/// calls the sub-group loop in `ring_loop.cu` issues. Supported `head_dim`:
+/// 32, 64, 128, 256.
+void launch_attention_step_segmented(const float* q, const float* k, const float* v, float* out,
+                                     float* m, float* l, const AttentionShape& shape,
+                                     const SegMap& qmap, const SegMap& kmap, bool causal,
+                                     cudaStream_t stream = 0);
 
 /// Decode-specialized step kernel — `seq_q = 1`, one warp per `(batch, head)`.
 /// Same `(M, L, O)` persistent-state semantics as `launch_attention_step` so
@@ -117,7 +146,8 @@ void launch_attention_finalize(float* out, const float* l, const AttentionShape&
 /// Supported `head_dim`: 32, 64, 128. Requires sm_70+.
 void launch_attention_step_fp16(const __half* q, const __half* k, const __half* v, float* out,
                                 float* m, float* l, const AttentionShape& shape, int q_offset,
-                                int k_offset, bool causal, cudaStream_t stream = 0);
+                                int k_offset, bool causal, cudaStream_t stream = 0,
+                                int pos_stride = 1);
 
 /// Element-wise FP32 → FP16 cast on the device. Used to stage Q (and K/V in
 /// tests) into the FP16 path without a CPU round-trip.

@@ -44,7 +44,7 @@ __global__ void attention_step_fp16_kernel(const __half* __restrict__ Q,
                                            const __half* __restrict__ V, float* __restrict__ O,
                                            float* __restrict__ M, float* __restrict__ L, int H,
                                            int kv_H, int Sq, int Sk, float scale, bool causal,
-                                           int q_offset, int k_offset) {
+                                           int q_offset, int k_offset, int pos_stride) {
   static_assert(D % kMmaK == 0, "D must be a multiple of 16 for wmma path");
   constexpr int kDSlices = D / kMmaK;
 
@@ -135,7 +135,7 @@ __global__ void attention_step_fp16_kernel(const __half* __restrict__ Q,
     if (tid < kBR) {
       const int r = tid;
       const int i_local = q_tile * kBR + r;
-      const int i_global = q_offset + i_local;
+      const int i_global = q_offset + i_local * pos_stride;
       const bool row_active = (i_local < Sq);
 
       float m_prev = m_s[r];
@@ -144,7 +144,7 @@ __global__ void attention_step_fp16_kernel(const __half* __restrict__ Q,
 #pragma unroll
         for (int j = 0; j < kBC; ++j) {
           const int j_local_in_chunk = j_base + j;
-          const int j_global = k_offset + j_local_in_chunk;
+          const int j_global = k_offset + j_local_in_chunk * pos_stride;
           const bool visible = (j_local_in_chunk < Sk) && (!causal || (j_global <= i_global));
           const float s = visible ? S_f[r * kBC + j] : -INFINITY;
           S_f[r * kBC + j] = s;
@@ -256,14 +256,14 @@ __global__ void int8_to_float_kernel(const signed char* __restrict__ src, float*
 template <int D>
 void launch_step_fp16_typed(const __half* q, const __half* k, const __half* v, float* o, float* m,
                             float* l, const AttentionShape& shape, int q_offset, int k_offset,
-                            bool causal, cudaStream_t stream) {
+                            int pos_stride, bool causal, cudaStream_t stream) {
   const dim3 grid(ceil_div(shape.seq_q, kBR), shape.heads, shape.batch);
   const dim3 block(32);
   const int kv_H = (shape.kv_heads > 0) ? shape.kv_heads : shape.heads;
   const float scale = 1.0f / std::sqrt(static_cast<float>(D));
   attention_step_fp16_kernel<D><<<grid, block, 0, stream>>>(q, k, v, o, m, l, shape.heads, kv_H,
                                                             shape.seq_q, shape.seq_k, scale, causal,
-                                                            q_offset, k_offset);
+                                                            q_offset, k_offset, pos_stride);
   cudaCheck(cudaGetLastError());
 }
 
@@ -271,19 +271,23 @@ void launch_step_fp16_typed(const __half* q, const __half* k, const __half* v, f
 
 void launch_attention_step_fp16(const __half* q, const __half* k, const __half* v, float* o,
                                 float* m, float* l, const AttentionShape& shape, int q_offset,
-                                int k_offset, bool causal, cudaStream_t stream) {
+                                int k_offset, bool causal, cudaStream_t stream, int pos_stride) {
   switch (shape.head_dim) {
     case 32:
-      launch_step_fp16_typed<32>(q, k, v, o, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_step_fp16_typed<32>(q, k, v, o, m, l, shape, q_offset, k_offset, pos_stride, causal,
+                                 stream);
       break;
     case 64:
-      launch_step_fp16_typed<64>(q, k, v, o, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_step_fp16_typed<64>(q, k, v, o, m, l, shape, q_offset, k_offset, pos_stride, causal,
+                                 stream);
       break;
     case 128:
-      launch_step_fp16_typed<128>(q, k, v, o, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_step_fp16_typed<128>(q, k, v, o, m, l, shape, q_offset, k_offset, pos_stride, causal,
+                                  stream);
       break;
     case 256:
-      launch_step_fp16_typed<256>(q, k, v, o, m, l, shape, q_offset, k_offset, causal, stream);
+      launch_step_fp16_typed<256>(q, k, v, o, m, l, shape, q_offset, k_offset, pos_stride, causal,
+                                  stream);
       break;
     default:
       fprintf(stderr,

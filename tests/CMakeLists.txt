@@ -83,6 +83,11 @@ add_executable(test_attention_step_fp16 test_attention_step_fp16.cu)
 target_link_libraries(test_attention_step_fp16 PRIVATE ring_attention)
 add_test(NAME attention_step_fp16 COMMAND test_attention_step_fp16)
 
+add_executable(test_attention_step_segmented test_attention_step_segmented.cu)
+target_link_libraries(test_attention_step_segmented PRIVATE ring_attention)
+add_test(NAME attention_step_segmented COMMAND test_attention_step_segmented)
+set_tests_properties(attention_step_segmented PROPERTIES LABELS gpu)
+
 add_executable(test_ring_partition test_ring_partition.cpp)
 target_link_libraries(test_ring_partition PRIVATE ring_attention)
 add_test(NAME ring_partition COMMAND test_ring_partition)
@@ -131,6 +136,19 @@ if(MPIRUN_EXECUTABLE)
                 --seq 128 --heads 2 --head_dim 32 --iters 1
                 --causal 1 ${_zigzag_flag} --mode ${_mode} --dtype fp16 --verify)
       set_tests_properties(ring_smoke_${_mode}_fp16 PROPERTIES
+        PASS_REGULAR_EXPRESSION "verify[^\n]*PASS"
+        LABELS "mpi;gpu")
+    endif()
+
+    # Striped partition smoke: allgather rejects --striped (same reason as
+    # zigzag); the ring modes use --striped 1 (seq=128 divisible by cp_size=2).
+    if(NOT _mode STREQUAL "allgather")
+      add_test(
+        NAME ring_smoke_${_mode}_striped
+        COMMAND ${MPIRUN_EXECUTABLE} -n 2 $<TARGET_FILE:ring_attention_cli>
+                --seq 128 --heads 2 --head_dim 32 --iters 1
+                --causal 1 --striped 1 --mode ${_mode} --verify)
+      set_tests_properties(ring_smoke_${_mode}_striped PROPERTIES
         PASS_REGULAR_EXPRESSION "verify[^\n]*PASS"
         LABELS "mpi;gpu")
     endif()

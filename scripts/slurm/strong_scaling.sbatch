@@ -24,7 +24,7 @@
 # same script works at 1, 2, or 4 nodes without edits.
 #
 # Output: results/bench_ring.csv  (consumed by scripts/plot_scaling.py)
-#   columns: mode,cp_size,batch,heads,seq,head_dim,causal,zigzag_n,iters,
+#   columns: mode,cp_size,batch,heads,seq,head_dim,causal,zigzag_n,striped,iters,
 #            comm_ms,comp_ms,wait_ms,total_ms,max_err
 
 set -euo pipefail
@@ -47,7 +47,7 @@ MAX_CP=$((NNODES * 4))
 echo "nodes=${NNODES}  max cp_size=${MAX_CP}  nodelist=${SLURM_JOB_NODELIST:-?}"
 
 # Write CSV header once (the CLI also prints it per run; plot_scaling.py deduplicates).
-echo "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag_n,iters,comm_ms,comp_ms,wait_ms,total_ms,max_err" \
+echo "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag_n,striped,iters,comm_ms,comp_ms,wait_ms,total_ms,max_err" \
   > "${CSV}"
 
 ITERS=20

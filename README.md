@@ -143,7 +143,10 @@ mpirun -n 2 ./build/release/apps/ring_attention_cli/ring_attention_cli \
 | `--heads`, `--head_dim`, `--batch` | attention shape. |
 | `--kv_heads K` | `0` = MHA; set `< heads` for GQA/MQA. |
 | `--causal 0/1` | apply the lower-triangular mask. |
-| `--zigzag 0/1` | interleaved token assignment for causal load balance (needs `seq` divisible by `2 * cp_size`). |
+| `--zigzag 0/1` | interleaved token assignment for causal load balance (needs `seq` divisible by `2 * cp_size`). Shorthand for `--zigzag-n 1`. |
+| `--zigzag-n N` | zig-zag with `N` passes per rank = `2N` contiguous sub-groups paired inward for finer load balance. Larger `N` balances more tightly at the cost of `(2N)²` per-rank sub-group launches per ring step (fully-masked pairs skipped). Needs `seq` divisible by `2N * cp_size`. Mutually exclusive with `--striped`; not supported with `--mode allgather`. |
+| `--striped 0/1` | striped token assignment: token `i` → rank `i % cp_size`. Balances causal-mask work as a single strided shard with a near-uniform per-ring-step mask (needs `seq` divisible by `cp_size`). Mutually exclusive with `--zigzag`; not supported with `--mode allgather`. |
+| `--segmented 0/1` | execute the zig-zag partition as one segmented-kernel launch per ring step instead of `(2N)²` per-sub-group launches. Numerically identical to `--zigzag-n N`; requires fp32 `--mode ring-overlap`/`ring-2d` with `--zigzag-n N` (rejected for fp16, `allgather`, `ring-blocking`, `--striped`). Experimental — does ~2× the work under causal masking, so slower than the sub-group loop. |
 | `--dtype fp32\|fp16` | precision. `fp16` exercises the Tensor-Core path (half-precision K/V on the wire, fp32 softmax accumulators). Default `fp32`. |
 | `--iters N` | timed iterations. |
 | `--verify` | re-run a CPU reference and report max absolute error. |

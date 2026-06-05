@@ -49,16 +49,24 @@ fi
 PASS=1
 
 # Run one ring-2d --verify and report PASS/FAIL.
-# Usage: verify_one <cp_size> <causal> <zigzag>  (SEQ/HEAD_DIM via env)
+# Usage: verify_one <cp_size> <causal> <zigzag> [segmented]  (SEQ/HEAD_DIM via env)
+# segmented=1 runs the zig-zag partition as one segmented-kernel launch per inner
+# round (--zigzag-n 1 --segmented 1) instead of the n_splits^2 sub-group loop.
 verify_one() {
-  local n=$1 causal=$2 zigzag=$3
+  local n=$1 causal=$2 zigzag=$3 seg=${4:-0}
   if [ "${n}" -gt "${MAX_CP}" ]; then return 0; fi
   local seq="${SEQ:-2048}" head_dim="${HEAD_DIM:-64}"
-  echo -n "  cp=${n} causal=${causal} zigzag=${zigzag} seq=${seq} D=${head_dim} ... "
+  local pflags="--zigzag ${zigzag}" tag="zigzag=${zigzag}"
+  if [ "${seg}" -eq 1 ]; then
+    pflags="--zigzag-n 1 --segmented 1"
+    tag="zigzag=1 segmented=1"
+  fi
+  echo -n "  cp=${n} causal=${causal} ${tag} seq=${seq} D=${head_dim} ... "
   local out
+  # shellcheck disable=SC2086  # pflags is intentionally word-split into args.
   out=$(mpirun -n "${n}" "${CLI}" \
     --seq "${seq}" --head_dim "${head_dim}" --heads 4 --iters 1 \
-    --causal "${causal}" --zigzag "${zigzag}" --mode ring-2d --verify 2>&1)
+    --causal "${causal}" ${pflags} --mode ring-2d --verify 2>&1)
   if echo "${out}" | grep -q "PASS"; then
     echo "PASS  ($(echo "${out}" | grep -o 'max_err=[^ ]*' | head -1))"
   else
@@ -72,9 +80,10 @@ echo "============================================================"
 # seq=2048 is divisible by 2*cp for cp ∈ {1,2,4,8,16}.
 for n in 2 4 8 16; do
   for causal in 0 1; do
-    verify_one "${n}" "${causal}" 1   # zigzag (production)
+    verify_one "${n}" "${causal}" 1      # zigzag (production)
+    verify_one "${n}" "${causal}" 1 1    # zigzag, segmented kernel (one launch/round)
   done
-  verify_one "${n}" 1 0               # contiguous, causal
+  verify_one "${n}" 1 0                   # contiguous, causal
 done
 
 echo ""
