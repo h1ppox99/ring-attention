@@ -94,13 +94,18 @@ int main(int argc, char** argv) {
   const int S_total = prompt_len + n_decode;
   const int S_max = S_total + cp_size;  // headroom
 
-#ifdef RING_USE_NCCL
-  ncclComm_t comm = nccl_init(rank, cp_size);
-#else
-  if (rank == 0) fprintf(stderr, "Test requires NCCL build\n");
+#ifndef RING_USE_NCCL
+  // run_ring_decode_step (and this test's comm setup) require the NCCL build.
+  // The whole decode body below references NCCL symbols, so it is compiled
+  // only when RING_USE_NCCL is defined; the MPI-only build returns early.
+  // These locals are consumed only by that body — discard them here.
+  (void)S_total;
+  (void)S_max;
+  if (rank == 0) fprintf(stderr, "Test requires NCCL build (skipping B=%d H=%d D=%d)\n", B, H, D);
   MPI_Finalize();
   return 1;
-#endif
+#else
+  ncclComm_t comm = nccl_init(rank, cp_size);
 
   // 1. Generate full Q/K/V (identical on every rank).
   XorShift32 rng(42u);
@@ -203,4 +208,5 @@ int main(int argc, char** argv) {
   }
   MPI_Finalize();
   return 0;
+#endif  // RING_USE_NCCL
 }

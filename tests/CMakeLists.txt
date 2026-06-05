@@ -17,9 +17,11 @@ add_test(NAME decode_op COMMAND test_decode_op)
 add_executable(test_ring_decode test_ring_decode.cu)
 target_link_libraries(test_ring_decode PRIVATE ring_attention)
 # Multi-rank smoke: prefill 32, decode 4 tokens across cp_size=2.
-# Requires NCCL + 2 GPUs (same as ring_smoke_* tests). On a 1-GPU allocation
-# this test will fail to bind both ranks; that's expected.
-if(MPIRUN_EXECUTABLE)
+# Requires NCCL + 2 GPUs. `run_ring_decode_step` aborts at runtime without
+# NCCL (see ring_decode.hpp), so these tests are only meaningful — and only
+# registered — on a USE_NCCL build. On a 1-GPU allocation they will fail to
+# bind both ranks; that's expected.
+if(MPIRUN_EXECUTABLE AND USE_NCCL)
   add_test(
     NAME ring_decode_smoke
     COMMAND ${MPIRUN_EXECUTABLE} -n 2 $<TARGET_FILE:test_ring_decode>

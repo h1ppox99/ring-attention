@@ -38,6 +38,7 @@ namespace ring_attention {
 
 namespace {
 
+#ifdef RING_USE_NCCL
 /// Merge `cp_size` per-rank online-softmax partials into the global
 /// (O, m, l) using the FlashAttention partial-merge recurrence.
 ///
@@ -79,6 +80,7 @@ __global__ void decode_partial_merge_kernel(const float* __restrict__ gathered,
     l_out[bh] = l_acc;
   }
 }
+#endif  // RING_USE_NCCL
 
 }  // namespace
 

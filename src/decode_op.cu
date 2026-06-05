@@ -1,11 +1,14 @@
 /// @file
 /// Single-rank decode op implementation.
 ///
-/// Pack the cache's populated rows into a contiguous (B, kv_H, current_len, D)
-/// tile via cudaMemcpy2DAsync, then drive the existing flash-attention step
-/// kernel with seq_q=1, seq_k=current_len. The pack handles the stride
-/// mismatch between the cache's `S_max` row stride and the kernel's expected
-/// `seq_k` row stride.
+/// Drive the flash-attention step kernel with seq_q=1, seq_k=current_len.
+///
+/// The fp32 path reads the cache in place: the decode kernel accepts a per-head
+/// row stride (`kv_row_stride = s_max`), so no de-stride copy is needed. The
+/// fp16 / Tensor-Core step kernel has no strided-read mode, so the fp16 path
+/// still packs the populated rows into a contiguous (B, kv_H, current_len, D)
+/// tile via `cudaMemcpy2DAsync` (handling the `S_max` → `current_len` stride
+/// mismatch) before the kernel call.
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -49,19 +52,18 @@ void run_local_decode_step(const float* q, const DeviceKVCache<float>& cache, in
   const int D = cache.head_dim();
   const int Sk = cache.current_len();
 
-  const std::size_t packed_count = static_cast<std::size_t>(B) * kv_H * Sk * D;
-  DeviceTensor<float> k_packed(packed_count);
-  DeviceTensor<float> v_packed(packed_count);
-  pack_cache(cache, k_packed.data(), v_packed.data(), Sk, stream);
-
   AttentionShape shape{B, heads, 1, Sk, D};
   shape.kv_heads = kv_H;
   const std::size_t m_count = static_cast<std::size_t>(B) * heads;
   DeviceTensor<float> m_d(m_count), l_d(m_count);
 
   launch_attention_init(out, m_d.data(), l_d.data(), shape, m_count, stream);
-  launch_attention_step(q, k_packed.data(), v_packed.data(), out, m_d.data(), l_d.data(), shape,
-                        q_pos_global, cache_k_offset, causal, stream);
+  // Read the cache in place (per-head row stride = s_max) instead of packing the
+  // populated rows into a contiguous tile first — the fp32 decode kernel handles
+  // the stride directly, the same path the ring decode loop uses (Round 17).
+  launch_attention_decode_step(q, cache.k_data(), cache.v_data(), out, m_d.data(), l_d.data(),
+                               shape, q_pos_global, cache_k_offset, causal, stream,
+                               /*kv_row_stride=*/cache.s_max());
   launch_attention_finalize(out, l_d.data(), shape, stream);
 }
 

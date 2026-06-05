@@ -4,10 +4,10 @@
 /// Single-rank decode operation: attend a single query token against the
 /// rank-local `DeviceKVCache`.
 ///
-/// Internally packs the cache's populated rows into a contiguous tile so the
-/// existing `launch_attention_step` (or its fp16 variant) sees a tensor with
-/// stride `seq_k = current_len`, not `s_max`. Online-softmax state `(m, ℓ)`
-/// is allocated and finalized internally.
+/// The fp32 path reads the cache in place (the decode kernel takes a per-head
+/// row stride of `s_max`); the fp16 path packs the populated rows into a
+/// contiguous tile first, since its Tensor-Core step kernel has no strided-read
+/// mode. Online-softmax state `(m, ℓ)` is allocated and finalized internally.
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

@@ -30,44 +30,17 @@
 #include "nccl_utils.hpp"
 #include "ring_gen.hpp"
 #include "ring_loop.hpp"
+#include "ring_loop_common.hpp"
 #include "ring_partition.hpp"
 
 namespace {
 
-[[noreturn]] void mpi_die(const char* msg) {
-  fprintf(stderr, "%s\n", msg);
-  MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
-  std::exit(EXIT_FAILURE);
-}
-
-/// Validate that `bytes` fits in the `int` count used by MPI-3 point-to-point
-/// and collective calls. NVHPC 24.1 ships OpenMPI 4.1.7 (MPI-3.1) so we cannot
-/// use `MPI_Count` / the `_c` variants here. On overflow we abort with a clear
-/// message rather than silently truncating the count.
-int mpi_int_count(std::size_t bytes, const char* where) {
-  if (bytes > static_cast<std::size_t>(INT_MAX)) {
-    char buf[256];
-    std::snprintf(buf, sizeof(buf),
-                  "MPI count overflow in %s: %zu bytes exceeds INT_MAX=%d — "
-                  "reduce per-rank tensor size or chunk the transfer.",
-                  where, bytes, INT_MAX);
-    mpi_die(buf);
-  }
-  return static_cast<int>(bytes);
-}
-
-/// Fill a host vector of shape (B, H, seq_len, D) using gen_elem (returns fp32).
-void fill_host_tensor(std::vector<float>& buf, uint32_t seed, int tensor_id, int B, int H,
-                      int seq_len, int D, int global_seq_start) {
-  buf.resize(static_cast<std::size_t>(B) * H * seq_len * D);
-  for (int b = 0; b < B; ++b)
-    for (int h = 0; h < H; ++h)
-      for (int s = 0; s < seq_len; ++s)
-        for (int d = 0; d < D; ++d) {
-          const std::size_t idx = (static_cast<std::size_t>(b * H + h) * seq_len + s) * D + d;
-          buf[idx] = ring_attention::gen_elem(seed, tensor_id, b, h, global_seq_start + s, d);
-        }
-}
+// The MPI guards, gen_elem fills, timed-loop driver, and CPU-reference
+// verification are shared with the FP32 path; see ring_loop_common.hpp.
+using ring_attention::detail::fill_host_tensor;
+using ring_attention::detail::fill_region;
+using ring_attention::detail::mpi_die;
+using ring_attention::detail::mpi_int_count;
 
 /// Upload a host fp32 buffer and cast it on the device into a __half buffer.
 /// Scratch is reused across calls to amortise allocation; `scratch_count` must
@@ -93,7 +66,6 @@ ring_attention::RingResult run_allgather_fp16(const ring_attention::RingConfig& 
 
   const std::size_t q_local_elem = static_cast<std::size_t>(B) * H * Sl * D;
   const std::size_t kv_local_elem = static_cast<std::size_t>(B) * kv_H * Sl * D;
-  const std::size_t q_full_elem = static_cast<std::size_t>(B) * H * S * D;
   const std::size_t kv_full_elem = static_cast<std::size_t>(B) * kv_H * S * D;
   const std::size_t m_count = static_cast<std::size_t>(B) * H * Sl;
   const std::size_t kv_local_bytes = kv_local_elem * sizeof(__half);  // MPI byte count
@@ -125,7 +97,7 @@ ring_attention::RingResult run_allgather_fp16(const ring_attention::RingConfig& 
 
   const int kv_local_bytes_int = mpi_int_count(kv_local_bytes, "run_allgather_fp16/MPI_Allgather");
 
-  auto one_pass = [&]() -> std::pair<double, double> {
+  auto one_pass = [&]() -> std::tuple<double, double, double> {
     const double tc0 = MPI_Wtime();
     MPI_Allgather(k_h16.data(), kv_local_bytes_int, MPI_BYTE, k_gathered.data(), kv_local_bytes_int,
                   MPI_BYTE, MPI_COMM_WORLD);
@@ -164,69 +136,19 @@ ring_attention::RingResult run_allgather_fp16(const ring_attention::RingConfig& 
     cudaEventElapsedTime(&comp_float_ms, ev0, ev1);
     cudaEventDestroy(ev0);
     cudaEventDestroy(ev1);
-    return {(tc1 - tc0) * 1e3, static_cast<double>(comp_float_ms)};
+    return {(tc1 - tc0) * 1e3, static_cast<double>(comp_float_ms), 0.0};
   };
 
-  one_pass();  // warmup
-
-  double sum_comm = 0.0, sum_comp = 0.0;
-  MPI_Barrier(MPI_COMM_WORLD);
-  const double t_start = MPI_Wtime();
-  for (int i = 0; i < cfg.iters; ++i) {
-    const auto [comm, comp] = one_pass();
-    sum_comm += comm;
-    sum_comp += comp;
-  }
-  MPI_Barrier(MPI_COMM_WORLD);
-  const double t_end = MPI_Wtime();
-
   RingResult res;
-  res.comm_ms = sum_comm / cfg.iters;
-  res.comp_ms = sum_comp / cfg.iters;
-  res.wait_ms = 0.0;
-  res.total_ms = (t_end - t_start) * 1e3 / cfg.iters;
+  detail::run_timed_passes(cfg, one_pass, res);
 
-  const double local_t[3] = {res.comm_ms, res.comp_ms, res.total_ms};
-  double global_t[3] = {};
-  MPI_Reduce(local_t, global_t, 3, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-  if (R == 0) {
-    res.comm_ms = global_t[0];
-    res.comp_ms = global_t[1];
-    res.total_ms = global_t[2];
-  }
-
-  float max_err = -1.f;
   if (cfg.verify) {
-    std::vector<float> full_q_cpu(q_full_elem), full_k_cpu(kv_full_elem), full_v_cpu(kv_full_elem);
-    fill_host_tensor(full_q_cpu, cfg.seed, 0, B, H, S, D, 0);
-    fill_host_tensor(full_k_cpu, cfg.seed, 1, B, kv_H, S, D, 0);
-    fill_host_tensor(full_v_cpu, cfg.seed, 2, B, kv_H, S, D, 0);
-
-    AttentionShape ref_shape{B, H, S, S, D};
-    ref_shape.kv_heads = kv_H;
-    std::vector<float> cpu_out(q_full_elem);
-    cpu_attention(full_q_cpu.data(), full_k_cpu.data(), full_v_cpu.data(), cpu_out.data(),
-                  ref_shape, cfg.causal);
-
     one_pass();
     std::vector<float> dev_out_h(q_local_elem);
     out_d.copy_to_host(dev_out_h);
-
-    max_err = 0.f;
-    for (int b = 0; b < B; ++b)
-      for (int h = 0; h < H; ++h) {
-        const float* cpu_slice =
-            cpu_out.data() + (static_cast<std::size_t>(b * H + h) * S + q_off) * D;
-        const float* dev_slice = dev_out_h.data() + static_cast<std::size_t>(b * H + h) * Sl * D;
-        for (int e = 0; e < Sl * D; ++e)
-          max_err = std::max(max_err, std::abs(cpu_slice[e] - dev_slice[e]));
-      }
-
-    float global_max;
-    MPI_Reduce(&max_err, &global_max, 1, MPI_FLOAT, MPI_MAX, 0, MPI_COMM_WORLD);
-    max_err = (R == 0) ? global_max : -1.f;
+    res.max_err =
+        detail::verify_local_output(cfg, B, H, S, D, kv_H, Sl, q_local_elem, {q_off}, dev_out_h);
   }
-  res.max_err = max_err;
   return res;
 }
 
@@ -259,29 +181,13 @@ ring_attention::RingResult run_ring_blocking_fp16(const ring_attention::RingConf
   const int next_rank = part.next_rank();
   const int prev_rank = part.prev_rank();
 
-  auto fill_q_into = [&](std::vector<float>& buf, int tid, std::size_t off, int gss) {
-    for (int b = 0; b < B; ++b)
-      for (int h = 0; h < H; ++h)
-        for (int s = 0; s < Sl; ++s)
-          for (int d = 0; d < D; ++d)
-            buf[off + (static_cast<std::size_t>(b * H + h) * Sl + s) * D + d] =
-                gen_elem(cfg.seed, tid, b, h, gss + s, d);
-  };
-
-  auto fill_kv_into = [&](std::vector<float>& buf, int tid, std::size_t off, int gss) {
-    for (int b = 0; b < B; ++b)
-      for (int h = 0; h < kv_H; ++h)
-        for (int s = 0; s < Sl; ++s)
-          for (int d = 0; d < D; ++d)
-            buf[off + (static_cast<std::size_t>(b * kv_H + h) * Sl + s) * D + d] =
-                gen_elem(cfg.seed, tid, b, h, gss + s, d);
-  };
-
   std::vector<float> q_h(q_local_elem), k_h_init(kv_local_elem), v_h_init(kv_local_elem);
   for (int sg = 0; sg < nsg; ++sg) {
-    fill_q_into(q_h, 0, sg * q_sg_elem, part.q_offset(sg));
-    fill_kv_into(k_h_init, 1, sg * kv_sg_elem, part.k_offset_for_step(0, sg));
-    fill_kv_into(v_h_init, 2, sg * kv_sg_elem, part.k_offset_for_step(0, sg));
+    fill_region(q_h, sg * q_sg_elem, cfg.seed, 0, B, H, Sl, D, part.q_offset(sg));
+    fill_region(k_h_init, sg * kv_sg_elem, cfg.seed, 1, B, kv_H, Sl, D,
+                part.k_offset_for_step(0, sg));
+    fill_region(v_h_init, sg * kv_sg_elem, cfg.seed, 2, B, kv_H, Sl, D,
+                part.k_offset_for_step(0, sg));
   }
 
   // Q (fp16 on device) — uploaded once. Scratch is reused below to stage K/V,
@@ -424,74 +330,18 @@ ring_attention::RingResult run_ring_blocking_fp16(const ring_attention::RingConf
     return {comm_acc, comp_acc, wait_acc};
   };
 
-  one_pass();
-
-  double sum_comm = 0.0, sum_comp = 0.0, sum_wait = 0.0;
-  MPI_Barrier(MPI_COMM_WORLD);
-  const double t_start = MPI_Wtime();
-  for (int i = 0; i < cfg.iters; ++i) {
-    const auto [c, p_, w] = one_pass();
-    sum_comm += c;
-    sum_comp += p_;
-    sum_wait += w;
-  }
-  MPI_Barrier(MPI_COMM_WORLD);
-  const double t_end = MPI_Wtime();
-
   RingResult res;
-  res.comm_ms = sum_comm / cfg.iters;
-  res.comp_ms = sum_comp / cfg.iters;
-  res.wait_ms = sum_wait / cfg.iters;
-  res.total_ms = (t_end - t_start) * 1e3 / cfg.iters;
+  detail::run_timed_passes(cfg, one_pass, res);
 
-  const double local_t[4] = {res.comm_ms, res.comp_ms, res.wait_ms, res.total_ms};
-  double global_t[4] = {};
-  MPI_Reduce(local_t, global_t, 4, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-  if (R == 0) {
-    res.comm_ms = global_t[0];
-    res.comp_ms = global_t[1];
-    res.wait_ms = global_t[2];
-    res.total_ms = global_t[3];
-  }
-
-  float max_err = -1.f;
   if (cfg.verify) {
-    const std::size_t q_full_elem = static_cast<std::size_t>(B) * H * S * D;
-    const std::size_t kv_full_elem = static_cast<std::size_t>(B) * kv_H * S * D;
-    std::vector<float> full_q(q_full_elem), full_k(kv_full_elem), full_v(kv_full_elem);
-    fill_host_tensor(full_q, cfg.seed, 0, B, H, S, D, 0);
-    fill_host_tensor(full_k, cfg.seed, 1, B, kv_H, S, D, 0);
-    fill_host_tensor(full_v, cfg.seed, 2, B, kv_H, S, D, 0);
-
-    AttentionShape ref_shape{B, H, S, S, D};
-    ref_shape.kv_heads = kv_H;
-    std::vector<float> cpu_out(q_full_elem);
-    cpu_attention(full_q.data(), full_k.data(), full_v.data(), cpu_out.data(), ref_shape,
-                  cfg.causal);
-
     one_pass();
     std::vector<float> dev_out_h(q_local_elem);
     out_d.copy_to_host(dev_out_h);
-
-    max_err = 0.f;
-    for (int sg = 0; sg < nsg; ++sg) {
-      const int q_off_sg = part.q_offset(sg);
-      for (int b = 0; b < B; ++b)
-        for (int h = 0; h < H; ++h) {
-          const float* cpu_slice =
-              cpu_out.data() + (static_cast<std::size_t>(b * H + h) * S + q_off_sg) * D;
-          const float* dev_slice =
-              dev_out_h.data() + sg * q_sg_elem + static_cast<std::size_t>(b * H + h) * Sl * D;
-          for (int e = 0; e < Sl * D; ++e)
-            max_err = std::max(max_err, std::abs(cpu_slice[e] - dev_slice[e]));
-        }
-    }
-
-    float global_max;
-    MPI_Reduce(&max_err, &global_max, 1, MPI_FLOAT, MPI_MAX, 0, MPI_COMM_WORLD);
-    max_err = (R == 0) ? global_max : -1.f;
+    std::vector<int> q_offsets(nsg);
+    for (int sg = 0; sg < nsg; ++sg) q_offsets[sg] = part.q_offset(sg);
+    res.max_err =
+        detail::verify_local_output(cfg, B, H, S, D, kv_H, Sl, q_sg_elem, q_offsets, dev_out_h);
   }
-  res.max_err = max_err;
 
 #ifdef RING_USE_NCCL
   ncclCommDestroy(nccl_comm);
@@ -532,24 +382,6 @@ ring_attention::RingResult run_ring_overlap_fp16(const ring_attention::RingConfi
   const int next_rank = part.next_rank();
   const int prev_rank = part.prev_rank();
 
-  auto fill_q_into = [&](std::vector<float>& buf, int tid, std::size_t off, int gss) {
-    for (int b = 0; b < B; ++b)
-      for (int h = 0; h < H; ++h)
-        for (int s = 0; s < Sl; ++s)
-          for (int d = 0; d < D; ++d)
-            buf[off + (static_cast<std::size_t>(b * H + h) * Sl + s) * D + d] =
-                gen_elem(cfg.seed, tid, b, h, gss + s, d);
-  };
-
-  auto fill_kv_into = [&](std::vector<float>& buf, int tid, std::size_t off, int gss) {
-    for (int b = 0; b < B; ++b)
-      for (int h = 0; h < kv_H; ++h)
-        for (int s = 0; s < Sl; ++s)
-          for (int d = 0; d < D; ++d)
-            buf[off + (static_cast<std::size_t>(b * kv_H + h) * Sl + s) * D + d] =
-                gen_elem(cfg.seed, tid, b, h, gss + s, d);
-  };
-
   // In mem_probe mode we only test whether the device buffers fit, so skip both
   // the host allocations and the fills (pure CPU work over S*H*D elements that
   // would also balloon host RAM at large S).
@@ -559,9 +391,11 @@ ring_attention::RingResult run_ring_overlap_fp16(const ring_attention::RingConfi
     k_h_init.resize(kv_local_elem);
     v_h_init.resize(kv_local_elem);
     for (int sg = 0; sg < nsg; ++sg) {
-      fill_q_into(q_h, 0, sg * q_sg_elem, part.q_offset(sg));
-      fill_kv_into(k_h_init, 1, sg * kv_sg_elem, part.k_offset_for_step(0, sg));
-      fill_kv_into(v_h_init, 2, sg * kv_sg_elem, part.k_offset_for_step(0, sg));
+      fill_region(q_h, sg * q_sg_elem, cfg.seed, 0, B, H, Sl, D, part.q_offset(sg));
+      fill_region(k_h_init, sg * kv_sg_elem, cfg.seed, 1, B, kv_H, Sl, D,
+                  part.k_offset_for_step(0, sg));
+      fill_region(v_h_init, sg * kv_sg_elem, cfg.seed, 2, B, kv_H, Sl, D,
+                  part.k_offset_for_step(0, sg));
     }
   }
 
@@ -609,8 +443,25 @@ ring_attention::RingResult run_ring_overlap_fp16(const ring_attention::RingConfi
   // footprint not yet counted; negligible beside the multi-GB tensors above.
   if (cfg.mem_probe) {
     cudaDeviceSynchronize();
+    // Tear down everything allocated up to this point (streams, events, comm /
+    // pinned staging). The init buffers k_init_h16/v_init_h16 are allocated only
+    // below, so they are not held here.
+    for (int s = 0; s < P; ++s) {
+      cudaEventDestroy(ev_starts[s]);
+      cudaEventDestroy(ev_ends[s]);
+      cudaEventDestroy(ev_h2d_starts[s]);
+      cudaEventDestroy(ev_h2d_ends[s]);
+    }
+    cudaEventDestroy(comm_done);
+    cudaStreamDestroy(stream_compute);
+    cudaStreamDestroy(stream_copy);
 #ifdef RING_USE_NCCL
     ncclCommDestroy(nccl_comm);
+#else
+    cudaFreeHost(K_send_h);
+    cudaFreeHost(V_send_h);
+    cudaFreeHost(K_recv_h);
+    cudaFreeHost(V_recv_h);
 #endif
     RingResult probe_res;
     probe_res.total_ms = -1.0;  // sentinel: probe, not a timed run
@@ -727,74 +578,18 @@ ring_attention::RingResult run_ring_overlap_fp16(const ring_attention::RingConfi
     return {comm_acc, comp_acc, wait_acc};
   };
 
-  one_pass();
-
-  double sum_comm = 0.0, sum_comp = 0.0, sum_wait = 0.0;
-  MPI_Barrier(MPI_COMM_WORLD);
-  const double t_start = MPI_Wtime();
-  for (int i = 0; i < cfg.iters; ++i) {
-    const auto [c, p_, w] = one_pass();
-    sum_comm += c;
-    sum_comp += p_;
-    sum_wait += w;
-  }
-  MPI_Barrier(MPI_COMM_WORLD);
-  const double t_end = MPI_Wtime();
-
   RingResult res;
-  res.comm_ms = sum_comm / cfg.iters;
-  res.comp_ms = sum_comp / cfg.iters;
-  res.wait_ms = sum_wait / cfg.iters;
-  res.total_ms = (t_end - t_start) * 1e3 / cfg.iters;
+  detail::run_timed_passes(cfg, one_pass, res);
 
-  const double local_t[4] = {res.comm_ms, res.comp_ms, res.wait_ms, res.total_ms};
-  double global_t[4] = {};
-  MPI_Reduce(local_t, global_t, 4, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-  if (R == 0) {
-    res.comm_ms = global_t[0];
-    res.comp_ms = global_t[1];
-    res.wait_ms = global_t[2];
-    res.total_ms = global_t[3];
-  }
-
-  float max_err = -1.f;
   if (cfg.verify) {
-    const std::size_t q_full_elem = static_cast<std::size_t>(B) * H * S * D;
-    const std::size_t kv_full_elem = static_cast<std::size_t>(B) * kv_H * S * D;
-    std::vector<float> full_q(q_full_elem), full_k(kv_full_elem), full_v(kv_full_elem);
-    fill_host_tensor(full_q, cfg.seed, 0, B, H, S, D, 0);
-    fill_host_tensor(full_k, cfg.seed, 1, B, kv_H, S, D, 0);
-    fill_host_tensor(full_v, cfg.seed, 2, B, kv_H, S, D, 0);
-
-    AttentionShape ref_shape{B, H, S, S, D};
-    ref_shape.kv_heads = kv_H;
-    std::vector<float> cpu_out(q_full_elem);
-    cpu_attention(full_q.data(), full_k.data(), full_v.data(), cpu_out.data(), ref_shape,
-                  cfg.causal);
-
     one_pass();
     std::vector<float> dev_out_h(q_local_elem);
     out_d.copy_to_host(dev_out_h);
-
-    max_err = 0.f;
-    for (int sg = 0; sg < nsg; ++sg) {
-      const int q_off_sg = part.q_offset(sg);
-      for (int b = 0; b < B; ++b)
-        for (int h = 0; h < H; ++h) {
-          const float* cpu_slice =
-              cpu_out.data() + (static_cast<std::size_t>(b * H + h) * S + q_off_sg) * D;
-          const float* dev_slice =
-              dev_out_h.data() + sg * q_sg_elem + static_cast<std::size_t>(b * H + h) * Sl * D;
-          for (int e = 0; e < Sl * D; ++e)
-            max_err = std::max(max_err, std::abs(cpu_slice[e] - dev_slice[e]));
-        }
-    }
-
-    float global_max;
-    MPI_Reduce(&max_err, &global_max, 1, MPI_FLOAT, MPI_MAX, 0, MPI_COMM_WORLD);
-    max_err = (R == 0) ? global_max : -1.f;
+    std::vector<int> q_offsets(nsg);
+    for (int sg = 0; sg < nsg; ++sg) q_offsets[sg] = part.q_offset(sg);
+    res.max_err =
+        detail::verify_local_output(cfg, B, H, S, D, kv_H, Sl, q_sg_elem, q_offsets, dev_out_h);
   }
-  res.max_err = max_err;
 
   for (int s = 0; s < P; ++s) {
     cudaEventDestroy(ev_starts[s]);

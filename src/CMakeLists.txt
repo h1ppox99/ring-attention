@@ -1,8 +1,6 @@
-# Ring attention CUDA/C++ library sources will go here.
-# Example:
-#   add_library(ring_attention STATIC ring_attention.cu ring_attention.hpp)
-#   target_include_directories(ring_attention PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-#   target_link_libraries(ring_attention PUBLIC MPI::MPI_CXX CUDA::cudart)
+# Ring-attention CUDA/C++ library: kernels, host orchestrators, and the CPU
+# reference. Headers (e.g. ring_loop_common.hpp) are pulled in via #include and
+# need not be listed. NCCL wiring is appended below, gated on USE_NCCL.
 
 add_library(ring_attention STATIC
   device_tensor.cu
