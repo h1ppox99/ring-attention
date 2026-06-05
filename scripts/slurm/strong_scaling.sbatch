@@ -50,8 +50,11 @@ echo "nodes=${NNODES}  max cp_size=${MAX_CP}  nodelist=${SLURM_JOB_NODELIST:-?}"
 echo "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag_n,striped,iters,comm_ms,comp_ms,wait_ms,total_ms,max_err" \
   > "${CSV}"
 
-ITERS=20
+ITERS="${ITERS:-20}"
 ZIGZAG_N="${ZIGZAG_N:-1}"  # number of zig-zag passes; override with: ZIGZAG_N=2 sbatch ...
+# Trim to fit the 15-min courtesy limit, e.g.: HEAD_DIMS=128 ITERS=10 sbatch ...
+HEAD_DIMS="${HEAD_DIMS:-32 64 128 256}"
+CPS="${CPS:-$(seq 1 16)}"
 
 # Fixed total problem size. seq=20160 = 2^6 * 3^2 * 5 * 7 is divisible by
 # 2*cp_size for every cp_size in 1..16 EXCEPT 11 and 13 (those would need a
@@ -83,8 +86,8 @@ bench_one() {
     >> "${CSV}"
 }
 
-for cp_size in $(seq 1 16); do
-  for head_dim in 32 64 128 256; do
+for cp_size in ${CPS}; do
+  for head_dim in ${HEAD_DIMS}; do
     bench_one "${cp_size}" "${head_dim}"
   done
 done

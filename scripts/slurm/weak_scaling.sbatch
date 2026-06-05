@@ -48,9 +48,13 @@ echo "nodes=${NNODES}  max cp_size=${MAX_CP}  nodelist=${SLURM_JOB_NODELIST:-?}"
 
 # Tokens owned by each rank, held constant across the sweep. Must be divisible
 # by 2*ZIGZAG_N so that seq = PER_RANK*cp_size is divisible by 2*ZIGZAG_N*cp_size.
-PER_RANK=4096
-ITERS=20
+PER_RANK="${PER_RANK:-4096}"
+ITERS="${ITERS:-20}"
 ZIGZAG_N="${ZIGZAG_N:-1}"  # number of zig-zag passes; override with: ZIGZAG_N=2 sbatch ...
+# Trim the sweep to fit the 15-min courtesy limit, e.g.:
+#   HEAD_DIMS="64 128" CPS="1 2 4 8 16" ITERS=10 sbatch ...
+HEAD_DIMS="${HEAD_DIMS:-32 64 128 256}"
+CPS="${CPS:-$(seq 1 16)}"
 
 echo "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag_n,striped,iters,comm_ms,comp_ms,wait_ms,total_ms,max_err" \
   > "${CSV}"
@@ -74,8 +78,8 @@ bench_one() {
     >> "${CSV}"
 }
 
-for cp_size in $(seq 1 16); do
-  for head_dim in 32 64 128 256; do
+for cp_size in ${CPS}; do
+  for head_dim in ${HEAD_DIMS}; do
     bench_one "${cp_size}" "${head_dim}"
   done
 done

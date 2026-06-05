@@ -44,8 +44,11 @@ echo "nodes=${NNODES}  max cp_size=${MAX_CP}  nodelist=${SLURM_JOB_NODELIST:-?}"
 
 # Fixed total sequence (strong scaling). 20160 = 2^6·3^2·5·7 is divisible by
 # 2*cp for every cp in the sweep set, so zigzag is valid throughout.
-SEQ=20160
-ITERS=20
+SEQ="${SEQ:-20160}"
+ITERS="${ITERS:-20}"
+# Trim to fit the 15-min courtesy limit, e.g.:  HEAD_DIMS=128 ITERS=10 sbatch ...
+HEAD_DIMS="${HEAD_DIMS:-64 128}"
+CPS="${CPS:-1 2 3 4 8 12 16}"
 
 echo "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag,iters,comm_ms,comp_ms,wait_ms,total_ms,max_err" \
   > "${CSV}"
@@ -63,8 +66,8 @@ bench_one() {
 }
 
 # Uniform-layout cp_size values for a 4-GPU/node cluster.
-for cp_size in 1 2 3 4 8 12 16; do
-  for head_dim in 64 128; do
+for cp_size in ${CPS}; do
+  for head_dim in ${HEAD_DIMS}; do
     bench_one ring-overlap "${cp_size}" "${head_dim}"
     bench_one ring-2d      "${cp_size}" "${head_dim}"
   done
