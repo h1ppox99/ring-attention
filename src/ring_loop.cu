@@ -263,7 +263,7 @@ ring_attention::RingResult run_ring_blocking(const ring_attention::RingConfig& c
   const int kv_H = (cfg.kv_heads > 0) ? cfg.kv_heads : cfg.heads;
   const int S = cfg.seq, P = cfg.cp_size, R = cfg.rank;
 
-  const RingPartition::Mode mode = cfg.striped       ? RingPartition::Mode::Striped
+  const RingPartition::Mode mode = cfg.striped        ? RingPartition::Mode::Striped
                                    : cfg.zigzag_n > 0 ? RingPartition::Mode::Zigzag
                                                       : RingPartition::Mode::Contiguous;
   const int n_splits = zigzag_sub_groups(cfg.zigzag_n);
@@ -625,7 +625,7 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
   const int kv_H = (cfg.kv_heads > 0) ? cfg.kv_heads : cfg.heads;
   const int S = cfg.seq, P = cfg.cp_size, R = cfg.rank;
 
-  const RingPartition::Mode mode = cfg.striped       ? RingPartition::Mode::Striped
+  const RingPartition::Mode mode = cfg.striped        ? RingPartition::Mode::Striped
                                    : cfg.zigzag_n > 0 ? RingPartition::Mode::Zigzag
                                                       : RingPartition::Mode::Contiguous;
   const int n_splits = zigzag_sub_groups(cfg.zigzag_n);
@@ -634,6 +634,14 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
   const int nsg = part.num_sub_groups();
   const int Sl = part.local_chunk_len();
   const int Sl_local = Sl * nsg;
+  // Segmented path: run the whole local zig-zag shard as ONE segmented-kernel
+  // launch per ring step (a piecewise-affine SegMap) instead of the n_splits^2
+  // affine sub-group loop. It requires a different in-buffer layout: the kernel
+  // walks query rows 0..nsg*Sl-1 contiguously per (b,h), so the sub-groups must
+  // sit consecutively in the seq axis ([b][h][nsg*Sl][D]) rather than sg-major
+  // ([sg][b][h][Sl][D]). Total element counts are identical — only the index
+  // map changes (see q_index/kv_index below).
+  const bool seg = cfg.segmented;
   const std::size_t q_sg_elem = static_cast<std::size_t>(B) * H * Sl * D;
   const std::size_t q_local_elem = static_cast<std::size_t>(nsg) * q_sg_elem;
   const std::size_t kv_sg_elem = static_cast<std::size_t>(B) * kv_H * Sl * D;
@@ -645,29 +653,41 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
   const int next_rank = part.next_rank();
   const int prev_rank = part.prev_rank();
 
-  auto fill_q_into = [&](std::vector<float>& buf, int tid, std::size_t off, int gss) {
+  // Linear index of (b, h, sub-group sg, local row s)'s first element. The two
+  // layouts (affine sub-group loop vs. segmented) share the same total size;
+  // only the mapping differs. `seg` picks seq-contiguous-per-head.
+  auto q_index = [&](int b, int h, int sg, int s) -> std::size_t {
+    return seg ? (static_cast<std::size_t>(b * H + h) * Sl_local + sg * Sl + s) * D
+               : static_cast<std::size_t>(sg) * q_sg_elem +
+                     (static_cast<std::size_t>(b * H + h) * Sl + s) * D;
+  };
+  auto kv_index = [&](int b, int h, int sg, int s) -> std::size_t {
+    return seg ? (static_cast<std::size_t>(b * kv_H + h) * Sl_local + sg * Sl + s) * D
+               : static_cast<std::size_t>(sg) * kv_sg_elem +
+                     (static_cast<std::size_t>(b * kv_H + h) * Sl + s) * D;
+  };
+
+  auto fill_q_into = [&](std::vector<float>& buf, int tid, int sg, int gss) {
     for (int b = 0; b < B; ++b)
       for (int h = 0; h < H; ++h)
         for (int s = 0; s < Sl; ++s)
           for (int d = 0; d < D; ++d)
-            buf[off + (static_cast<std::size_t>(b * H + h) * Sl + s) * D + d] =
-                gen_elem(cfg.seed, tid, b, h, gss + s * stride, d);
+            buf[q_index(b, h, sg, s) + d] = gen_elem(cfg.seed, tid, b, h, gss + s * stride, d);
   };
 
-  auto fill_kv_into = [&](std::vector<float>& buf, int tid, std::size_t off, int gss) {
+  auto fill_kv_into = [&](std::vector<float>& buf, int tid, int sg, int gss) {
     for (int b = 0; b < B; ++b)
       for (int h = 0; h < kv_H; ++h)
         for (int s = 0; s < Sl; ++s)
           for (int d = 0; d < D; ++d)
-            buf[off + (static_cast<std::size_t>(b * kv_H + h) * Sl + s) * D + d] =
-                gen_elem(cfg.seed, tid, b, h, gss + s * stride, d);
+            buf[kv_index(b, h, sg, s) + d] = gen_elem(cfg.seed, tid, b, h, gss + s * stride, d);
   };
 
   std::vector<float> q_h(q_local_elem), k_h_init(kv_local_elem), v_h_init(kv_local_elem);
   for (int sg = 0; sg < nsg; ++sg) {
-    fill_q_into(q_h, 0, sg * q_sg_elem, part.q_offset(sg));
-    fill_kv_into(k_h_init, 1, sg * kv_sg_elem, part.k_offset_for_step(0, sg));
-    fill_kv_into(v_h_init, 2, sg * kv_sg_elem, part.k_offset_for_step(0, sg));
+    fill_q_into(q_h, 0, sg, part.q_offset(sg));
+    fill_kv_into(k_h_init, 1, sg, part.k_offset_for_step(0, sg));
+    fill_kv_into(v_h_init, 2, sg, part.k_offset_for_step(0, sg));
   }
 
   // Device buffers — Q stays put; K/V double-buffered with pointer swap.
@@ -699,6 +719,18 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
   cudaHostAlloc(&K_recv_h, kv_bytes, cudaHostAllocDefault);
   cudaHostAlloc(&V_recv_h, kv_bytes, cudaHostAllocDefault);
 #endif
+
+  // Segmented path runs the full local shard (all nsg sub-groups) in one launch:
+  // seq_q == seq_k == Sl_local. qmap is step-independent (this rank's own query
+  // sub-groups); kmap.base is rebuilt each step from the held shard's offsets.
+  AttentionShape seg_shape{B, H, Sl_local, Sl_local, D};
+  seg_shape.kv_heads = kv_H;
+  SegMap qmap;
+  if (seg) {
+    qmap.n_seg = nsg;
+    qmap.seg_len = Sl;
+    for (int sg = 0; sg < nsg; ++sg) qmap.base[sg] = part.q_offset(sg);
+  }
 
   // Two CUDA streams + one reusable event for the producer/consumer handshake.
   cudaStream_t stream_compute = nullptr, stream_copy = nullptr;
@@ -760,20 +792,35 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
       //     ev_ends[step] fires only after all sub-group calls for this step complete,
       //     which is the correct WAR fence point for the next step's H2D.
       cudaEventRecord(ev_starts[step], stream_compute);
-      for (int sg_q = 0; sg_q < nsg; ++sg_q) {
-        for (int sg_k = 0; sg_k < nsg; ++sg_k) {
-          const int q_off_sg = part.q_offset(sg_q);
-          const int k_off_sg = part.k_offset_for_step(step, sg_k);
-          // Prune a (sg_q, sg_k) block only if every key position is strictly
-          // after every query position. The last local row sits at global
-          // position q_off_sg + (Sl-1)*stride, so the bound scales with stride
-          // (stride=cp_size under striped, where blocks interleave and are
-          // almost never fully maskable).
-          if (cfg.causal && k_off_sg > q_off_sg + (Sl - 1) * stride) continue;
-          launch_attention_step(q_d.data() + sg_q * q_sg_elem, K_cur + sg_k * kv_sg_elem,
-                                V_cur + sg_k * kv_sg_elem, out_d.data() + sg_q * q_sg_elem,
-                                m_d.data() + sg_q * m_sg, l_d.data() + sg_q * m_sg, sg_shape,
-                                q_off_sg, k_off_sg, cfg.causal, stream_compute, stride);
+      if (seg) {
+        // One segmented launch over the whole local shard: the kernel's
+        // piecewise-affine kmap recovers each held key's global position, so the
+        // n_splits^2 affine sub-group launches collapse into a single kernel.
+        // No fully-masked-pair pruning here — masking is per-element inside the
+        // kernel (the launch-count win outweighs the extra masked work).
+        SegMap kmap;
+        kmap.n_seg = nsg;
+        kmap.seg_len = Sl;
+        for (int sg = 0; sg < nsg; ++sg) kmap.base[sg] = part.k_offset_for_step(step, sg);
+        launch_attention_step_segmented(q_d.data(), K_cur, V_cur, out_d.data(), m_d.data(),
+                                        l_d.data(), seg_shape, qmap, kmap, cfg.causal,
+                                        stream_compute);
+      } else {
+        for (int sg_q = 0; sg_q < nsg; ++sg_q) {
+          for (int sg_k = 0; sg_k < nsg; ++sg_k) {
+            const int q_off_sg = part.q_offset(sg_q);
+            const int k_off_sg = part.k_offset_for_step(step, sg_k);
+            // Prune a (sg_q, sg_k) block only if every key position is strictly
+            // after every query position. The last local row sits at global
+            // position q_off_sg + (Sl-1)*stride, so the bound scales with stride
+            // (stride=cp_size under striped, where blocks interleave and are
+            // almost never fully maskable).
+            if (cfg.causal && k_off_sg > q_off_sg + (Sl - 1) * stride) continue;
+            launch_attention_step(q_d.data() + sg_q * q_sg_elem, K_cur + sg_k * kv_sg_elem,
+                                  V_cur + sg_k * kv_sg_elem, out_d.data() + sg_q * q_sg_elem,
+                                  m_d.data() + sg_q * m_sg, l_d.data() + sg_q * m_sg, sg_shape,
+                                  q_off_sg, k_off_sg, cfg.causal, stream_compute, stride);
+          }
         }
       }
       cudaEventRecord(ev_ends[step], stream_compute);
@@ -866,9 +913,13 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
 
     // Drain stream_compute before finalize, then sync once more.
     cudaStreamSynchronize(stream_compute);
-    for (int sg = 0; sg < nsg; ++sg)
-      launch_attention_finalize(out_d.data() + sg * q_sg_elem, l_d.data() + sg * m_sg, sg_shape,
-                                stream_compute);
+    if (seg) {
+      launch_attention_finalize(out_d.data(), l_d.data(), seg_shape, stream_compute);
+    } else {
+      for (int sg = 0; sg < nsg; ++sg)
+        launch_attention_finalize(out_d.data() + sg * q_sg_elem, l_d.data() + sg * m_sg, sg_shape,
+                                  stream_compute);
+    }
     cudaStreamSynchronize(stream_compute);
 
     // Now all kernel + H2D events have fired — safe to query elapsed times.
@@ -942,8 +993,12 @@ ring_attention::RingResult run_ring_overlap(const ring_attention::RingConfig& cf
       for (int b = 0; b < B; ++b)
         for (int h = 0; h < H; ++h) {
           const float* cpu_head = cpu_out.data() + static_cast<std::size_t>(b * H + h) * S * D;
-          const float* dev_slice =
-              dev_out_h.data() + sg * q_sg_elem + static_cast<std::size_t>(b * H + h) * Sl * D;
+          // Output layout matches the fill layout: seq-contiguous-per-head under
+          // --segmented, sg-major otherwise (see q_index).
+          const std::size_t dev_base =
+              seg ? (static_cast<std::size_t>(b * H + h) * Sl_local + sg * Sl) * D
+                  : sg * q_sg_elem + static_cast<std::size_t>(b * H + h) * Sl * D;
+          const float* dev_slice = dev_out_h.data() + dev_base;
           // Local row s maps to global row q_off_sg + s*stride (stride=1 for
           // contiguous/zigzag, cp_size for striped). Gather the matching global
           // rows from the dense reference rather than assuming a contiguous run.
@@ -1052,6 +1107,12 @@ ring_attention::RingResult run_ring_2d(const ring_attention::RingConfig& cfg) {
   const int nsg = part.num_sub_groups();
   const int Sl = part.local_chunk_len();
   const int Sl_local = Sl * nsg;
+  // Segmented path: collapse the n_splits^2 affine sub-group loop into one
+  // segmented-kernel launch per inner round. Like run_ring_overlap it needs the
+  // sub-groups laid out seq-contiguous-per-head ([b][h][nsg*Sl][D]) instead of
+  // sg-major; both compute tiers (NCCL + host-staged) honor it. zig-zag has
+  // stride 1, so a sub-group's local row s sits at global q_offset(sg)+s.
+  const bool seg = cfg.segmented;
   const std::size_t q_sg_elem = static_cast<std::size_t>(B) * H * Sl * D;
   const std::size_t q_local_elem = static_cast<std::size_t>(nsg) * q_sg_elem;
   const std::size_t kv_sg_elem = static_cast<std::size_t>(B) * kv_H * Sl * D;
@@ -1064,29 +1125,40 @@ ring_attention::RingResult run_ring_2d(const ring_attention::RingConfig& cfg) {
   const int intra_next = (g + 1) % G, intra_prev = (g - 1 + G) % G;
   const int inter_next = (n + 1) % N, inter_prev = (n - 1 + N) % N;
 
-  auto fill_q_into = [&](std::vector<float>& buf, int tid, std::size_t off, int gss) {
+  // Linear index of (b, h, sub-group sg, local row s)'s first element. `seg`
+  // picks seq-contiguous-per-head; otherwise sg-major. Same total size.
+  auto q_index = [&](int b, int h, int sg, int s) -> std::size_t {
+    return seg ? (static_cast<std::size_t>(b * H + h) * Sl_local + sg * Sl + s) * D
+               : static_cast<std::size_t>(sg) * q_sg_elem +
+                     (static_cast<std::size_t>(b * H + h) * Sl + s) * D;
+  };
+  auto kv_index = [&](int b, int h, int sg, int s) -> std::size_t {
+    return seg ? (static_cast<std::size_t>(b * kv_H + h) * Sl_local + sg * Sl + s) * D
+               : static_cast<std::size_t>(sg) * kv_sg_elem +
+                     (static_cast<std::size_t>(b * kv_H + h) * Sl + s) * D;
+  };
+
+  auto fill_q_into = [&](std::vector<float>& buf, int tid, int sg, int gss) {
     for (int b = 0; b < B; ++b)
       for (int h = 0; h < H; ++h)
         for (int s = 0; s < Sl; ++s)
           for (int d = 0; d < D; ++d)
-            buf[off + (static_cast<std::size_t>(b * H + h) * Sl + s) * D + d] =
-                gen_elem(cfg.seed, tid, b, h, gss + s, d);
+            buf[q_index(b, h, sg, s) + d] = gen_elem(cfg.seed, tid, b, h, gss + s, d);
   };
-  auto fill_kv_into = [&](std::vector<float>& buf, int tid, std::size_t off, int gss) {
+  auto fill_kv_into = [&](std::vector<float>& buf, int tid, int sg, int gss) {
     for (int b = 0; b < B; ++b)
       for (int h = 0; h < kv_H; ++h)
         for (int s = 0; s < Sl; ++s)
           for (int d = 0; d < D; ++d)
-            buf[off + (static_cast<std::size_t>(b * kv_H + h) * Sl + s) * D + d] =
-                gen_elem(cfg.seed, tid, b, h, gss + s, d);
+            buf[kv_index(b, h, sg, s) + d] = gen_elem(cfg.seed, tid, b, h, gss + s, d);
   };
 
   // Own (seed) Q/K/V — step 0's K/V is this rank's own shard, like the flat ring.
   std::vector<float> q_h(q_local_elem), k_h_init(kv_local_elem), v_h_init(kv_local_elem);
   for (int sg = 0; sg < nsg; ++sg) {
-    fill_q_into(q_h, 0, sg * q_sg_elem, part.q_offset(sg));
-    fill_kv_into(k_h_init, 1, sg * kv_sg_elem, part.k_offset_for_source(R, sg));
-    fill_kv_into(v_h_init, 2, sg * kv_sg_elem, part.k_offset_for_source(R, sg));
+    fill_q_into(q_h, 0, sg, part.q_offset(sg));
+    fill_kv_into(k_h_init, 1, sg, part.k_offset_for_source(R, sg));
+    fill_kv_into(v_h_init, 2, sg, part.k_offset_for_source(R, sg));
   }
 
   DeviceTensor<float> q_d(q_local_elem);
@@ -1096,6 +1168,17 @@ ring_attention::RingResult run_ring_2d(const ring_attention::RingConfig& cfg) {
   const AttentionShape init_shape{B, H, Sl_local, S, D};
   AttentionShape sg_shape{B, H, Sl, Sl, D};
   sg_shape.kv_heads = kv_H;
+  // Segmented: full local shard in one launch (seq_q == seq_k == Sl_local). qmap
+  // is this rank's query sub-groups; kmap.base is rebuilt each inner round from
+  // the held shard's source rank.
+  AttentionShape seg_shape{B, H, Sl_local, Sl_local, D};
+  seg_shape.kv_heads = kv_H;
+  SegMap qmap;
+  if (seg) {
+    qmap.n_seg = nsg;
+    qmap.seg_len = Sl;
+    for (int sg = 0; sg < nsg; ++sg) qmap.base[sg] = part.q_offset(sg);
+  }
 
 #ifdef RING_USE_NCCL
   // GPU-direct NCCL on BOTH tiers, FP16 transit (half the inter-node bytes,
@@ -1174,15 +1257,25 @@ ring_attention::RingResult run_ring_2d(const ring_attention::RingConfig& cfg) {
         launch_half_to_float(kh_cur, Kf.data(), kv_local_elem, stream_compute);
         launch_half_to_float(vh_cur, Vf.data(), kv_local_elem, stream_compute);
         cudaEventRecord(ev0, stream_compute);
-        for (int sg_q = 0; sg_q < nsg; ++sg_q) {
-          for (int sg_k = 0; sg_k < nsg; ++sg_k) {
-            const int q_off_sg = part.q_offset(sg_q);
-            const int k_off_sg = part.k_offset_for_source(source, sg_k);
-            if (cfg.causal && k_off_sg > q_off_sg + Sl - 1) continue;
-            launch_attention_step(q_d.data() + sg_q * q_sg_elem, Kf.data() + sg_k * kv_sg_elem,
-                                  Vf.data() + sg_k * kv_sg_elem, out_d.data() + sg_q * q_sg_elem,
-                                  m_d.data() + sg_q * m_sg, l_d.data() + sg_q * m_sg, sg_shape,
-                                  q_off_sg, k_off_sg, cfg.causal, stream_compute);
+        if (seg) {
+          SegMap kmap;
+          kmap.n_seg = nsg;
+          kmap.seg_len = Sl;
+          for (int sg = 0; sg < nsg; ++sg) kmap.base[sg] = part.k_offset_for_source(source, sg);
+          launch_attention_step_segmented(q_d.data(), Kf.data(), Vf.data(), out_d.data(),
+                                          m_d.data(), l_d.data(), seg_shape, qmap, kmap, cfg.causal,
+                                          stream_compute);
+        } else {
+          for (int sg_q = 0; sg_q < nsg; ++sg_q) {
+            for (int sg_k = 0; sg_k < nsg; ++sg_k) {
+              const int q_off_sg = part.q_offset(sg_q);
+              const int k_off_sg = part.k_offset_for_source(source, sg_k);
+              if (cfg.causal && k_off_sg > q_off_sg + Sl - 1) continue;
+              launch_attention_step(q_d.data() + sg_q * q_sg_elem, Kf.data() + sg_k * kv_sg_elem,
+                                    Vf.data() + sg_k * kv_sg_elem, out_d.data() + sg_q * q_sg_elem,
+                                    m_d.data() + sg_q * m_sg, l_d.data() + sg_q * m_sg, sg_shape,
+                                    q_off_sg, k_off_sg, cfg.causal, stream_compute);
+            }
           }
         }
         cudaEventRecord(ev1, stream_compute);
@@ -1223,9 +1316,13 @@ ring_attention::RingResult run_ring_2d(const ring_attention::RingConfig& cfg) {
     }
 
     cudaStreamSynchronize(stream_compute);
-    for (int sg = 0; sg < nsg; ++sg)
-      launch_attention_finalize(out_d.data() + sg * q_sg_elem, l_d.data() + sg * m_sg, sg_shape,
-                                stream_compute);
+    if (seg) {
+      launch_attention_finalize(out_d.data(), l_d.data(), seg_shape, stream_compute);
+    } else {
+      for (int sg = 0; sg < nsg; ++sg)
+        launch_attention_finalize(out_d.data() + sg * q_sg_elem, l_d.data() + sg * m_sg, sg_shape,
+                                  stream_compute);
+    }
     cudaStreamSynchronize(stream_compute);
     cudaEventDestroy(ev0);
     cudaEventDestroy(ev1);
@@ -1290,15 +1387,24 @@ ring_attention::RingResult run_ring_2d(const ring_attention::RingConfig& cfg) {
       for (int i = 0; i < G; ++i) {
         const int source = sched.source(m, i);
         cudaEventRecord(ev0);
-        for (int sg_q = 0; sg_q < nsg; ++sg_q) {
-          for (int sg_k = 0; sg_k < nsg; ++sg_k) {
-            const int q_off_sg = part.q_offset(sg_q);
-            const int k_off_sg = part.k_offset_for_source(source, sg_k);
-            if (cfg.causal && k_off_sg > q_off_sg + Sl - 1) continue;
-            launch_attention_step(q_d.data() + sg_q * q_sg_elem, K_cur + sg_k * kv_sg_elem,
-                                  V_cur + sg_k * kv_sg_elem, out_d.data() + sg_q * q_sg_elem,
-                                  m_d.data() + sg_q * m_sg, l_d.data() + sg_q * m_sg, sg_shape,
-                                  q_off_sg, k_off_sg, cfg.causal);
+        if (seg) {
+          SegMap kmap;
+          kmap.n_seg = nsg;
+          kmap.seg_len = Sl;
+          for (int sg = 0; sg < nsg; ++sg) kmap.base[sg] = part.k_offset_for_source(source, sg);
+          launch_attention_step_segmented(q_d.data(), K_cur, V_cur, out_d.data(), m_d.data(),
+                                          l_d.data(), seg_shape, qmap, kmap, cfg.causal);
+        } else {
+          for (int sg_q = 0; sg_q < nsg; ++sg_q) {
+            for (int sg_k = 0; sg_k < nsg; ++sg_k) {
+              const int q_off_sg = part.q_offset(sg_q);
+              const int k_off_sg = part.k_offset_for_source(source, sg_k);
+              if (cfg.causal && k_off_sg > q_off_sg + Sl - 1) continue;
+              launch_attention_step(q_d.data() + sg_q * q_sg_elem, K_cur + sg_k * kv_sg_elem,
+                                    V_cur + sg_k * kv_sg_elem, out_d.data() + sg_q * q_sg_elem,
+                                    m_d.data() + sg_q * m_sg, l_d.data() + sg_q * m_sg, sg_shape,
+                                    q_off_sg, k_off_sg, cfg.causal);
+            }
           }
         }
         cudaEventRecord(ev1);
@@ -1337,8 +1443,12 @@ ring_attention::RingResult run_ring_2d(const ring_attention::RingConfig& cfg) {
       }
     }
 
-    for (int sg = 0; sg < nsg; ++sg)
-      launch_attention_finalize(out_d.data() + sg * q_sg_elem, l_d.data() + sg * m_sg, sg_shape);
+    if (seg) {
+      launch_attention_finalize(out_d.data(), l_d.data(), seg_shape);
+    } else {
+      for (int sg = 0; sg < nsg; ++sg)
+        launch_attention_finalize(out_d.data() + sg * q_sg_elem, l_d.data() + sg * m_sg, sg_shape);
+    }
     cudaDeviceSynchronize();
     cudaEventDestroy(ev0);
     cudaEventDestroy(ev1);
@@ -1402,8 +1512,12 @@ ring_attention::RingResult run_ring_2d(const ring_attention::RingConfig& cfg) {
         for (int h = 0; h < H; ++h) {
           const float* cpu_slice =
               cpu_out.data() + (static_cast<std::size_t>(b * H + h) * S + q_off_sg) * D;
-          const float* dev_slice =
-              dev_out_h.data() + sg * q_sg_elem + static_cast<std::size_t>(b * H + h) * Sl * D;
+          // Output layout matches the fill layout: seq-contiguous-per-head under
+          // --segmented, sg-major otherwise (see q_index).
+          const std::size_t dev_base =
+              seg ? (static_cast<std::size_t>(b * H + h) * Sl_local + sg * Sl) * D
+                  : sg * q_sg_elem + static_cast<std::size_t>(b * H + h) * Sl * D;
+          const float* dev_slice = dev_out_h.data() + dev_base;
           for (int e = 0; e < Sl * D; ++e)
             max_err = std::max(max_err, std::abs(cpu_slice[e] - dev_slice[e]));
         }
@@ -1474,6 +1588,9 @@ RingResult run_ring_attention(const RingConfig& cfg) {
         "--zigzag-n is not supported with --mode=allgather (use ring-blocking or ring-overlap)");
   if (cfg.striped && cfg.mode == RingMode::AllGather)
     mpi_die("--striped is not supported with --mode=allgather (use ring-blocking or ring-overlap)");
+  if (cfg.segmented && ((cfg.mode != RingMode::RingOverlap && cfg.mode != RingMode::Ring2D) ||
+                        cfg.dtype == RingDtype::Half || cfg.zigzag_n <= 0 || cfg.striped))
+    mpi_die("--segmented requires fp32 ring-overlap or ring-2d with --zigzag-n N (not --striped)");
   if (cfg.dtype == RingDtype::Half) return run_ring_attention_fp16(cfg);
   switch (cfg.mode) {
     case RingMode::AllGather:

@@ -45,9 +45,13 @@ struct RingConfig {
   int head_dim;
   int kv_heads{0};  ///< KV head count for GQA/MQA; 0 means same as heads (MHA).
   bool causal;
-  int zigzag_n{0};  ///< 0 = disabled; N >= 1 = N zig-zag passes (each pass = 2 sub-groups).
-  bool striped{false};  ///< Striped partitioning (token i -> rank i%cp). Mutually exclusive
-                        ///< with zigzag (zigzag_n).
+  int zigzag_n{0};        ///< 0 = disabled; N >= 1 = N zig-zag passes (each pass = 2 sub-groups).
+  bool striped{false};    ///< Striped partitioning (token i -> rank i%cp). Mutually exclusive
+                          ///< with zigzag (zigzag_n).
+  bool segmented{false};  ///< Run the zig-zag partition as ONE segmented-kernel launch per ring
+                          ///< step (piecewise-affine SegMap) instead of the n_seg^2 affine
+                          ///< sub-group loop. Requires zigzag_n>0, fp32, mode=ring-overlap or
+                          ///< ring-2d.
   bool verify;
   bool csv;
   RingMode mode;

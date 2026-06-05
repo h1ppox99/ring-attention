@@ -34,8 +34,9 @@
 #
 # Output: results/partition_compare_<axis>_<YYYYmmdd-HHMMSS>.csv  (timestamped per
 # launch; override with CSV=<path>). Columns:
-#   mode,cp_size,batch,heads,seq,head_dim,causal,zigzag_n,striped,iters,
+#   mode,cp_size,batch,heads,seq,head_dim,causal,zigzag_n,striped,segmented,iters,
 #   comm_ms,comp_ms,wait_ms,total_ms,max_err
+# (segmented=1 marks a zig-zag run executed as one segmented-kernel launch/step.)
 
 set -euo pipefail
 
@@ -69,7 +70,7 @@ ITERS="${ITERS:-20}"
 CSV="${CSV:-results/partition_compare_${AXIS}_$(date +%Y%m%d-%H%M%S).csv}"
 echo "writing -> ${CSV}"
 
-echo "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag_n,striped,iters,comm_ms,comp_ms,wait_ms,total_ms,max_err" \
+echo "mode,cp_size,batch,heads,seq,head_dim,causal,zigzag_n,striped,segmented,iters,comm_ms,comp_ms,wait_ms,total_ms,max_err" \
   > "${CSV}"
 
 # Run one (scheme, cp, seq) point. $5 = required seq divisor for that scheme.
@@ -102,6 +103,10 @@ bench_point() {
   run_scheme "${cp}" "${seq}" "${hd}" "striped"    "${cp}"            --striped 1
   run_scheme "${cp}" "${seq}" "${hd}" "zigzag-n1"  $((2 * cp))        --zigzag-n 1
   run_scheme "${cp}" "${seq}" "${hd}" "zigzag-n2"  $((4 * cp))        --zigzag-n 2
+  # Same zig-zag partitions, executed as one segmented-kernel launch per ring
+  # step (distinguished in the CSV by segmented=1). Same divisibility as zig-zag.
+  run_scheme "${cp}" "${seq}" "${hd}" "zigzag-n1-seg" $((2 * cp))     --zigzag-n 1 --segmented 1
+  run_scheme "${cp}" "${seq}" "${hd}" "zigzag-n2-seg" $((4 * cp))     --zigzag-n 2 --segmented 1
 }
 
 case "${AXIS}" in

@@ -102,16 +102,31 @@ for mode in ring-blocking ring-overlap; do
   done
 done
 
+# Segmented zig-zag: the fused single-kernel-per-step execution of the zig-zag
+# partition. Same numerical result as the n_splits^2 sub-group loop, so the same
+# verify matrix gates it. Only supported on fp32 ring-overlap (no fp16 kernel,
+# not wired into the other modes), so we don't loop over modes here.
+for nz in 1 2; do
+  echo ""
+  echo "=== ring-overlap --zigzag-n ${nz} --segmented --verify ==="
+  for n in 1 2 4; do
+    for causal in 0 1; do
+      check_verify "${n}" ring-overlap "${causal}" --zigzag-n "${nz}" --segmented 1
+    done
+  done
+done
+
 # Shape sweep on the report hot path (ring-overlap+zigzag+causal). Catches
 # shape-specific bugs (D=128 register spilling, large-seq tiling) the fixed
 # 1024×64 matrix misses. cp_size=2 suffices: shape bugs are kernel-local.
 echo ""
-echo "=== ring-overlap --zigzag-n/--striped --verify (shape sweep, cp_size=2, causal=1) ==="
+echo "=== ring-overlap --zigzag-n/--striped/--segmented --verify (shape sweep, cp_size=2, causal=1) ==="
 for HEAD_DIM in 32 64 128; do
   for SEQ in 512 4096; do
     export SEQ HEAD_DIM
     check_verify 2 ring-overlap 1 --zigzag-n 1
     check_verify 2 ring-overlap 1 --striped 1
+    check_verify 2 ring-overlap 1 --zigzag-n 1 --segmented 1
   done
 done
 unset SEQ HEAD_DIM
@@ -129,6 +144,10 @@ if [ "${SLURM_NNODES:-1}" -ge 2 ]; then
       check_verify "${N_TOTAL}" "${mode}" "${causal}" --zigzag-n 1
       check_verify "${N_TOTAL}" "${mode}" "${causal}" --striped 1
     done
+  done
+  # Segmented zig-zag across nodes (ring-overlap only).
+  for causal in 0 1; do
+    check_verify "${N_TOTAL}" ring-overlap "${causal}" --zigzag-n 1 --segmented 1
   done
   unset SEQ HEAD_DIM
 else
