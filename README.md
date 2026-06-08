@@ -152,7 +152,7 @@ mpirun -n 2 ./build/release/apps/ring_attention_cli/ring_attention_cli \
 
 ## Documentation
 
-**TODO** : point to final report once added in `docs/`.
+Figures and writeup are directly available in the `docs/` folder.
 
 ---
 
