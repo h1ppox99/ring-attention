@@ -7,36 +7,30 @@
 [![CUDA 12.3](https://img.shields.io/badge/CUDA-12.3-76B900.svg)](https://developer.nvidia.com/cuda-toolkit)
 [![Python 3.11](https://img.shields.io/badge/Python-3.11-3776AB.svg)](https://www.python.org/)
 
----
+<p align="center">
+  <img src="docs/figures/flat_ring_static.png" width="45%" alt="Flat ring: all GPUs share one ring, so every node crossing rides the slow 1 GbE uplink">
+  &nbsp;&nbsp;
+  <img src="docs/figures/hierarchical_ring_static.png" width="45%" alt="Hierarchical ring of rings: fast intra-node rings plus a single inter-node ring">
+  <br>
+  <em>Ring (left) vs. Hierarchical ring (right) optimised for the Stanford HPCC.</em>
+  <br>
+  📺 <b><a href="https://edouard-rabasse.github.io/ring-attention-animations/">Watch the rotations animated →</a></b>
+</p>
 
-## Content
+For the algorithm, see Liu, Zaharia & Abbeel, *Ring Attention with Blockwise Transformers for
+Near-Infinite Context* (2023), [arXiv:2310.01889](https://arxiv.org/abs/2310.01889).
 
-**TODO** : rewrite this content more concisely
+## Overview
 
-Attention is the one transformer block that cannot be trivially sequence-parallelised:
-every query token needs the keys and values of *every* position, so the cost grows with the
-full sequence length even after the rest of the model is split across GPUs. **Ring Attention**
-removes that wall. Each GPU holds only a `1/cp_size` slice of Q/K/V and the K/V shards are
-rotated around a ring of GPUs; partial attention is computed against each shard as it arrives
-and merged with a FlashAttention-style **online softmax**. Memory per GPU scales with
-`1/cp_size`, so the maximum context length grows linearly as you add GPUs — without ever
-materialising the full sequence on any single device.
+In a transformer, every query attends to the keys/values of *every* position, so the
+attention block's cost and memory scale with the **full** sequence even after the rest of the
+model is sharded across GPUs. **Ring Attention** removes that ceiling: each GPU holds a
+`1/cp_size` slice of Q/K/V, and K/V shards rotate around a ring while partial attention is
+merged with a FlashAttention-style **online softmax**. Per-GPU memory scales with `1/cp_size`,
+so the maximum context length grows **linearly** with the GPU count.
 
-See Liu, Zaharia, and Abbeel, *Ring Attention with Blockwise Transformers for Near-Infinite Context* (2023),
-[arXiv:2310.01889](https://arxiv.org/abs/2310.01889) for more details.
-
-This repository is a from-scratch **CUDA/C++ implementation** with a matching
-**Python/PyTorch reference** for correctness testing. It includes:
-
-- **Zig-Zag token assignment** — interleaved first/last token layout that balances
-  per-GPU work under a causal mask (otherwise early ranks do most of the work).
-- **Communication/compute overlap** — K/V rotation (MPI or NCCL) hidden behind the
-  attention kernel using two CUDA streams.
-- **A hierarchical 2D ring**  that minimises slow inter-node hops on
-  clusters with fast intra-node links and a thin (1 GbE) uplink per node.
-- **Distributed-KV-cache decode**  autoregressive single-token decoding
-  against a KV history sharded around the ring.
-- **FP16 Tensor-Core path**, GQA/MQA support, and a benchmark/verification CLI.
+This repo is a from-scratch **C++/CUDA** implementation with a **Python/PyTorch** reference
+for correctness. See full report in `docs/writeup.pdf`.
 
 ### Repository layout
 
