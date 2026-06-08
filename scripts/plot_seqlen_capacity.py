@@ -38,6 +38,23 @@ import matplotlib.ticker as mticker
 import pandas as pd
 
 
+def _set_style() -> None:
+    """Use a Computer Modern (LaTeX-like) serif font for all figures.
+
+    Relies on matplotlib's bundled ``cmr10`` font and the ``cm`` mathtext
+    fontset, so no system TeX installation is required.
+    """
+    plt.rcParams.update(
+        {
+            "font.family": "serif",
+            "font.serif": ["cmr10", "DejaVu Serif"],
+            "mathtext.fontset": "cm",
+            "axes.formatter.use_mathtext": True,
+            "axes.unicode_minus": False,
+        }
+    )
+
+
 def load_csv(path: Path) -> pd.DataFrame:
     """Load the capacity CSV, coercing numerics and dropping unparsable rows."""
     df = pd.read_csv(path)
@@ -63,25 +80,6 @@ def plot_capacity(df: pd.DataFrame, out_dir: Path) -> None:
 
     cp = df["cp_size"].to_numpy()
     seq = df["max_seq"].to_numpy()
-    cp1 = df.loc[df["cp_size"] == cp.min()].iloc[0]
-    base_cp, base_seq = float(cp1["cp_size"]), float(cp1["max_seq"])
-
-    # Reachable region (filled triangle) under the measured capacity curve. A
-    # LINEAR y-axis is deliberate: linear capacity scaling is a straight line
-    # here, the clearest possible statement of "context grows with GPU count".
-    ax.fill_between(cp, seq, 0, color="#1f77b4", alpha=0.10, zorder=1)
-
-    # Ideal linear capacity, anchored at the smallest measured cp_size.
-    ideal = base_seq * (cp / base_cp)
-    ax.plot(
-        cp,
-        ideal,
-        "--",
-        color="0.45",
-        lw=1.6,
-        zorder=2,
-        label=f"ideal linear  (∝ #GPUs, from cp={int(base_cp)})",
-    )
 
     # Measured capacity.
     ax.plot(
@@ -92,56 +90,19 @@ def plot_capacity(df: pd.DataFrame, out_dir: Path) -> None:
         lw=2.2,
         ms=7,
         zorder=4,
-        label="measured max sequence (ring attention)",
+        label="Measured maximum sequence length",
     )
 
-    y_top = max(seq.max(), ideal.max())
-
-    # Annotate the headline endpoint: the full-ring capacity and its multiplier.
-    top = df.iloc[-1]
-    mult = float(top["max_seq"]) / base_seq
-    ax.annotate(
-        f"{int(top['cp_size'])} GPUs → {_human_tokens(float(top['max_seq']))} tokens\n"
-        f"{mult:.1f}× a single GPU",
-        xy=(float(top["cp_size"]), float(top["max_seq"])),
-        xytext=(-10, -55),
-        textcoords="offset points",
-        ha="right",
-        fontsize=9.5,
-        fontweight="bold",
-        color="#0d3b66",
-        arrowprops=dict(arrowstyle="->", color="#0d3b66", lw=1.2),
-    )
-    # Annotate the single-GPU point.
-    ax.annotate(
-        f"1 GPU: {_human_tokens(base_seq)} tokens",
-        xy=(base_cp, base_seq),
-        xytext=(10, 18),
-        textcoords="offset points",
-        ha="left",
-        fontsize=9,
-        color="#7a3b00",
-        arrowprops=dict(arrowstyle="->", color="#7a3b00", lw=1.0),
-    )
+    y_top = seq.max()
 
     ax.set_ylim(0, y_top * 1.12)
     ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: _human_tokens(v)))
     ax.set_xticks(cp)
     ax.set_xlim(cp.min() - 0.4, cp.max() + 0.4)
-    ax.set_xlabel("Number of GPUs in the ring (cp_size)")
+    ax.set_xlabel("Number of GPUs")
     ax.set_ylabel("Max sequence length per attention layer (tokens)")
 
-    meta = df.iloc[0]
-    gpu_mem = float(meta["gpu_mem_mb"])
-    mem_str = f"{gpu_mem / 1024:.0f} GB/GPU" if gpu_mem > 0 else "Turing"
-    ax.set_title(
-        "Ring attention scales sequence length linearly with GPU count\n"
-        f"single attention layer · {meta['dtype']}, heads={int(meta['heads'])}, "
-        f"head_dim={int(meta['head_dim'])}, batch={int(meta['batch'])}, "
-        f"causal+zigzag, {mem_str}",
-        fontsize=11,
-    )
-    ax.grid(True, axis="y", alpha=0.25)
+    ax.grid(True, which="both", alpha=0.3)
     ax.legend(loc="upper left", fontsize=9, framealpha=0.9)
     fig.tight_layout()
 
@@ -161,7 +122,11 @@ def plot_per_gpu(df: pd.DataFrame, out_dir: Path) -> None:
 
     ax.plot(cp, per_gpu, "s-", color="#2ca02c", lw=2.0, ms=6, label="max tokens per GPU (measured)")
     ax.axhline(
-        mean_pg, color="0.5", ls="--", lw=1.2, label=f"mean ≈ {_human_tokens(mean_pg)} tokens/GPU"
+        mean_pg,
+        color="0.5",
+        ls="--",
+        lw=1.2,
+        label=rf"mean $\approx$ {_human_tokens(mean_pg)} tokens/GPU",
     )
 
     ax.set_xticks(cp)
@@ -191,6 +156,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    _set_style()
     args.out.mkdir(parents=True, exist_ok=True)
     df = load_csv(args.csv)
     print(f"Loaded {len(df)} rows from {args.csv}")
